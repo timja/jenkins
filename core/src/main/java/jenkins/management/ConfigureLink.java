@@ -52,10 +52,10 @@ public class ConfigureLink extends ManagementLink {
         return Messages.ConfigureLink_Description();
     }
 
-    @CheckForNull
     @Override
-    public Permission getRequiredPermission() {
-        return Jenkins.MANAGE;
+    public boolean isShowLink() {
+        final Jenkins j = Jenkins.get();
+        return j.hasPermission(Jenkins.MANAGE) || j.hasPermission(Jenkins.SYSTEM_READ);
     }
 
     @Override

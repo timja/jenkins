@@ -1051,10 +1051,10 @@ public class Functions {
      * we needed this for {@link GlobalConfiguration}s are for backward compatibility.
      *
      * @param predicate
-     *      Filter the descriptors based on {@link GlobalConfigurationCategory}
+     *      Filter the descriptors based on this predicate
      * @since 1.494
      */
-    public static Collection<Descriptor> getSortedDescriptorsForGlobalConfig(Predicate<GlobalConfigurationCategory> predicate) {
+    public static Collection<Descriptor> getSortedDescriptorsForGlobalConfig(Predicate<Descriptor> predicate) {
         ExtensionList<Descriptor> exts = ExtensionList.lookup(Descriptor.class);
         List<Tag> r = new ArrayList<>(exts.size());
 
@@ -1062,11 +1062,7 @@ public class Functions {
             Descriptor d = c.getInstance();
             if (d.getGlobalConfigPage()==null)  continue;
 
-            if (!Jenkins.get().hasPermission(d.getRequiredPermission())) {
-                continue;
-            }
-
-            if (predicate.apply(d.getCategory())) {
+            if (predicate.apply(d)) {
                 r.add(new Tag(c.ordinal(), d));
             }
         }
@@ -1082,7 +1078,7 @@ public class Functions {
      * Like {@link #getSortedDescriptorsForGlobalConfig(Predicate)} but with a constant truth predicate, to include all descriptors.
      */
     public static Collection<Descriptor> getSortedDescriptorsForGlobalConfig() {
-        return getSortedDescriptorsForGlobalConfig(Predicates.<GlobalConfigurationCategory>alwaysTrue());
+        return getSortedDescriptorsForGlobalConfig(Predicates.<Descriptor>alwaysTrue());
     }
 
     /**
@@ -1090,21 +1086,52 @@ public class Functions {
      */
     @Deprecated
     public static Collection<Descriptor> getSortedDescriptorsForGlobalConfigNoSecurity() {
-        return getSortedDescriptorsForGlobalConfig(Predicates.not(GlobalSecurityConfiguration.FILTER));
+        return getSortedDescriptorsForGlobalConfigUnclassified();
     }
 
     /**
-     * Like {@link #getSortedDescriptorsForGlobalConfig(Predicate)} but for unclassified descriptors only.
+     * Descriptors in the global configuration form that users with {@link Jenkins#MANAGE} permission can configure.
+     *
      * @since 1.506
      */
     public static Collection<Descriptor> getSortedDescriptorsForGlobalConfigUnclassified() {
-        return getSortedDescriptorsForGlobalConfig(new Predicate<GlobalConfigurationCategory>() {
-            public boolean apply(GlobalConfigurationCategory cat) {
-                return cat instanceof GlobalConfigurationCategory.Unclassified;
+        return getSortedDescriptorsForGlobalConfig(new Predicate<Descriptor>() {
+            public boolean apply(Descriptor d) {
+                return d.getCategory() instanceof GlobalConfigurationCategory.Unclassified && Jenkins.get().hasPermission(d.getRequiredPermission());
             }
         });
     }
-    
+
+    /**
+     * Descriptors shown in the global configuration form to users with {@link Jenkins#SYSTEM_READ} permission.
+     *
+     * @return
+     * @since TODO
+     */
+    @Restricted(NoExternalUse.class)
+    public static Collection<Descriptor> getSortedDescriptorsForGlobalConfigUnclassifiedReadable() {
+        return getSortedDescriptorsForGlobalConfig(new Predicate<Descriptor>() {
+            public boolean apply(Descriptor d) {
+                return d.getCategory() instanceof GlobalConfigurationCategory.Unclassified && (
+                        Jenkins.get().hasPermission(d.getRequiredPermission()) || Jenkins.get().hasPermission(Jenkins.SYSTEM_READ));
+            }
+        });
+    }
+
+    @Restricted(NoExternalUse.class)
+    public static void checkAnyPermission(AccessControlled ac, Permission permission1, Permission permission2) { // TODO Jelly cannot handle varargs?
+        Permission[] permissions = new Permission[] { permission1, permission2 };
+        boolean failed = true;
+        for (Permission permission : permissions) {
+            if (ac.hasPermission(permission)) {
+                failed = false;
+            }
+        }
+        if (failed && permissions.length > 0) {
+            ac.checkPermission(permissions[0]);
+        }
+    }
+
     private static class Tag implements Comparable<Tag> {
         double ordinal;
         String hierarchy;
