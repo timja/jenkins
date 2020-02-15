@@ -1,20 +1,20 @@
 /*
  * The MIT License
- * 
+ *
  * Copyright (c) 2004-2010, Sun Microsystems, Inc., Kohsuke Kawaguchi,
  * Yahoo! Inc., Stephen Connolly, Tom Huybrechts, Alan Harder, Manufacture
  * Francaise des Pneumatiques Michelin, Romain Seguy
- * 
+ *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
  * in the Software without restriction, including without limitation the rights
  * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
  * copies of the Software, and to permit persons to whom the Software is
  * furnished to do so, subject to the following conditions:
- * 
+ *
  * The above copyright notice and this permission notice shall be included in
  * all copies or substantial portions of the Software.
- * 
+ *
  * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
  * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
  * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -207,7 +207,7 @@ public class Functions {
     public static boolean isModelWithChildren(Object o) {
         return o instanceof ModelObjectWithChildren;
     }
-    
+
     @Deprecated
     public static boolean isMatrixProject(Object o) {
         return o != null && o.getClass().getName().equals("hudson.matrix.MatrixProject");
@@ -485,7 +485,7 @@ public class Functions {
 
     /**
      * Gets the system property indicated by the specified key.
-     * 
+     *
      * Delegates to {@link SystemProperties#getString(java.lang.String)}.
      */
     @Restricted(DoNotUse.class)
@@ -500,7 +500,7 @@ public class Functions {
     public static boolean isWindows() {
         return File.pathSeparatorChar==';';
     }
-    
+
     public static boolean isGlibcSupported() {
         try {
             GNUCLibrary.LIBC.getpid();
@@ -840,7 +840,7 @@ public class Functions {
     public static void checkPermission(Object object, Permission permission) throws IOException, ServletException {
         if (permission == null)
             return;
-        
+
         if (object instanceof AccessControlled)
             checkPermission((AccessControlled) object,permission);
         else {
@@ -1119,15 +1119,18 @@ public class Functions {
     }
 
     @Restricted(NoExternalUse.class)
-    public static void checkAnyPermission(AccessControlled ac, Permission permission1, Permission permission2) { // TODO Jelly cannot handle varargs?
-        Permission[] permissions = new Permission[] { permission1, permission2 };
+    public static void checkAnyPermission(AccessControlled ac, Permission[] permissions) {
+        if (permissions == null) {
+            return;
+        }
+
         boolean failed = true;
         for (Permission permission : permissions) {
             if (ac.hasPermission(permission)) {
                 failed = false;
             }
         }
-        if (failed && permissions.length > 0) {
+        if (failed) {
             ac.checkPermission(permissions[0]);
         }
     }
@@ -1223,20 +1226,20 @@ public class Functions {
             i = (Item) ig;
         }
     }
-    
+
     private static String normalizeURI(String uri) {
         return URI.create(uri).normalize().toString();
     }
-    
+
     /**
      * Gets all the {@link TopLevelItem}s recursively in the {@link ItemGroup} tree.
-     * 
+     *
      * @since 1.512
      */
     public static List<TopLevelItem> getAllTopLevelItems(ItemGroup root) {
       return root.getAllItems(TopLevelItem.class);
     }
-    
+
     /**
      * Gets the relative name or display name to the given item from the specified group.
      *
@@ -1255,7 +1258,7 @@ public class Functions {
         if (p == null) return null;
         if (g == null) return useDisplayName ? p.getFullDisplayName() : p.getFullName();
         String separationString = useDisplayName ? " » " : "/";
-        
+
         // first list up all the parents
         Map<ItemGroup,Integer> parents = new HashMap<>();
         int depth=0;
@@ -1289,7 +1292,7 @@ public class Functions {
                 return null;
         }
     }
-    
+
     /**
      * Gets the name to the given item relative to given group.
      *
@@ -1304,9 +1307,9 @@ public class Functions {
     @Nullable
     public static String getRelativeNameFrom(@CheckForNull Item p, @CheckForNull ItemGroup g) {
         return getRelativeNameFrom(p, g, false);
-    }    
-    
-    
+    }
+
+
     /**
      * Gets the relative display name to the given item from the specified group.
      *
@@ -1844,7 +1847,7 @@ public class Functions {
      * Gets all the {@link PageDecorator}s.
      */
     public static List<PageDecorator> getPageDecorators() {
-        // this method may be called to render start up errors, at which point Hudson doesn't exist yet. see HUDSON-3608 
+        // this method may be called to render start up errors, at which point Hudson doesn't exist yet. see HUDSON-3608
         if(Jenkins.getInstanceOrNull()==null)  return Collections.emptyList();
         return PageDecorator.all();
     }
@@ -1968,7 +1971,7 @@ public class Functions {
     public List filterDescriptors(Object context, Iterable descriptors) {
         return DescriptorVisibilityFilter.apply(context,descriptors);
     }
-    
+
     /**
      * Returns true if we are running unit tests.
      */
@@ -2013,7 +2016,7 @@ public class Functions {
     public static String getCurrentDescriptorByNameUrl() {
         return Descriptor.getCurrentDescriptorByNameUrl();
     }
-    
+
     public static String setCurrentDescriptorByNameUrl(String value) {
         String o = getCurrentDescriptorByNameUrl();
         Stapler.getCurrentRequest().setAttribute("currentDescriptorByNameUrl", value);
@@ -2070,11 +2073,11 @@ public class Functions {
     public String getUserAvatar(User user, String avatarSize) {
         return getAvatar(user,avatarSize);
     }
-    
-    
+
+
     /**
      * Returns human readable information about file size
-     * 
+     *
      * @param size file size in bytes
      * @return file size in appropriate unit
      */
