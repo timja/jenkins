@@ -27,7 +27,7 @@ THE SOFTWARE.
 -->
 <?jelly escape-by-default='true'?>
 <j:jelly xmlns:j="jelly:core" xmlns:st="jelly:stapler" xmlns:d="jelly:define" xmlns:l="/lib/layout" xmlns:t="/lib/hudson" xmlns:f="/lib/form">
-<l:layout title="${%Manage Jenkins}" xmlns:local="local" permission="${app.MANAGE}">
+<l:layout title="${%Manage Jenkins}" xmlns:local="local" permission="${app.SYSTEM_READ}">
 
   <l:header>
      <link rel="stylesheet" href="${resURL}/bootstrap/css/bootstrap.min.css" type="text/css" />
@@ -41,12 +41,14 @@ THE SOFTWARE.
   <l:main-panel>
     <h1>${%Manage Jenkins}</h1>
 
-    <div class="manage-messages">
-    <j:forEach var="am" items="${app.activeAdministrativeMonitors}">
-      <st:include page="message.jelly" it="${am}" />
-    </j:forEach>
-    <st:include page="downgrade.jelly" />
-    </div>
+    <l:hasPermission permission="${app.ADMINISTER}">
+      <div class="manage-messages">
+      <j:forEach var="am" items="${app.activeAdministrativeMonitors}">
+        <st:include page="message.jelly" it="${am}" />
+      </j:forEach>
+      <st:include page="downgrade.jelly" />
+      </div>
+    </l:hasPermission>
 
     <j:forEach var="m" items="${it.managementLinks}">
       <l:hasPermission permission="${m.requiredPermission}">

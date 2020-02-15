@@ -349,9 +349,9 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
 
     @Deprecated
     private InstallState installState;
-    
+
     /**
-     * If we're in the process of an initial setup, 
+     * If we're in the process of an initial setup,
      * this will be set
      */
     private transient SetupWizard setupWizard;
@@ -1068,7 +1068,7 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
 
     /**
      * Set the proxy configuration.
-     * 
+     *
      * @param proxy the proxy to set
      * @since TODO
      */
@@ -1091,7 +1091,7 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
     }
 
     /**
-     * Update the current install state. This will invoke state.initializeState() 
+     * Update the current install state. This will invoke state.initializeState()
      * when the state has been transitioned.
      */
     public void setInstallState(@Nonnull InstallState newState) {
@@ -2274,7 +2274,7 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
     @Override
     public SearchIndexBuilder makeSearchIndex() {
         SearchIndexBuilder builder = super.makeSearchIndex();
-        if (hasPermission(ADMINISTER)) {
+        if (hasPermission(SYSTEM_READ)) {
                 builder.add("configure", "config", "configure")
                     .add("manage")
                     .add("log");
@@ -2317,7 +2317,7 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
      * It is done in this order so that it can work correctly even in the face
      * of a reverse proxy.
      *
-     * @return {@code null} if this parameter is not configured by the user and the calling thread is not in an HTTP request; 
+     * @return {@code null} if this parameter is not configured by the user and the calling thread is not in an HTTP request;
      *                      otherwise the returned URL will always have the trailing {@code /}
      * @throws IllegalStateException {@link JenkinsLocationConfiguration} cannot be retrieved.
      *                      Jenkins instance may be not ready, or there is an extension loading glitch.
@@ -2532,7 +2532,7 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
      * Everything below here is admin-only, so do the check here.
      */
     public LogRecorderManager getLog() {
-        checkPermission(ADMINISTER);
+        checkPermission(SYSTEM_READ);
         return log;
     }
 
@@ -3775,7 +3775,7 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
             boolean result = true;
             for (Descriptor<?> d : Functions.getSortedDescriptorsForGlobalConfigUnclassified())
                 result &= configureDescriptor(req,json,d);
-            
+
             save();
             updateComputerList();
             if(result)
@@ -4704,7 +4704,7 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
     public List<ManagementLink> getManagementLinks() {
         return ManagementLink.all();
     }
-    
+
     /**
      * If set, a currently active setup wizard - e.g. installation
      *
@@ -4714,7 +4714,7 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
     public SetupWizard getSetupWizard() {
         return setupWizard;
     }
-    
+
     /**
      * Exposes the current user to {@code /me} URL.
      */
@@ -4749,7 +4749,7 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
         }
         return this;
     }
-    
+
     /**
      * Test a path to see if it is subject to mandatory read permission checks by container-managed security
      * @param restOfPath the URI, excluding the Jenkins root URI and query string
@@ -5063,7 +5063,7 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
                 LOGGER.log(Level.WARNING, "Unable to read Jenkins version: " + e.getMessage(), e);
             }
         }
-        
+
         VERSION = ver;
         context.setAttribute("version",ver);
 
@@ -5260,6 +5260,7 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
             new PermissionScope[]{PermissionScope.JENKINS});
 
 
+    public static final Permission SYSTEM_READ = new Permission(PERMISSIONS, "SystemRead", Messages._Jenkins_SystemReadPermission_Description(), ADMINISTER, SystemProperties.getBoolean("jenkins.security.SystemReadPermission"), new PermissionScope[]{PermissionScope.JENKINS});
     public static final Permission READ = new Permission(PERMISSIONS,"Read",Messages._Hudson_ReadPermission_Description(),Permission.READ,PermissionScope.JENKINS);
     public static final Permission RUN_SCRIPTS = new Permission(PERMISSIONS, "RunScripts", Messages._Hudson_RunScriptsPermission_Description(),ADMINISTER,PermissionScope.JENKINS);
 
