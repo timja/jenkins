@@ -1,14 +1,24 @@
-import pluginManagerAvailable from './templates/plugin-manager/helloWorld.hbs'
+import pluginManagerAvailable from './templates/plugin-manager/available.hbs'
 
-console.log('are you here??')
-document.addEventListener("DOMContentLoaded", function() {
-    console.log('I got called');
-    
-    var div = document.createElement('div');
-    div.innerHTML = pluginManagerAvailable({
-        name: 'jonny'
+var debounce = null;
+function applyFilter(searchQuery) {
+    clearTimeout(debounce);
+    // debounce reduces number of server side calls while typing
+    debounce = setTimeout(function() {
+        view.availablePlugins(searchQuery.toLowerCase().trim(), 50, function (pluginsObj) {
+            var plugins = JSON.parse(pluginsObj.responseObject());
+            document.getElementById('plugins').innerHTML = pluginManagerAvailable({
+                plugins
+            });
+        })
+    }, 150);
+}
+
+document.addEventListener("DOMContentLoaded", function () {
+    var filterInput = document.getElementById('filter-box');
+    filterInput.addEventListener('input', function(e) {
+        applyFilter(e.target.value)
     });
-    
-    console.log(div)
-    document.body.appendChild(div);
+
+    applyFilter(filterInput.value);
 });

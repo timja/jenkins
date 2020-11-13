@@ -33,7 +33,9 @@ THE SOFTWARE.
     
     <st:include page="sidepanel.jelly"/>
     <l:main-panel>
+      <script>var view =<st:bind value="${app.updateCenter}"/></script>
       <script src="${resURL}/jsbundles/plugin-manager-ui.js" type="text/javascript"/>
+      <link rel="stylesheet" href="${resURL}/jsbundles/plugin-manager-ui.css" type="text/css" />
 
       <div id="filter-container">
         <div class="plugin-manager__search">
@@ -50,7 +52,8 @@ THE SOFTWARE.
         </div>
       </div>
 
-      <div id="plugins"/>
+      <local:tabBar page="${page}" xmlns:local="/hudson/PluginManager" />
+      <table id="plugins" class="sortable pane bigtable stripped-odd" />
 
     </l:main-panel>
   </l:layout>

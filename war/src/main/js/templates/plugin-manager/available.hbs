@@ -1,0 +1,90 @@
+<thead>
+<tr>
+    <th tooltip="Check to install the plugin" width="32" title="Check to install the plugin"><a href="#"
+                                                                                                class="sortheader">Install<span
+            class="sortarrow">&nbsp;&nbsp;&nbsp;</span></a></th>
+    <th initialsortdir="down"><a href="#" class="sortheader">Name<span class="sortarrow">↓</span></a></th>
+    <th><a href="#" class="sortheader">Version<span class="sortarrow"></span></a></th>
+    <th><a href="#" class="sortheader">Released<span class="sortarrow"></span></a></th>
+</tr>
+</thead>
+<tbody>
+
+{{#each plugins}}
+    <tr>
+        <!-- TODO hide if not admin  -->
+        <td class="pane">
+            <input type="checkbox" name="plugin.{{ this.name }}.{{ this.sourceId }}">
+        </td>
+        <td class="pane">
+            <div>
+                <a href="{{ this.wiki }}" target="_blank" rel="noopener noreferrer">
+                    {{ this.displayName }}
+                </a>
+            </div>
+            {{#if this.categories }}
+                <div class="plugin-manager__categories">
+                    {{#each this.categories }}
+                        <a href="?filter={{ this }}" class="plugin-manager__category-label">
+                        {{ this }}
+                        </a>
+                    {{/each}}
+                </div>
+            {{/if}}
+            {{#if this.excerpt }}
+                <div class="except">
+                    {{{ this.excerpt }}}
+                </div>
+            {{/if}}
+            {{#if this.newerCoreRequired }}
+                <div class="alert alert-danger">
+                    {{{ this.newerCoreRequired }}}
+                </div>
+            {{/if}}
+            {{#if this.dependenciesNewerJava }}
+                <div class="alert alert-danger">
+                    {{{ this.dependenciesNewerJava }}}
+                </div>
+            {{/if}}
+            {{#if this.unresolvedSecurityWarnings }}
+                <div class="alert alert-danger">
+                    {{ this.unresolvedSecurityWarnings.text }}
+                    <ul>
+                    {{#each this.unresolvedSecurityWarnings.warnings}}
+                        <li>
+                            <a href="{{ this.url }}" target="_blank" rel="noopener noreferrer">
+                                {{ this.message }}
+                            </a>
+                        </li>
+                    {{/each}}
+                    </ul>
+                </div>
+            {{/if}}
+            {{#if this.deprecated }}
+                <div class="alert alert-warning">
+                    {{{ this.deprecated }}}
+                </div>
+            {{/if}}
+            {{#if this.adoptMe }}
+                <div class="alert alert-warning">
+                    {{{ this.adoptMe }}}
+                </div>
+            {{/if}}
+            {{#if this.newerVersionAvailableNotOffered }}
+                <div class="alert alert-info">
+                    {{{ this.newerVersionAvailableNotOffered }}}
+                </div>
+            {{/if}}
+        </td>
+        <td class="pane">
+            {{ this.version }}
+        </td>
+        <td class="pane">
+            <!-- TODO wrap in if -->
+            <time datetime="{{ this.releaseTimestamp.iso8601 }}">
+                {{ this.releaseTimestamp.displayValue }}
+            </time>
+        </td>
+    </tr>
+{{/each}}
+</tbody>
