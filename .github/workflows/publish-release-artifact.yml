@@ -41,7 +41,7 @@ jobs:
         id: fetch-war
         run: |
           FILE_NAME=jenkins.war
-          PROJECT_VERSION=${{ needs.determine-version.outputs.project-version }}
+          PROJECT_VERSION=272
           IS_LTS=${{ needs.determine-version.outputs.is-lts }}
           echo $PROJECT_VERSION
           echo "::set-output name=file-name::$FILE_NAME"
