@@ -355,6 +355,7 @@ public class FunctionsTest {
     }
 
     @Issue("JDK-6507809")
+    @Ignore("TODO fails on newer java")
     @Test public void printThrowable() throws Exception {
         // Basics: a single exception. No change.
         assertPrintThrowable(new Stack("java.lang.NullPointerException: oops", "p.C.method1:17", "m.Main.main:1"),
