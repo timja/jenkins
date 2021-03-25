@@ -25,6 +25,7 @@
 package hudson.model;
 
 import com.infradna.tool.bridge_method_injector.WithBridgeMethods;
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import hudson.Extension;
 import hudson.ExtensionPoint;
 import hudson.FilePath;
@@ -49,7 +50,6 @@ import hudson.util.ClockDifference;
 import hudson.util.DescribableList;
 import hudson.util.EnumConverter;
 import hudson.util.TagCloud;
-import hudson.util.TagCloud.WeightFunction;
 import java.io.IOException;
 import java.lang.reflect.Type;
 import java.util.Collections;
@@ -99,13 +99,14 @@ public abstract class Node extends AbstractModelObject implements Reconfigurable
     private static final Logger LOGGER = Logger.getLogger(Node.class.getName());
 
     /** @see <a href="https://issues.jenkins-ci.org/browse/JENKINS-46652">JENKINS-46652</a> */
+    @SuppressFBWarnings("MS_SHOULD_BE_FINAL")
     public static /* not final */ boolean SKIP_BUILD_CHECK_ON_FLYWEIGHTS = SystemProperties.getBoolean(Node.class.getName() + ".SKIP_BUILD_CHECK_ON_FLYWEIGHTS", true);
 
     /**
      * Newly copied agents get this flag set, so that Jenkins doesn't try to start/remove this node until its configuration
      * is saved once.
      */
-    protected volatile transient boolean holdOffLaunchUntilSave;
+    protected transient volatile boolean holdOffLaunchUntilSave;
 
     public String getDisplayName() {
         return getNodeName(); // default implementation
@@ -282,11 +283,7 @@ public abstract class Node extends AbstractModelObject implements Reconfigurable
      * Return the possibly empty tag cloud for the labels of this node.
      */
     public TagCloud<LabelAtom> getLabelCloud() {
-        return new TagCloud<>(getAssignedLabels(), new WeightFunction<LabelAtom>() {
-            public float weight(LabelAtom item) {
-                return item.getTiedJobCount();
-            }
-        });
+        return new TagCloud<>(getAssignedLabels(), Label::getTiedJobCount);
     }
     /**
      * Returns the possibly empty set of labels that are assigned to this node,
@@ -526,7 +523,7 @@ public abstract class Node extends AbstractModelObject implements Reconfigurable
 
         final JSONObject jsonForProperties = form.optJSONObject("nodeProperties");
         final AtomicReference<BindInterceptor> old = new AtomicReference<>();
-        old.set(req.setBindListener(new BindInterceptor() {
+        old.set(req.setBindInterceptor(new BindInterceptor() {
             @Override
             public Object onConvert(Type targetType, Class targetTypeErasure, Object jsonSource) {
                 if (jsonForProperties != jsonSource) {

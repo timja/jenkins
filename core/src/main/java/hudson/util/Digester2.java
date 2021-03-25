@@ -80,7 +80,7 @@ public class Digester2 extends Digester {
 
     /**
      * @param processSecurely true iff this should configure the parser to prevent XXE.
-     * @since TODO
+     * @since 2.275 and 2.263.2
      */
     public Digester2(boolean processSecurely) {
         if (processSecurely) {
@@ -91,7 +91,7 @@ public class Digester2 extends Digester {
     /**
      * @param reader the reader
      * @param processSecurely true iff this should configure the parser to prevent XXE.
-     * @since TODO
+     * @since 2.275 and 2.263.2
      */
     public Digester2(XMLReader reader, boolean processSecurely) {
         super(reader);
@@ -145,7 +145,7 @@ public class Digester2 extends Digester {
     private static final class ObjectCreateRule2 extends Rule {
         private final Class clazz;
         
-        public ObjectCreateRule2(Class clazz) {
+        ObjectCreateRule2(Class clazz) {
             this.clazz = clazz;
         }
 
