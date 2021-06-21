@@ -37,6 +37,8 @@ jobs:
           GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
           GIT_AUTHOR_NAME: jenkins-dependency-updater
           GIT_AUTHOR_EMAIL: <81680575+jenkins-dependency-updater[bot]@users.noreply.github.com>
+          GIT_COMMITTER_NAME: jenkins-dependency-updater
+          GIT_COMMITTER_EMAIL: <81680575+jenkins-dependency-updater[bot]@users.noreply.github.com>
         run: |
           wget https://raw.githubusercontent.com/timja/core-changelog-generator/automate-changelog-generation/generate-weekly-changelog.sh
           bash generate-weekly-changelog.sh
