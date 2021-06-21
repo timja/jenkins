@@ -27,6 +27,7 @@ jobs:
         with:
           app_id: ${{ secrets.JENKINS_DEPENDENCY_UPDATER_APP_ID }}
           private_key: ${{ secrets.JENKINS_DEPENDENCY_UPDATER_PRIVATE_KEY }}
+          repository: timja/jenkins.io
       - name: Check out
         uses: actions/checkout@v2.3.4
         with:
