@@ -35,7 +35,7 @@ jobs:
       - name: Publish jenkins.io changelog draft
         env:
           GITHUB_TOKEN: ${{ steps.generate-token.outputs.token }}
-          GITHUB_AUTH: ${{ steps.generate-token.outputs.token }}
+          GITHUB_AUTH: "nobody:${{ steps.generate-token.outputs.token }}"
           GIT_AUTHOR_NAME: jenkins-dependency-updater
           GIT_AUTHOR_EMAIL: <81680575+jenkins-dependency-updater[bot]@users.noreply.github.com>
           GIT_COMMITTER_NAME: jenkins-dependency-updater
