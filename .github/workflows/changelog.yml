@@ -41,5 +41,8 @@ jobs:
           GIT_COMMITTER_EMAIL: <81680575+jenkins-dependency-updater[bot]@users.noreply.github.com>
         run: |
           git fetch --tags
-          wget https://raw.githubusercontent.com/timja/core-changelog-generator/automate-changelog-generation/generate-weekly-changelog.sh
+          git branch
+          echo
+          git tag
+          wget --quiet https://raw.githubusercontent.com/timja/core-changelog-generator/automate-changelog-generation/generate-weekly-changelog.sh
           bash generate-weekly-changelog.sh
