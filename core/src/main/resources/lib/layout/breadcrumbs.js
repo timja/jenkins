@@ -100,84 +100,6 @@ var breadcrumbs = (function() {
     }
 
     /**
-     * '>' control used to launch context menu.
-     */
-    var menuSelector = (function() {
-        var menuSelector = $(document.createElement("div"));
-        var menuSelectorTarget;
-        var parentToUpdate;
-
-        document.body.appendChild(menuSelector);
-        menuSelector.id = 'menuSelector';
-
-        /**
-         * @param target
-         *      DOM node to attach this selector to.
-         */
-        menuSelector.show = function(target) {
-            var xy = Dom.getXY(target);
-
-            if ($(target).hasClassName("inside"))
-                xy[0] -= this.offsetWidth;  // show the menu selector inside the text
-
-            if ($(target).hasClassName("inverse")) {
-                menuSelector.addClassName("inverse");
-            } else {
-                menuSelector.removeClassName("inverse");
-            }
-
-            xy[0] += target.offsetWidth;
-            xy[1] += target.offsetHeight/2 - this.offsetHeight/2;
-            Dom.setXY(this, xy);
-            this.target = target;
-
-            this.style.visibility = "visible";
-
-            menuSelectorTarget = target;
-            var updateParentSelector = menuSelectorTarget.getAttribute('update-parent-class');
-            if (updateParentSelector) {
-                parentToUpdate = $(menuSelectorTarget).up(updateParentSelector);
-            }
-        };
-        menuSelector.hide = function() {
-            this.style.visibility = "hidden";
-            menuSelectorTarget = undefined;
-            parentToUpdate = undefined;
-        };
-        menuSelector.observe("click",function () {
-            invokeContextMenu(this.target);
-        });
-
-        // if the mouse leaves the selector, hide it
-        canceller = new Delayed(function () {
-            logger("hiding 'v'");
-            menuSelector.hide();
-        }.bind(menuSelector), 750);
-
-        menuSelector.observe("mouseover",function () {
-            if (menuSelectorTarget) {
-                if (parentToUpdate) {
-                    parentToUpdate.addClassName('model-link-active');
-                }
-                menuSelectorTarget.addClassName('mouseIsOverMenuSelector');
-            }
-            canceller.cancel();
-        });
-        menuSelector.observe("mouseout",function () {
-            canceller.schedule();
-            if (menuSelectorTarget) {
-                if (parentToUpdate) {
-                    parentToUpdate.removeClassName('model-link-active');
-                }
-                menuSelectorTarget.removeClassName('mouseIsOverMenuSelector');
-            }
-        });
-        menuSelector.canceller = canceller;
-
-        return menuSelector;
-    })();
-
-    /**
      * Called when the user clicks a mouse to show a context menu.
      *
      * If the mouse stays there for a while, a context menu gets displayed.
@@ -238,32 +160,18 @@ var breadcrumbs = (function() {
         return false;
     }
 
-//    Behaviour.specify("#breadcrumbs LI", 'breadcrumbs', 0, function (e) {
-//        // when the mouse hovers over LI, activate the menu
-//        if (e.hasClassName("no-context-menu"))  return;
-//        e.observe("mouseover", function () { handleHover(e.firstChild) });
-//    });
-
-    Behaviour.specify("A.model-link", 'breadcrumbs', 0, function (a) {
-        // ditto for model-link, but give it a larger delay to avoid unintended menus to be displayed
-        // $(a).observe("mouseover", function () { handleHover(a,500); });
-
-        a.observe("mouseover",function () {
-            logger("mouse entered model-link %s",this.href);
-            menuSelector.canceller.cancel();
-            menuSelector.show(this);
-        });
-        a.observe("mouseout",function () {
-            logger("mouse left model-link %s",this.href);
-            menuSelector.canceller.schedule();
-        });
+    Behaviour.specify("A.model-link", 'breadcrumbs', 0, function (link) {
+        const dropdownChevron = document.createElement("button")
+        dropdownChevron.className = "jenkins-menu-dropdown-chevron"
+        dropdownChevron.addEventListener("click", function(e) {
+            e.preventDefault();
+            invokeContextMenu(link, null);
+        })
+        link.appendChild(dropdownChevron)
     });
 
     Behaviour.specify("#breadcrumbs LI.children", 'breadcrumbs', 0, function (a) {
-        a.observe("mouseover",function() {
-            menuSelector.hide();
-        });
-        a.observe("click",function() {
+        a.observe("click", function() {
             invokeContextMenu(this,"childrenContextMenu");
         })
     });
