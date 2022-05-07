@@ -10,9 +10,10 @@ ports:
   - port: 8080
     onOpen: open-browser
 
-prebuilds:
-  pullRequestsFromForks: true
+github:
+  prebuilds:
+    pullRequestsFromForks: true
 
 image:
-  file: .gitpod.Dockerfile
+  file: '.gitpod.Dockerfile'
 
