@@ -4,7 +4,8 @@
 
 tasks:
   - init: mvn install -P quick-build
-  - command: mvn -pl war jetty:run
+    command: mvn -pl war jetty:run
+  - command: gp await-port 8080 && gp url 8080 && gp preview $(gp url 8080)/jenkins/
 
 ports:
   - port: 8080
