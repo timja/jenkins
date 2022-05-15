@@ -28,6 +28,13 @@ You can find them by using this query (check the link) for [newbie friendly issu
 The Jenkins core build flow is built around Maven.
 You can read a description of the [building and debugging process here].
 
+You can open this project as a [Gitpod workspace](https://www.gitpod.io/) which comes pre-configured with all the tools you will need.
+
+[![Open in Gitpod](https://gitpod.io/button/open-in-gitpod.svg)](https://gitpod.io/#https://github.com/jenkinsci/design-library-plugin)
+
+If you prefer using IntelliJ IDEA, you can setup Gitpod integration with JetBrains Gateway using the instructions given [here](https://www.gitpod.io/docs/ides-and-editors/intellij),
+which will open the workspace in IntelliJ IDEA using JetBrains Gateway.
+
 If you want simply to build the `jenkins.war` file as fast as possible without tests, run:
 
 ```sh
