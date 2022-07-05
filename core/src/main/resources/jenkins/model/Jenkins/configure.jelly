@@ -28,14 +28,35 @@ THE SOFTWARE.
 <?jelly escape-by-default='true'?>
 <j:jelly xmlns:j="jelly:core" xmlns:st="jelly:stapler" xmlns:d="jelly:define" xmlns:l="/lib/layout" xmlns:t="/lib/hudson" xmlns:f="/lib/form">
 <l:layout permissions="${app.MANAGE_AND_SYSTEM_READ}" title="${%Configure System}">
-  <st:include page="sidepanel.jelly" />
+  <l:side-panel>
+    <div id="tasks">
+      <div class="jenkins-app-bar">
+        <div class="jenkins-app-bar__content">
+          <h1>${%Configuration}</h1>
+        </div>
+      </div>
+    </div>
+  </l:side-panel>
   <f:breadcrumb-config-outline title="${%Configure System}" />
 
-  <l:app-bar title="${%Configure System}" />
+  <l:header>
+    <script src="${resURL}/jsbundles/section-to-sidebar-items.js" type="text/javascript" defer="true" />
+  </l:header>
 
   <l:main-panel>
     <div class="behavior-loading"><l:spinner text="${%LOADING}"/></div>
-    <f:form method="post" name="config" action="configSubmit" class="jenkins-form">
+    <f:form method="post" name="config" action="configSubmit" class="jenkins-form config-table">
+      <div class="jenkins-app-bar">
+        <div class="jenkins-app-bar__content">
+          <h2>
+            <div class="jenkins-hidden">
+              <l:icon src="symbol-settings" />
+            </div>
+            <span>${%General}</span>
+          </h2>
+        </div>
+      </div>
+
       <j:set var="instance" value="${it}" />
       <j:set var="descriptor" value="${instance.descriptor}" />
 
