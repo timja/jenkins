@@ -38,6 +38,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Supplier;
+import java.util.logging.Logger;
 import jenkins.model.Jenkins;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.jelly.JellyContext;
@@ -52,6 +53,7 @@ import org.kohsuke.accmod.restrictions.NoExternalUse;
  */
 public class IconSet {
 
+    private static final Logger LOGGER = Logger.getLogger(IconSet.class.getName());
 
     public static final IconSet icons = new IconSet();
     // keyed by plugin name / core, and then symbol name returning the SVG as a string
@@ -139,6 +141,15 @@ public class IconSet {
         SYMBOLS.put(identifier, symbolsForLookup);
 
         return prependTitleIfRequired(symbol, title);
+    }
+
+    @Restricted(NoExternalUse.class)
+    public static String getSymbol(String name, Integer title, String tooltip, String classes, String pluginName, String id) {
+        LOGGER.severe(
+                String.format("INVALID symbol detected, name=%s, title=%d, tooltip=%s, classes=%s, pluginName=%s, id=%s",
+                name, title, tooltip, classes, pluginName, id));
+
+        return getSymbol(name, "", tooltip, classes, pluginName, id);
     }
 
     private static ClassLoader getClassLoader(String pluginName) {
