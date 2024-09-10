@@ -16,8 +16,6 @@ jobs:
     if: ${{ github.repository_owner == 'timja' }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - name: Run update-since-todo.py
         run: |
           body=$(./update-since-todo.py)
