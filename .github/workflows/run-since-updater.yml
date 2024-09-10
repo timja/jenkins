@@ -1,8 +1,8 @@
 name: Run update-since-todo.py
 
 on:
-  schedule:
-    - cron: "0 16 * * THU"
+#  schedule:
+#    - cron: "0 16 * * THU"
   workflow_dispatch:
 
 permissions:
@@ -12,15 +12,12 @@ permissions:
 jobs:
   run_script:
     runs-on: ubuntu-latest
-    if: ${{ github.repository_owner == 'jenkinsci' }}
+    if: ${{ github.repository_owner == 'timja' }}
     steps:
       - uses: actions/checkout@v3
       - name: Run update-since-todo.py
         run: |
           body=$(./update-since-todo.py)
-          body="${body//'%'/'%25'}"
-          body="${body//$'\n'/'%0A'}"
-          body="${body//$'\r'/'%0D'}" 
           echo "PROGRESS=$body" >> $GITHUB_OUTPUT
         id: run_script
         shell: bash
