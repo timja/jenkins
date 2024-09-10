@@ -22,7 +22,7 @@ jobs:
           
           echo "${body}"
           
-          echo "PROGRESS=DELIMITER$bodyDELIMITER" >> $GITHUB_OUTPUT
+          echo "PROGRESS<<DELIMITER$bodyDELIMITER" >> $GITHUB_OUTPUT
         id: run_script
         shell: bash
       - name: Create Pull Request
