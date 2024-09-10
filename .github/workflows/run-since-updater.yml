@@ -20,6 +20,10 @@ jobs:
           fetch-depth: 0
       - name: Run update-since-todo.py
         run: |
+          git tag
+          
+          git log 7006cded64f63f788ae91dd7b7587a4a39e70273
+          
           ./update-since-todo.py
           
           body=$(./update-since-todo.py)
