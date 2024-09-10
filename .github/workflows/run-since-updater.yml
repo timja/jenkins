@@ -4,6 +4,7 @@ on:
 #  schedule:
 #    - cron: "0 16 * * THU"
   workflow_dispatch:
+  push:
 
 permissions:
   contents: write
@@ -18,6 +19,9 @@ jobs:
       - name: Run update-since-todo.py
         run: |
           body=$(./update-since-todo.py)
+          
+          echo $body
+          
           echo "PROGRESS=$body" >> $GITHUB_OUTPUT
         id: run_script
         shell: bash
