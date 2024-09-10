@@ -22,7 +22,7 @@ jobs:
         run: |
           body=$(./update-since-todo.py)
           
-          echo $body
+          echo "${body}"
           
           echo "PROGRESS=$body" >> $GITHUB_OUTPUT
         id: run_script
