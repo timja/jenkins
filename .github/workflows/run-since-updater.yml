@@ -22,7 +22,11 @@ jobs:
           
           echo "${body}"
           
-          echo "PROGRESS=EOF$bodyEOF" >> $GITHUB_OUTPUT
+          {
+            echo 'PROGRESS=EOF'
+            echo "${body}"
+            echo 'EOF'
+          } >> $GITHUB_OUTPUT
         id: run_script
         shell: bash
       - name: Create Pull Request
