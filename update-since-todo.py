@@ -79,6 +79,7 @@ def analyze_file(file, lineno, commits_and_tags, dry_run=False):
             "Normal if the associated PR/commit is not merged and released yet; "
             "otherwise make sure to fetch tags from jenkinsci/jenkins"
         )
+    println() # Add a newline for markdown rendering
 
 
 def analyze_files(commits_and_tags, dry_run=False):
