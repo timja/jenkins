@@ -11,7 +11,7 @@ permissions:
   pull-requests: write
 
 jobs:
-  run_script:
+  since_updater:
     runs-on: ubuntu-latest
     if: ${{ github.repository_owner == 'timja' }}
     steps:
@@ -23,7 +23,7 @@ jobs:
           echo "${body}"
           
           {
-            echo 'PROGRESS=EOF'
+            echo 'PROGRESS<<EOF'
             echo "${body}"
             echo 'EOF'
           } >> $GITHUB_OUTPUT
