@@ -4,6 +4,7 @@ on:
   schedule:
     - cron: "0 16 * * THU"
   workflow_dispatch:
+  push:
 
 permissions:
   contents: write
@@ -12,7 +13,7 @@ permissions:
 jobs:
   since_updater:
     runs-on: ubuntu-latest
-    if: ${{ github.repository_owner == 'jenkinsci' }}
+    if: ${{ github.repository_owner == 'timja' }}
     steps:
       - uses: actions/checkout@v4
         with:
