@@ -114,7 +114,7 @@ def analyze_files(commits_and_tags, dry_run=False):
             raise subprocess.CalledProcessError(retcode, cmd)
     print()
     if runningInCI:
-        print("\n</details>")
+        print("</details>\n")
 
 
 def display_results(commits_and_tags):
