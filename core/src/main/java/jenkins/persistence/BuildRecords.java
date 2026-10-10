@@ -32,10 +32,12 @@ import hudson.ExtensionPoint;
 import hudson.FilePath;
 import hudson.Util;
 import hudson.XmlFile;
+import hudson.model.Item;
 import hudson.model.Job;
 import hudson.model.Run;
 import hudson.model.RunMap;
 import hudson.model.Saveable;
+import hudson.model.listeners.ItemListener;
 import hudson.model.listeners.RunListener;
 import hudson.model.listeners.SaveableListener;
 import hudson.util.DirScanner;
@@ -270,6 +272,32 @@ public final class BuildRecords {
             blobs.delete(base);
         }
         LOGGER.fine(() -> "Deleted stored " + run);
+    }
+
+    /**
+     * Removes every build record, snapshot and running placeholder of a job, as when the job is deleted.
+     * The job's {@code nextBuildNumber} is kept, so that a job recreated with the same name never reuses a number.
+     */
+    @Restricted(NoExternalUse.class)
+    public static void deleteAll(@NonNull Job<?, ?> job) throws IOException {
+        String builds = buildsKey(job);
+        if (builds == null) {
+            return;
+        }
+        PersistenceStore store = PersistenceStores.get();
+        for (String number : store.children(builds)) {
+            store.delete(builds + "/" + number + "/" + RECORD, PersistenceStore.ANY);
+        }
+        String running = builds.substring(0, builds.length() - "builds".length()) + RunningBuilds.PREFIX;
+        for (String name : store.children(running)) {
+            store.delete(running + "/" + name, PersistenceStore.ANY);
+        }
+        BlobStore blobs = PersistenceStores.getBlobStore();
+        if (blobs != null) {
+            blobs.delete(builds);
+        }
+        RunningBuilds.invalidate(builds.substring(0, builds.length() - "/builds".length()));
+        LOGGER.fine(() -> "Deleted stored builds of " + job.getFullName());
     }
 
     /**
@@ -518,6 +546,24 @@ public final class BuildRecords {
                 delete(run);
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.WARNING, "Failed to delete stored " + run, e);
+            }
+        }
+    }
+
+    @Restricted(NoExternalUse.class)
+    @Extension
+    public static final class ItemDeleted extends ItemListener {
+
+        @Override
+        public void onDeleted(Item item) {
+            // folders delete their children one by one, so each job gets here
+            if (!(item instanceof Job<?, ?> job) || PersistenceStores.isApplyingRemoteChange()) {
+                return;
+            }
+            try {
+                deleteAll(job);
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.WARNING, "Failed to delete stored builds of " + job.getFullName(), e);
             }
         }
     }
