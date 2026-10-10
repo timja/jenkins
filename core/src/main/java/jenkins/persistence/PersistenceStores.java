@@ -678,6 +678,10 @@ public final class PersistenceStores {
         if (version <= PersistenceStore.ABSENT) {
             elements.remove(key);
         }
+        Base base = bases.get(key);
+        if (base != null && base.version() != version) {
+            bases.remove(key); // not the content of this version: never merge against it
+        }
     }
 
     /**
@@ -685,6 +689,22 @@ public final class PersistenceStores {
      */
     public static long lastSeen(@NonNull String key) {
         return versions.getOrDefault(key, PersistenceStore.ANY);
+    }
+
+    /** Content of an XML key at a version, the base of a merge. */
+    private record Base(long version, byte[] content) {}
+
+    private static final Map<String, Base> bases = new ConcurrentHashMap<>();
+    private static final int MERGE_ATTEMPTS = 5;
+    private static final int MAX_BASE_SIZE = 1024 * 1024;
+    private static final AtomicLong merges = new AtomicLong();
+
+    private static void remember(String key, long version, byte[] content) {
+        if (key.endsWith(".xml") && content.length <= MAX_BASE_SIZE) {
+            bases.put(key, new Base(version, content));
+        } else {
+            bases.remove(key);
+        }
     }
 
     /**
@@ -696,10 +716,18 @@ public final class PersistenceStores {
     public static void forgetUnder(@NonNull String prefix) {
         versions.keySet().removeIf(k -> k.startsWith(prefix + "/"));
         elements.keySet().removeIf(k -> k.startsWith(prefix + "/"));
+        bases.keySet().removeIf(k -> k.startsWith(prefix + "/"));
     }
 
     /**
-     * Number of conflicting writes detected (and, under the {@code warn} policy, overwritten) by this JVM.
+     * Number of conflicting writes merged (Target 11) by this JVM.
+     */
+    public static long getMergeCount() {
+        return merges.get();
+    }
+
+    /**
+     * Number of conflicting writes detected (and, under the {@code warn} policy, merged or overwritten) by this JVM.
      */
     public static long getConflictCount() {
         return conflicts.get();
@@ -913,7 +941,9 @@ public final class PersistenceStores {
         testingBlobStore = blobs;
         versions.clear();
         elements.clear();
+        bases.clear();
         conflicts.set(0);
+        merges.set(0);
     }
 
     /**
@@ -927,6 +957,7 @@ public final class PersistenceStores {
             seen(key, entry == null ? PersistenceStore.ABSENT : entry.version());
             if (entry != null) {
                 held(key, entry.content(), true);
+                remember(key, entry.version(), entry.content());
             }
             return entry;
         }
@@ -950,15 +981,61 @@ public final class PersistenceStores {
                 if (createOnly || "fail".equals(CONFLICTS)) {
                     throw e;
                 }
-                LOGGER.log(Level.WARNING, e.getMessage() + "; overwriting (last writer wins)");
-                version = store.write(key, content, PersistenceStore.ANY);
+                Long merged = mergeAndWrite(content, expected);
+                if (merged != null) {
+                    version = merged;
+                } else {
+                    LOGGER.log(Level.WARNING, e.getMessage() + "; overwriting (last writer wins)");
+                    version = store.write(key, content, PersistenceStore.ANY);
+                }
             }
             if (creation != null) {
                 creation.written = version;
             }
             seen(key, version);
             held(key, content, false);
+            remember(key, version, content);
             return version;
+        }
+
+        /**
+         * Merges what this JVM wrote with what was written meanwhile, against what it had read, and writes the result.
+         * The object in memory is reloaded from it afterwards, so that it also has the other change.
+         *
+         * @return the new version, or null if the contents cannot be merged
+         */
+        @CheckForNull
+        private Long mergeAndWrite(byte[] mine, long expected) throws IOException {
+            Base base = bases.get(key);
+            if (base == null || base.version() != expected || !key.endsWith(".xml")) {
+                return null;
+            }
+            for (int attempt = 0; attempt < MERGE_ATTEMPTS; attempt++) {
+                PersistenceStore.Entry theirs = store.read(key);
+                if (theirs == null) {
+                    return null; // deleted meanwhile
+                }
+                XmlMerge.Result result = XmlMerge.merge(base.content(), mine, theirs.content());
+                if (result == null) {
+                    return null;
+                }
+                try {
+                    long version = store.write(key, result.merged(), theirs.version());
+                    merges.incrementAndGet();
+                    if (result.conflicts() > 0) {
+                        LOGGER.warning(() -> key + " was changed meanwhile; merged, but " + result.conflicts()
+                                + " part(s) changed on both sides keep this controller's version");
+                    } else {
+                        LOGGER.info(() -> key + " was changed meanwhile; merged both changes");
+                    }
+                    remember(key, version, result.merged());
+                    ItemChangeApplier.reload(key); // this JVM's object lacks the other change
+                    return version;
+                } catch (ConflictException again) {
+                    LOGGER.fine(() -> key + " changed again while merging; retrying");
+                }
+            }
+            return null;
         }
 
         public void delete() throws IOException {

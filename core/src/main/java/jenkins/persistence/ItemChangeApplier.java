@@ -105,6 +105,21 @@ public final class ItemChangeApplier {
         });
     }
 
+    /**
+     * Reloads the object stored at a key from the store, as if another controller had changed it, for example after this
+     * JVM merged its write with one made elsewhere.
+     */
+    static void reload(String key) {
+        ItemChangeApplier a = instance;
+        if (a != null) {
+            a.pending.incrementAndGet();
+            a.queue.add(new ChangeEvent(ChangeEvent.Kind.WRITTEN, key, null, Long.MAX_VALUE, MERGED));
+        }
+    }
+
+    /** The origin of {@link #reload} events (never a controller's). */
+    private static final String MERGED = "(merged here)";
+
     // before global configuration is loaded, which item loading (requiring SYSTEM_CONFIG_ADAPTED) follows: an item read
     // before subscribing could miss a change made in between, never delivered and newer than what was read
     @Initializer(after = InitMilestone.EXTENSIONS_AUGMENTED, before = InitMilestone.SYSTEM_CONFIG_LOADED)
