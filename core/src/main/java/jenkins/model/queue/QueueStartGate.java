@@ -50,6 +50,28 @@ public interface QueueStartGate extends ExtensionPoint {
     CauseOfBlockage mayStart(@NonNull Queue.BuildableItem item);
 
     /**
+     * Whether this controller should provision capacity (such as cloud agents) for an item now.
+     * With several controllers sharing a queue, each holds every waiting item, and only one should provision for it.
+     *
+     * @return false if another controller is expected to provision for, and run, the item
+     */
+    default boolean countsForProvisioning(@NonNull Queue.BuildableItem item) {
+        return true;
+    }
+
+    /**
+     * Whether every gate lets this controller provision for an item.
+     */
+    static boolean provisionsFor(@NonNull Queue.BuildableItem item) {
+        for (QueueStartGate gate : ExtensionList.lookup(QueueStartGate.class)) {
+            if (!gate.countsForProvisioning(item)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
      * Consults every gate.
      */
     @CheckForNull
