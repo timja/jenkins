@@ -763,6 +763,50 @@ public final class SharedQueue {
     @Restricted(NoExternalUse.class)
     @Extension
     public static final class Gate implements QueueStartGate {
+        /** Recent provisioning answers per item id: load statistics ask for every label, every few seconds. */
+        private final Map<Long, Map.Entry<Long, Boolean>> provisioning = new ConcurrentHashMap<>();
+
+        /**
+         * Only one controller provisions for an item: the one that claimed it, or it is pinned to; otherwise its origin
+         * while alive (it goes first, and may hold the agents the build needs); otherwise, any.
+         */
+        @Override
+        public boolean countsForProvisioning(@NonNull Queue.BuildableItem item) {
+            if (!shared(item.task)) {
+                return true;
+            }
+            long now = System.currentTimeMillis();
+            Map.Entry<Long, Boolean> cached = provisioning.get(item.getId());
+            if (cached != null && now - cached.getKey() < 2_000) {
+                return cached.getValue();
+            }
+            boolean answer;
+            try {
+                ClusterQueue.Record r = queue().get(item.getId());
+                String me = origin();
+                if (r == null) {
+                    answer = true;
+                } else if (r.claimedBy() != null) {
+                    answer = me.equals(r.claimedBy());
+                } else if (r.pinnedTo() != null) {
+                    answer = me.equals(r.pinnedTo());
+                } else if (me.equals(r.origin())) {
+                    answer = true;
+                } else {
+                    Set<String> live = PersistenceStores.get().liveOrigins();
+                    answer = live != null && !live.contains(r.origin());
+                }
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.FINE, e, () -> "Cannot tell who provisions for " + item);
+                answer = true;
+            }
+            if (provisioning.size() > 10_000) {
+                provisioning.clear();
+            }
+            provisioning.put(item.getId(), Map.entry(now, answer));
+            return answer;
+        }
+
         @Override
         public CauseOfBlockage mayStart(@NonNull Queue.BuildableItem item) {
             if (!shared(item.task)) {

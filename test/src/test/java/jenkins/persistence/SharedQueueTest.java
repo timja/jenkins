@@ -348,6 +348,28 @@ class SharedQueueTest {
     }
 
     @Test
+    void onlyItsOriginProvisionsForAnItem() throws Exception {
+        Label cloudy = Label.get("cloudy"); // no node has it: items stay buildable, waiting for capacity
+        FreeStyleProject elsewhere = r.createFreeStyleProject("cloudy-elsewhere");
+        elsewhere.setAssignedLabel(cloudy);
+        publishElsewhere("cloudy-elsewhere", 0, "carol");
+        for (int i = 0; i < 100 && Queue.getInstance().getBuildableItems().isEmpty(); i++) {
+            Thread.sleep(100);
+        }
+        assertEquals(1, Queue.getInstance().getBuildableItems().size());
+        assertEquals(0, cloudy.loadStatistics.computeSnapshot().getQueueLength(), "the other controller provisions for its item");
+
+        FreeStyleProject here = r.createFreeStyleProject("cloudy-here");
+        here.setAssignedLabel(cloudy);
+        here.scheduleBuild2(0);
+        for (int i = 0; i < 100 && Queue.getInstance().getBuildableItems().size() < 2; i++) {
+            Thread.sleep(100);
+        }
+        assertEquals(1, cloudy.loadStatistics.computeSnapshot().getQueueLength(), "this controller provisions for its own item");
+        Queue.getInstance().clear();
+    }
+
+    @Test
     void itemClaimedElsewhereDoesNotStartHere() throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("claimed");
         ClusterQueue.Record rec = publishElsewhere("claimed", 2_000, "bob");
