@@ -1,0 +1,106 @@
+/*
+ * The MIT License
+ *
+ * Copyright (c) 2026, Jenkins project contributors
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
+package jenkins.persistence;
+
+import edu.umd.cs.findbugs.annotations.CheckForNull;
+import edu.umd.cs.findbugs.annotations.NonNull;
+import java.io.IOException;
+import java.util.List;
+import java.util.function.Consumer;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.Beta;
+
+/**
+ * The build queue shared by all controllers using a store, obtained from {@link PersistenceStore#queue}.
+ * Each controller mirrors it into its local {@link hudson.model.Queue} (see {@link SharedQueue});
+ * an item may only start on the controller which {@linkplain #claim claims} it.
+ *
+ * @since TODO
+ */
+@Restricted(Beta.class)
+public interface ClusterQueue {
+
+    enum State { WAITING, CLAIMED, STARTED, CANCELLED }
+
+    /**
+     * An item in the shared queue.
+     *
+     * @param id unique across the cluster; also the local queue item id on every controller
+     * @param task full name of the job
+     * @param dedupKey items with the same key fold into one while waiting
+     * @param actions persistable actions of the item, as XML
+     * @param dueAt when the quiet period ends, in milliseconds since the epoch
+     * @param origin the controller which accepted the item
+     * @param pinnedTo if set, the only origin which may claim the item
+     * @param claimedBy the origin which claimed it, if claimed or started
+     * @param buildNumber once started
+     */
+    record Record(long id, @NonNull String task, @NonNull String dedupKey, @NonNull String actions, long dueAt, @NonNull State state,
+            @NonNull String origin, @CheckForNull String pinnedTo, @CheckForNull String claimedBy, int buildNumber) {}
+
+    /** A new unique id. */
+    long nextId() throws IOException;
+
+    /**
+     * Adds an item, unless an item with the same dedup key is waiting already.
+     *
+     * @return the stored record: the new one, or the existing one this item should fold into
+     */
+    @NonNull
+    Record publish(@NonNull Record item) throws IOException;
+
+    /**
+     * Updates the actions and due time of a waiting item after another schedule folded into it.
+     */
+    void update(long id, @NonNull String actions, long dueAt) throws IOException;
+
+    /**
+     * Claims a waiting item for this controller.
+     *
+     * @return true if this controller now has it, false if it was claimed, started or cancelled elsewhere
+     */
+    boolean claim(long id) throws IOException;
+
+    /** Records that an item claimed here started as the given build. */
+    void started(long id, int buildNumber) throws IOException;
+
+    /**
+     * Cancels a waiting item.
+     *
+     * @return false if it was not waiting
+     */
+    boolean cancel(long id) throws IOException;
+
+    @CheckForNull
+    Record get(long id) throws IOException;
+
+    /** Items waiting or claimed, for mirroring at startup. */
+    @NonNull
+    List<Record> pending() throws IOException;
+
+    /** Receives every change of any record, in order, including this controller's own. */
+    @NonNull
+    AutoCloseable subscribe(@NonNull Consumer<Record> listener);
+}

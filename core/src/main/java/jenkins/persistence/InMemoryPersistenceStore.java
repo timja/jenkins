@@ -69,6 +69,8 @@ public class InMemoryPersistenceStore implements PersistenceStore {
     private Thread draining;
     private final Map<String, long[]> leaseEpochs;
     private final Map<String, String> leaseOwners;
+    private final Map<Long, ClusterQueue.Record> queueRecords;
+    private final List<Consumer<ClusterQueue.Record>> queueListeners;
     /** Versions come from one counter, so a key that is deleted and recreated never repeats a version. */
     private long clock;
 
@@ -85,6 +87,8 @@ public class InMemoryPersistenceStore implements PersistenceStore {
         this.delivering = new Object();
         this.leaseEpochs = new TreeMap<>();
         this.leaseOwners = new TreeMap<>();
+        this.queueRecords = new TreeMap<>();
+        this.queueListeners = new CopyOnWriteArrayList<>();
     }
 
     private InMemoryPersistenceStore(InMemoryPersistenceStore root, String origin) {
@@ -97,6 +101,8 @@ public class InMemoryPersistenceStore implements PersistenceStore {
         this.delivering = root.delivering;
         this.leaseEpochs = root.leaseEpochs;
         this.leaseOwners = root.leaseOwners;
+        this.queueRecords = root.queueRecords;
+        this.queueListeners = root.queueListeners;
     }
 
     /**
@@ -151,6 +157,135 @@ public class InMemoryPersistenceStore implements PersistenceStore {
                 root.draining = null;
             }
         }
+    }
+
+    /**
+     * A shared queue held in memory, for tests. Not returned by {@link #queue} unless a subclass does so.
+     */
+    @NonNull
+    public ClusterQueue clusterQueue() {
+        return new ClusterQueue() {
+            private void fire(Record r) {
+                for (Consumer<Record> l : queueListeners) {
+                    l.accept(r);
+                }
+            }
+
+            private Record with(Record r, State state, String claimedBy, int buildNumber, String actions, long dueAt) {
+                return new Record(r.id(), r.task(), r.dedupKey(), actions, dueAt, state, r.origin(), r.pinnedTo(), claimedBy, buildNumber);
+            }
+
+            @Override
+            public long nextId() {
+                synchronized (root) {
+                    return ++root.clock;
+                }
+            }
+
+            @Override
+            @NonNull
+            public Record publish(@NonNull Record item) {
+                Record stored;
+                synchronized (root) {
+                    Record same = queueRecords.get(item.id());
+                    if (same != null) {
+                        return same;
+                    }
+                    for (Record r : queueRecords.values()) {
+                        if (r.state() == State.WAITING && r.dedupKey().equals(item.dedupKey())) {
+                            return r;
+                        }
+                    }
+                    stored = item;
+                    queueRecords.put(item.id(), item);
+                }
+                fire(stored);
+                return stored;
+            }
+
+            @Override
+            public void update(long id, @NonNull String actions, long dueAt) {
+                Record next;
+                synchronized (root) {
+                    Record r = queueRecords.get(id);
+                    if (r == null || r.state() != State.WAITING) {
+                        return;
+                    }
+                    next = with(r, r.state(), r.claimedBy(), r.buildNumber(), actions, Math.min(r.dueAt(), dueAt));
+                    if (next.equals(r)) {
+                        return;
+                    }
+                    queueRecords.put(id, next);
+                }
+                fire(next);
+            }
+
+            @Override
+            public boolean claim(long id) {
+                Record next;
+                synchronized (root) {
+                    Record r = queueRecords.get(id);
+                    if (r == null || r.state() != State.WAITING) {
+                        return r != null && origin.equals(r.claimedBy());
+                    }
+                    next = with(r, State.CLAIMED, origin, 0, r.actions(), r.dueAt());
+                    queueRecords.put(id, next);
+                }
+                fire(next);
+                return true;
+            }
+
+            @Override
+            public void started(long id, int buildNumber) {
+                Record next;
+                synchronized (root) {
+                    Record r = queueRecords.get(id);
+                    if (r == null || !origin.equals(r.claimedBy())) {
+                        return;
+                    }
+                    next = with(r, State.STARTED, origin, buildNumber, r.actions(), r.dueAt());
+                    queueRecords.put(id, next);
+                }
+                fire(next);
+            }
+
+            @Override
+            public boolean cancel(long id) {
+                Record next;
+                synchronized (root) {
+                    Record r = queueRecords.get(id);
+                    if (r == null || r.state() != State.WAITING) {
+                        return false;
+                    }
+                    next = with(r, State.CANCELLED, null, 0, r.actions(), r.dueAt());
+                    queueRecords.put(id, next);
+                }
+                fire(next);
+                return true;
+            }
+
+            @Override
+            public Record get(long id) {
+                synchronized (root) {
+                    return queueRecords.get(id);
+                }
+            }
+
+            @Override
+            @NonNull
+            public List<Record> pending() {
+                synchronized (root) {
+                    return queueRecords.values().stream().filter(r -> r.state() == State.WAITING || r.state() == State.CLAIMED).toList();
+                }
+            }
+
+            @Override
+            @NonNull
+            public AutoCloseable subscribe(@NonNull Consumer<Record> listener) {
+                queueListeners.add(listener);
+                return () -> queueListeners.remove(listener);
+            }
+        };
     }
 
     /**

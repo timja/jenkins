@@ -10,6 +10,8 @@ import hudson.model.Queue.Item;
 import hudson.model.Queue.LeftItem;
 import hudson.model.Queue.WaitingItem;
 import java.util.concurrent.Executor;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.Beta;
 
 /**
  * Listener for events in {@link Queue}.
@@ -67,6 +69,15 @@ public abstract class QueueListener implements ExtensionPoint {
      * blocked phase if someone starts vetoing once again.
      */
     public void onLeaveBuildable(BuildableItem bi) {}
+
+    /**
+     * Another request to schedule the same task was folded into this item
+     * (its actions, such as causes, and quiet period may have changed).
+     *
+     * @since TODO
+     */
+    @Restricted(Beta.class)
+    public void onFolded(Queue.Item item) {}
 
     /**
      * The item has left the queue, either by getting {@link Queue#cancel(Item) cancelled} or by getting
