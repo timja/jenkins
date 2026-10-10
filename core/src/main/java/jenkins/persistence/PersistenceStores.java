@@ -40,10 +40,12 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -283,13 +285,15 @@ public final class PersistenceStores {
     /**
      * Moves the stored entries (and blobs) below one directory to another, as when an item is renamed or moved.
      * Does nothing if no store is active or the directories are outside {@code JENKINS_HOME}.
+     * The {@code nextBuildNumber} entries deleted items leave behind at the destination are replaced,
+     * keeping the higher number.
      *
      * <p>The source and destination are claimed first, which excludes other moves of, to, into or out of them, on any
      * controller. It does not exclude an item created at the destination while the move runs: should that item complete a
      * build before the move fails (on finding it there), its snapshots can be overwritten by the moved ones, or moved back
      * to the source with them.
      *
-     * @throws ConflictException if something is already stored at the destination, the item's configuration is no
+     * @throws ConflictException if something else is already stored at the destination, the item's configuration is no
      *     longer stored at the source (moved or deleted elsewhere), or another move holds either, or what holds them
      *     (a folder being moved), or something in the source
      */
@@ -437,9 +441,13 @@ public final class PersistenceStores {
     }
 
     private static void moveClaimed(PersistenceStore store, String fromKey, String toKey) throws IOException {
-        if (store.read(toKey) != null || !store.children(toKey).isEmpty()) {
+        List<String> existing = new ArrayList<>();
+        collectKeys(store, toKey, existing);
+        Map<String, Integer> leftovers = leftoverBuildNumbers(store, existing);
+        if (!existing.isEmpty() && leftovers.isEmpty()) {
             // checked before touching blobs, which would otherwise overwrite those of whatever is at the destination
-            throw new ConflictException(toKey, PersistenceStore.ABSENT, PersistenceStore.ANY);
+            PersistenceStore.Entry there = store.read(existing.get(0));
+            throw new ConflictException(toKey, PersistenceStore.ABSENT, there == null ? PersistenceStore.ANY : there.version());
         }
         String config = fromKey + "/config.xml";
         if (store.owns(config) && store.read(config) == null) {
@@ -453,6 +461,9 @@ public final class PersistenceStores {
             // location. A blob move may fail partway: what it moved is moved back below
             if (blobs != null) {
                 blobs.move(fromKey, toKey);
+            }
+            for (String key : leftovers.keySet()) {
+                store.delete(key, PersistenceStore.ANY);
             }
             moved = store.move(fromKey, toKey);
             checkItemMoved(store, fromKey, toKey, moved);
@@ -470,6 +481,14 @@ public final class PersistenceStores {
         // show for an item created there later
         RunningBuilds.invalidateBelow(fromKey);
         RunningBuilds.invalidateBelow(toKey);
+        for (Map.Entry<String, Integer> leftover : leftovers.entrySet()) {
+            // never go back to numbers an item previously at the destination used
+            PersistenceStore.Entry now = store.read(leftover.getKey());
+            Integer movedNumber = now == null ? null : parseNumber(now.content());
+            if (movedNumber == null || movedNumber < leftover.getValue()) {
+                store.write(leftover.getKey(), (leftover.getValue() + "\n").getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+            }
+        }
         // the moved entries have new versions: take them as seen where this JVM had seen the entry as it was moved, so
         // that the moved item's next save is still checked for conflicts; where it had seen an older version (changed
         // elsewhere since), keep that older one, so that the next save conflicts and merges as it would have unmoved
@@ -508,6 +527,42 @@ public final class PersistenceStores {
             }
         }
         throw e;
+    }
+
+    /**
+     * If all the given keys are {@code nextBuildNumber} entries, as left behind by deleted items, returns them.
+     *
+     * @return key to number; empty if there are no keys, or something else too
+     */
+    private static Map<String, Integer> leftoverBuildNumbers(PersistenceStore store, List<String> keys) throws IOException {
+        Map<String, Integer> leftovers = new TreeMap<>();
+        for (String key : keys) {
+            PersistenceStore.Entry entry = key.endsWith("/nextBuildNumber") ? store.read(key) : null;
+            Integer number = entry == null ? null : parseNumber(entry.content());
+            if (number == null) {
+                return Map.of();
+            }
+            leftovers.put(key, number);
+        }
+        return leftovers;
+    }
+
+    private static void collectKeys(PersistenceStore store, String prefix, List<String> keys) throws IOException {
+        if (store.read(prefix) != null) {
+            keys.add(prefix);
+        }
+        for (String child : store.children(prefix)) {
+            collectKeys(store, prefix + "/" + child, keys);
+        }
+    }
+
+    @CheckForNull
+    private static Integer parseNumber(byte[] content) {
+        try {
+            return Integer.parseInt(new String(content, StandardCharsets.UTF_8).trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     /**
