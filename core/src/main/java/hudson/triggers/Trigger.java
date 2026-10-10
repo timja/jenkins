@@ -62,6 +62,7 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
 import jenkins.security.XStreamNotDeserializable;
+import jenkins.triggers.TriggerCoordinator;
 import jenkins.triggers.TriggeredItem;
 import jenkins.util.SystemProperties;
 import org.jenkinsci.Symbol;
@@ -270,7 +271,7 @@ public abstract class Trigger<J extends Item> implements Describable<Trigger<?>>
                 // FIXME allow to set a global crontab spec
                 previousSynchronousPolling = scmd.getExecutor().submit(new DependencyRunner(p -> {
                     for (Trigger t : (Collection<Trigger>) p.getTriggers().values()) {
-                        if (t instanceof SCMTrigger) {
+                        if (t instanceof SCMTrigger && TriggerCoordinator.allows(p, t, cal)) {
                             if (t.job != null) {
                                 LOGGER.fine("synchronously triggering SCMTrigger for project " + t.job.getName());
                             } else {
@@ -294,7 +295,9 @@ public abstract class Trigger<J extends Item> implements Describable<Trigger<?>>
                     if (t != null && t.spec != null && t.tabs != null) {
                         LOGGER.log(Level.FINE, "cron checking {0} with spec ‘{1}’", new Object[]{p, t.spec.trim()});
 
-                        if (t.tabs.check(cal)) {
+                        if (t.tabs.check(cal) && !TriggerCoordinator.allows(p, t, cal)) {
+                            LOGGER.log(Level.FINE, "cron trigger of {0} left to another controller", p);
+                        } else if (t.tabs.check(cal)) {
                             LOGGER.log(Level.CONFIG, "cron triggered {0}", p);
                             try {
                                 long begin_time = System.currentTimeMillis();
