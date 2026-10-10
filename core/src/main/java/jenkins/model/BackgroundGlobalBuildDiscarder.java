@@ -32,6 +32,7 @@ import java.io.IOException;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Stream;
+import jenkins.util.ClusterSingleton;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 
@@ -42,6 +43,7 @@ import org.kohsuke.accmod.restrictions.NoExternalUse;
  * @see GlobalBuildDiscarderStrategy
  */
 @Restricted(NoExternalUse.class)
+@ClusterSingleton // acts on shared state: once per cluster of controllers sharing it
 @Extension
 public class BackgroundGlobalBuildDiscarder extends AsyncPeriodicWork {
     private static final Logger LOGGER = Logger.getLogger(BackgroundGlobalBuildDiscarder.class.getName());
