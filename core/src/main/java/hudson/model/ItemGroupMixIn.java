@@ -39,6 +39,9 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -108,7 +111,19 @@ public abstract class ItemGroupMixIn {
             throw new UncheckedIOException(e);
         }
 
-        File[] subdirs = modulesDir.listFiles(File::isDirectory);
+        List<File> subdirs = new ArrayList<>(Arrays.asList(modulesDir.listFiles(File::isDirectory)));
+        try {
+            // items which so far exist only in a persistence store
+            for (String name : PersistenceStores.storedItemNames(modulesDir)) {
+                File subdir = new File(modulesDir, name);
+                if (!subdirs.contains(subdir)) {
+                    Util.createDirectories(subdir.toPath());
+                    subdirs.add(subdir);
+                }
+            }
+        } catch (IOException e) {
+            Logger.getLogger(ItemGroupMixIn.class.getName()).log(Level.WARNING, "could not list stored items of " + modulesDir, e);
+        }
         CopyOnWriteMap.Tree<K, V> configurations = new CopyOnWriteMap.Tree<>();
         for (File subdir : subdirs) {
             try {

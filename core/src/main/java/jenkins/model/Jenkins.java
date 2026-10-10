@@ -278,6 +278,7 @@ import jenkins.diagnostics.URICheckEncodingMonitor;
 import jenkins.install.InstallState;
 import jenkins.install.SetupWizard;
 import jenkins.model.ProjectNamingStrategy.DefaultProjectNamingStrategy;
+import jenkins.persistence.PersistenceStores;
 import jenkins.security.ClassFilterImpl;
 import jenkins.security.ConfidentialKey;
 import jenkins.security.ConfidentialStore;
@@ -3464,6 +3465,29 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
                 loadedNames.add(item.getName());
             }));
         }
+
+        // A persistence store may hold items with no local directory yet (for example on a fresh controller).
+        // The store only becomes available once extensions are loaded, so it cannot be consulted above.
+        loadJobs.add(g.requires(loadJenkins).requires(SYSTEM_CONFIG_ADAPTED).attains(JOB_LOADED).notFatal().add("Loading items from the persistence store", session -> {
+            Set<String> local = new HashSet<>();
+            for (File subdir : subdirs) {
+                local.add(subdir.getName());
+            }
+            for (String name : PersistenceStores.storedItemNames(projectsDir)) {
+                if (local.contains(name)) {
+                    continue; // loaded by its own task
+                }
+                File subdir = new File(projectsDir, name);
+                try {
+                    Util.createDirectories(subdir.toPath());
+                    TopLevelItem item = (TopLevelItem) Items.load(Jenkins.this, subdir);
+                    items.put(item.getName(), item);
+                    loadedNames.add(item.getName());
+                } catch (IOException | RuntimeException e) {
+                    LOGGER.log(Level.WARNING, "Failed to load item " + name + " from the persistence store", e);
+                }
+            }
+        }));
 
         g.requires(loadJobs.toArray(new Handle[0])).attains(JOB_LOADED).add("Cleaning up obsolete items deleted from the disk", reactor -> {
             // anything we didn't load from disk, throw them away.

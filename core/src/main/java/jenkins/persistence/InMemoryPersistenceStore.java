@@ -28,7 +28,9 @@ import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import java.util.Arrays;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.function.Predicate;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
@@ -91,6 +93,21 @@ public class InMemoryPersistenceStore implements PersistenceStore {
             throw new ConflictException(key, expectedVersion, current.version());
         }
         entries.remove(key);
+    }
+
+    @Override
+    @NonNull
+    public synchronized Set<String> children(@NonNull String parentKey) {
+        String prefix = parentKey + "/";
+        Set<String> names = new TreeSet<>();
+        for (String key : entries.keySet()) {
+            if (key.startsWith(prefix)) {
+                String rest = key.substring(prefix.length());
+                int slash = rest.indexOf('/');
+                names.add(slash == -1 ? rest : rest.substring(0, slash));
+            }
+        }
+        return names;
     }
 
     /**
