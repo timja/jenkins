@@ -319,6 +319,29 @@ public abstract class PeepholePermalink extends Permalink implements Predicate<R
         }
     }
 
+    /**
+     * Updates the cached targets of a job after another controller completed, changed or deleted one of its builds.
+     * Points affected permalinks at that build as a hint, which {@link Cache.Some#resolve} validates
+     * (searching older builds if it does not match), so no build is loaded until a permalink is actually used.
+     *
+     * @param deleted whether the build was deleted
+     */
+    @Restricted(NoExternalUse.class)
+    public static void changedElsewhere(@NonNull Job<?, ?> job, int number, boolean deleted) {
+        Cache cache = ExtensionList.lookupFirst(Cache.class);
+        for (PeepholePermalink pp : Util.filter(job.getPermalinks(), PeepholePermalink.class)) {
+            Cache.PermalinkTarget target = cache.get(job, pp.getId());
+            if (target instanceof Cache.Some(int n) && (n > number || deleted && n < number)) {
+                continue; // points at another build, which this change cannot affect
+            }
+            if (deleted && target instanceof Cache.None) {
+                continue;
+            }
+            LOGGER.fine(() -> "Hinting " + pp.getId() + " of " + job + " at #" + number + " changed elsewhere");
+            cache.put(job, pp.getId(), new Cache.Some(number));
+        }
+    }
+
     @Extension
     public static class RunListenerImpl extends RunListener<Run<?, ?>> {
         /**

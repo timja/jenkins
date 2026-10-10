@@ -33,6 +33,7 @@ import hudson.model.AbstractItem;
 import hudson.model.Item;
 import hudson.model.ItemGroup;
 import hudson.model.Items;
+import hudson.model.Job;
 import hudson.model.TopLevelItem;
 import hudson.model.listeners.ItemListener;
 import hudson.security.ACL;
@@ -193,6 +194,9 @@ public final class ItemChangeApplier {
     }
 
     private void written(ChangeEvent e) throws Exception {
+        if (build(e)) {
+            return;
+        }
         List<String> names = itemPath(e.key());
         if (names == null || e.version() <= PersistenceStores.lastSeen(e.key())) {
             return; // not an item, or already have this version (e.g. loaded it at startup)
@@ -260,6 +264,9 @@ public final class ItemChangeApplier {
     }
 
     private void deleted(ChangeEvent e) throws Exception {
+        if (build(e)) {
+            return;
+        }
         List<String> names = itemPath(e.key());
         if (names == null || e.version() <= PersistenceStores.lastSeen(e.key())) {
             return; // not an item, or deleted before what this controller has: an item it made again since, say
@@ -271,6 +278,30 @@ public final class ItemChangeApplier {
             existing.delete();
             applied.incrementAndGet();
         }
+    }
+
+    /**
+     * Applies a change to a {@linkplain BuildRecords build record}.
+     *
+     * @return false if the key is not a build record
+     */
+    private boolean build(ChangeEvent e) throws Exception {
+        BuildRecords.RecordKey record = BuildRecords.RecordKey.parse(e.key());
+        List<String> names = record == null ? null : itemPath(record.jobKey() + "/config.xml");
+        if (names == null) {
+            return false;
+        }
+        Job<?, ?> job = jenkins.getItemByFullName(String.join("/", names), Job.class);
+        if (job == null) {
+            return true; // not loaded (yet); its builds are listed from the store when it is
+        }
+        if (e.kind() == ChangeEvent.Kind.DELETED) {
+            BuildRecords.deletedElsewhere(job, record.number());
+        } else {
+            BuildRecords.writtenElsewhere(job, record.number());
+        }
+        applied.incrementAndGet();
+        return true;
     }
 
     private void moved(ChangeEvent e) throws Exception {

@@ -30,9 +30,11 @@ import hudson.Extension;
 import hudson.ExtensionList;
 import hudson.ExtensionPoint;
 import hudson.FilePath;
+import hudson.Util;
 import hudson.XmlFile;
 import hudson.model.Job;
 import hudson.model.Run;
+import hudson.model.RunMap;
 import hudson.model.Saveable;
 import hudson.model.listeners.RunListener;
 import hudson.model.listeners.SaveableListener;
@@ -59,6 +61,8 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Stream;
 import java.util.zip.GZIPOutputStream;
+import jenkins.model.PeepholePermalink;
+import jenkins.model.lazy.LazyBuildMixIn;
 import jenkins.util.ThrowingCallable;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
@@ -307,15 +311,85 @@ public final class BuildRecords {
             }
         }
         // last, as on the publishing side: a local build.xml means the directory is complete
+        writeRecord(dir, record.content());
+        LOGGER.fine(() -> "Materialized " + job.getFullName() + " #" + dir.getName());
+        return true;
+    }
+
+    private static void writeRecord(File dir, byte[] content) throws IOException {
         Path tmp = Files.createTempFile(dir.toPath(), RECORD, ".tmp");
-        Files.write(tmp, record.content());
+        Files.write(tmp, content);
         try {
             Files.move(tmp, new File(dir, RECORD).toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
         } catch (AtomicMoveNotSupportedException e) {
             Files.move(tmp, new File(dir, RECORD).toPath(), StandardCopyOption.REPLACE_EXISTING); // as AtomicFileWriter does
         }
-        LOGGER.fine(() -> "Materialized " + job.getFullName() + " #" + dir.getName());
-        return true;
+    }
+
+    /**
+     * Parsed key of a build record: {@code jobs/f/jobs/j/builds/5/build.xml} → job key {@code jobs/f/jobs/j}, number 5.
+     */
+    record RecordKey(String jobKey, int number) {
+        @CheckForNull
+        static RecordKey parse(String key) {
+            String[] segments = key.split("/");
+            int n = segments.length;
+            if (n < 5 || !segments[n - 1].equals(RECORD) || !segments[n - 3].equals("builds")) {
+                return null;
+            }
+            try {
+                return new RecordKey(String.join("/", Arrays.copyOf(segments, n - 3)), Integer.parseInt(segments[n - 2]));
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
+    }
+
+    @CheckForNull
+    private static RunMap<?> runsOf(Job<?, ?> job) {
+        return job instanceof LazyBuildMixIn.LazyLoadingJob<?, ?> lazy ? lazy.getLazyBuildMixIn()._getRuns() : null;
+    }
+
+    /**
+     * Brings this controller up to date after another controller published or republished a build record.
+     * A new build is only added to the index; it is materialized when first loaded.
+     */
+    static void writtenElsewhere(@NonNull Job<?, ?> job, int number) throws IOException {
+        RunMap<?> runs = runsOf(job);
+        String builds = buildsKey(job);
+        if (runs == null || builds == null) {
+            return;
+        }
+        File dir = new File(job.getBuildDir(), String.valueOf(number));
+        if (new File(dir, RECORD).isFile()) {
+            PersistenceStore.Entry record = PersistenceStores.get().read(builds + "/" + number + "/" + RECORD);
+            if (record == null) {
+                return; // deleted since; the deletion event follows
+            }
+            LOGGER.fine(() -> "Refreshing " + job.getFullName() + " #" + number + " changed elsewhere");
+            writeRecord(dir, record.content());
+            runs.unload(number);
+        } else {
+            LOGGER.fine(() -> "Recognizing " + job.getFullName() + " #" + number + " completed elsewhere");
+            Files.createDirectories(dir.toPath());
+            runs.recognizeNumber(number);
+        }
+        PeepholePermalink.changedElsewhere(job, number, false);
+    }
+
+    /**
+     * Brings this controller up to date after another controller deleted a build.
+     * Listeners are not notified: cleanup of external data happened where the build was deleted.
+     */
+    static void deletedElsewhere(@NonNull Job<?, ?> job, int number) throws IOException {
+        RunMap<?> runs = runsOf(job);
+        if (runs == null) {
+            return;
+        }
+        LOGGER.fine(() -> "Forgetting " + job.getFullName() + " #" + number + " deleted elsewhere");
+        runs.forget(number);
+        Util.deleteRecursive(new File(job.getBuildDir(), String.valueOf(number)));
+        PeepholePermalink.changedElsewhere(job, number, true);
     }
 
     /**
