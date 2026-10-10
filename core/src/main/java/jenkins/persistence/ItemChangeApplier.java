@@ -191,6 +191,10 @@ public final class ItemChangeApplier {
                 return null;
             });
         }
+        if (itemPath(e.key()) != null) {
+            // an item was created, changed, moved or deleted: its triggers may link it to other jobs
+            jenkins.rebuildDependencyGraphAsync();
+        }
     }
 
     private void written(ChangeEvent e) throws Exception {

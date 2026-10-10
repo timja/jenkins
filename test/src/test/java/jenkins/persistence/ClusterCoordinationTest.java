@@ -186,6 +186,21 @@ class ClusterCoordinationTest {
         r.assertBuildStatusSuccess(f);
     }
 
+    @Test
+    void itemsChangedElsewhereUpdateTheDependencyGraph() throws Exception {
+        FreeStyleProject down = r.createFreeStyleProject("down2");
+        other.write("jobs/up2/config.xml", bytes("<?xml version='1.1' encoding='UTF-8'?><project><publishers><hudson.tasks.BuildTrigger>"
+                + "<childProjects>down2</childProjects><threshold><name>SUCCESS</name><ordinal>0</ordinal><color>BLUE</color>"
+                + "<completeBuild>true</completeBuild></threshold></hudson.tasks.BuildTrigger></publishers></project>"), PersistenceStore.ABSENT);
+        awaitApplied();
+        FreeStyleProject up = r.jenkins.getItemByFullName("up2", FreeStyleProject.class);
+        assertNotNull(up);
+        for (int i = 0; i < 100 && !up.getDownstreamProjects().contains(down); i++) {
+            Thread.sleep(100);
+        }
+        assertTrue(up.getDownstreamProjects().contains(down), "the trigger defined elsewhere links up2 to down2 here");
+    }
+
     @TestExtension
     public static class Provider implements PersistenceStoreProvider {
         @Override
