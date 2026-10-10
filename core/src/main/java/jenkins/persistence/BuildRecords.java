@@ -655,6 +655,12 @@ public final class BuildRecords {
             if (PersistenceStores.isApplyingRemoteChange()) {
                 return;
             }
+            if (RunningBuilds.wasLost(run) || !RunningBuilds.owns(run)) {
+                // another controller has taken it over and will publish it
+                LOGGER.warning(() -> "Not publishing " + run + ": it is owned by another controller");
+                RunningBuilds.discard(run);
+                return;
+            }
             try {
                 publish(run);
             } catch (IOException | RuntimeException e) {
@@ -761,7 +767,8 @@ public final class BuildRecords {
 
         @Override
         public void onChange(Saveable o, XmlFile file) {
-            if (!(o instanceof Run<?, ?> run) || run.isLogUpdated() || LOADING.get() != null || PersistenceStores.isApplyingRemoteChange()) {
+            if (!(o instanceof Run<?, ?> run) || run.isLogUpdated() || LOADING.get() != null || PersistenceStores.isApplyingRemoteChange()
+                    || RunningBuilds.wasLost(run)) {
                 return;
             }
             try {

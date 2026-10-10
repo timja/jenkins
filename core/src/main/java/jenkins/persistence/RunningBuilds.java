@@ -27,9 +27,12 @@ package jenkins.persistence;
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Extension;
+import hudson.ExtensionList;
 import hudson.model.Action;
 import hudson.model.AsyncPeriodicWork;
+import hudson.model.Executor;
 import hudson.model.Job;
+import hudson.model.Result;
 import hudson.model.Run;
 import hudson.model.TaskListener;
 import hudson.model.listeners.RunListener;
@@ -48,14 +51,17 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import jenkins.model.CauseOfInterruption;
 import jenkins.model.Jenkins;
 import jenkins.model.TransientActionFactory;
 import jenkins.model.lazy.LazyBuildMixIn;
 import jenkins.util.SystemProperties;
+import jenkins.util.Timer;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
@@ -115,14 +121,36 @@ public final class RunningBuilds {
         private final String controller;
         private final String displayName;
         private final long startTime;
+        private final long epoch;
+        private final Map<String, String> properties;
+        private final long version;
 
-        Placeholder(String key, int number, String origin, String controller, String displayName, long startTime) {
+        Placeholder(String key, int number, String origin, String controller, String displayName, long startTime,
+                long epoch, Map<String, String> properties, long version) {
             this.key = key;
             this.number = number;
             this.origin = origin;
             this.controller = controller;
             this.displayName = displayName;
             this.startTime = startTime;
+            this.epoch = epoch;
+            this.properties = Map.copyOf(properties);
+            this.version = version;
+        }
+
+        Placeholder withOwner(String origin, String controller, long epoch, Map<String, String> properties) {
+            return new Placeholder(key, number, origin, controller, displayName, startTime, epoch, properties, version);
+        }
+
+        /** The lease epoch of the owner when it wrote this placeholder, or 0 if the store has no leases. */
+        public long getEpoch() {
+            return epoch;
+        }
+
+        /** Properties recorded by the owner through {@link RunningBuilds#update}, such as where its save points are. */
+        @NonNull
+        public Map<String, String> getProperties() {
+            return properties;
         }
 
         @Exported
@@ -164,18 +192,27 @@ public final class RunningBuilds {
             p.setProperty("controller", controller);
             p.setProperty("displayName", displayName);
             p.setProperty("startTime", Long.toString(startTime));
+            p.setProperty("epoch", Long.toString(epoch));
+            properties.forEach((k, v) -> p.setProperty("x." + k, v));
             StringWriter w = new StringWriter();
             p.store(w, null);
             return w.toString().getBytes(StandardCharsets.UTF_8);
         }
 
         @CheckForNull
-        static Placeholder fromBytes(String key, int number, byte[] content) {
+        static Placeholder fromBytes(String key, int number, byte[] content, long version) {
             Properties p = new Properties();
             try {
                 p.load(new StringReader(new String(content, StandardCharsets.UTF_8)));
+                Map<String, String> extra = new TreeMap<>();
+                for (String name : p.stringPropertyNames()) {
+                    if (name.startsWith("x.")) {
+                        extra.put(name.substring(2), p.getProperty(name));
+                    }
+                }
                 return new Placeholder(key, number, p.getProperty("origin", ""), p.getProperty("controller", "?"),
-                        p.getProperty("displayName", "#" + number), Long.parseLong(p.getProperty("startTime", "0")));
+                        p.getProperty("displayName", "#" + number), Long.parseLong(p.getProperty("startTime", "0")),
+                        Long.parseLong(p.getProperty("epoch", "0")), extra, version);
             } catch (IOException | NumberFormatException e) {
                 LOGGER.log(Level.WARNING, "Malformed placeholder " + key, e);
                 return null;
@@ -238,7 +275,7 @@ public final class RunningBuilds {
                 }
                 String key = runningKey + "/" + name;
                 PersistenceStore.Entry entry = store.read(key);
-                Placeholder p = entry == null ? null : Placeholder.fromBytes(key, number, entry.content());
+                Placeholder p = entry == null ? null : Placeholder.fromBytes(key, number, entry.content(), entry.version());
                 if (p != null) {
                     placeholders.add(p);
                 }
@@ -281,28 +318,185 @@ public final class RunningBuilds {
         return result;
     }
 
-    static void started(@NonNull Run<?, ?> run) throws IOException {
+    /** Builds owned by this controller: placeholder key → the placeholder as last written here. */
+    private static final Map<String, Placeholder> owned = new ConcurrentHashMap<>();
+    /** Builds this controller has lost to another one: placeholder keys. */
+    private static final Set<String> lost = ConcurrentHashMap.newKeySet();
+
+    @CheckForNull
+    private static String placeholderKey(@NonNull Run<?, ?> run) {
         String runningKey = runningKey(run.getParent());
-        if (runningKey == null) {
+        return runningKey == null ? null : runningKey + "/" + run.getNumber() + SUFFIX;
+    }
+
+    private static String jobKeyOfRunning(String runningKey) {
+        return runningKey.substring(0, runningKey.length() - PREFIX.length() - 1);
+    }
+
+    static void started(@NonNull Run<?, ?> run) throws IOException {
+        String key = placeholderKey(run);
+        if (key == null) {
             return;
         }
         PersistenceStore store = PersistenceStores.get();
-        String key = runningKey + "/" + run.getNumber() + SUFFIX;
-        Placeholder p = new Placeholder(key, run.getNumber(), store.getOrigin(), CONTROLLER_NAME, run.getDisplayName(), run.getStartTimeInMillis());
-        store.write(key, p.toBytes(), PersistenceStore.ANY);
-        invalidate(runningKey.substring(0, runningKey.length() - PREFIX.length() - 1));
+        BuildLeases leases = store.leases();
+        long epoch = 0;
+        if (leases != null) {
+            epoch = leases.acquire(key);
+            if (epoch == 0) {
+                throw new IOException("Another controller holds the lease on " + key);
+            }
+        }
+        Placeholder p = new Placeholder(key, run.getNumber(), store.getOrigin(), CONTROLLER_NAME, run.getDisplayName(), run.getStartTimeInMillis(),
+                epoch, Map.of(), PersistenceStore.ABSENT);
+        long version = store.write(key, p.toBytes(), PersistenceStore.ANY);
+        owned.put(key, new Placeholder(key, p.number, p.origin, p.controller, p.displayName, p.startTime, epoch, Map.of(), version));
+        invalidate(jobKeyOfRunning(runningKey(run.getParent())));
+    }
+
+    /**
+     * Whether this controller may still work on and publish a build it started or adopted.
+     * False once another controller has taken it over (for example after this one was partitioned).
+     */
+    public static boolean owns(@NonNull Run<?, ?> run) {
+        String key = placeholderKey(run);
+        if (key == null) {
+            return true;
+        }
+        if (lost.contains(key)) {
+            return false;
+        }
+        Placeholder p = owned.get(key);
+        BuildLeases leases = PersistenceStores.get().leases();
+        if (p == null || leases == null) {
+            return true; // not tracked (e.g. started before leases were available)
+        }
+        try {
+            return leases.holds(key, p.epoch);
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "Cannot check the lease on " + key + "; assuming it is still held", e);
+            return true;
+        }
+    }
+
+    /**
+     * Records properties of a running build in its placeholder, for example where its latest save point is.
+     * Conditional on this controller still owning the build: the write is a compare-and-set on the placeholder
+     * as this controller last wrote it, so it fails if another controller has adopted the build since.
+     *
+     * @throws ConflictException if the build is no longer owned here; the caller should stop working on it
+     *     (see {@link #lost})
+     */
+    public static void update(@NonNull Run<?, ?> run, @NonNull Map<String, String> properties) throws IOException {
+        String key = placeholderKey(run);
+        Placeholder p = key == null ? null : owned.get(key);
+        if (p == null) {
+            return;
+        }
+        if (lost.contains(key) || !owns(run)) {
+            throw new ConflictException(key, p.version, PersistenceStore.ANY);
+        }
+        Placeholder next = p.withOwner(p.origin, p.controller, p.epoch, properties);
+        long version = PersistenceStores.get().write(key, next.toBytes(), p.version);
+        owned.put(key, new Placeholder(key, p.number, p.origin, p.controller, p.displayName, p.startTime, p.epoch, properties, version));
+    }
+
+    /**
+     * Stops this controller working on a build which another controller has taken over:
+     * interrupts it, and makes sure it is neither published nor its placeholder removed from here.
+     * Its local copy is discarded once it has stopped.
+     */
+    public static void lost(@NonNull Run<?, ?> run) {
+        String key = placeholderKey(run);
+        if (key == null || !lost.add(key)) {
+            return;
+        }
+        owned.remove(key);
+        LOGGER.warning(() -> "Ownership of " + run + " was lost to another controller; stopping it here");
+        Executor executor = run.getExecutor();
+        if (executor != null) {
+            executor.interrupt(Result.ABORTED, new OwnershipLost());
+        }
+    }
+
+    /** Cause of interruption of a build taken over by another controller. */
+    public static final class OwnershipLost extends CauseOfInterruption {
+        @Override
+        public String getShortDescription() {
+            return "Another controller took over this build";
+        }
     }
 
     /**
      * Removes the placeholder of a build which completed here; called once its record is published.
      */
     static void finished(@NonNull Run<?, ?> run) throws IOException {
-        String runningKey = runningKey(run.getParent());
-        if (runningKey == null) {
+        String key = placeholderKey(run);
+        if (key == null) {
             return;
         }
-        PersistenceStores.get().delete(runningKey + "/" + run.getNumber() + SUFFIX, PersistenceStore.ANY);
-        invalidate(runningKey.substring(0, runningKey.length() - PREFIX.length() - 1));
+        Placeholder p = owned.remove(key);
+        PersistenceStore store = PersistenceStores.get();
+        store.delete(key, p == null ? PersistenceStore.ANY : p.version);
+        BuildLeases leases = store.leases();
+        if (leases != null && p != null) {
+            leases.release(key, p.epoch);
+        }
+        invalidate(jobKeyOfRunning(runningKey(run.getParent())));
+    }
+
+    /**
+     * Whether a build was lost to another controller, so it must not be published from here.
+     */
+    static boolean wasLost(@NonNull Run<?, ?> run) {
+        String key = placeholderKey(run);
+        return key != null && lost.contains(key);
+    }
+
+    /**
+     * Discards the local copy of a build lost to another controller, once it has stopped here.
+     * The other controller publishes it when it completes, and this controller then picks up that record.
+     */
+    static void discard(@NonNull Run<?, ?> run) {
+        Job<?, ?> job = run.getParent();
+        int number = run.getNumber();
+        String key = placeholderKey(run);
+        Timer.get().schedule(() -> {
+            try {
+                PersistenceStores.applyingRemoteChange(() -> {
+                    BuildRecords.deletedElsewhere(job, number);
+                    return null;
+                });
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.WARNING, "Failed to discard the local copy of " + job.getFullName() + " #" + number, e);
+            } finally {
+                if (key != null) {
+                    lost.remove(key);
+                }
+            }
+        }, DISCARD_DELAY_SECONDS, TimeUnit.SECONDS);
+    }
+
+    /** Lets a stopped build finish writing locally before its copy is discarded. */
+    private static final int DISCARD_DELAY_SECONDS = 5;
+
+    /**
+     * Checks that this controller still holds the leases of the builds it runs, and stops those it does not.
+     */
+    @Restricted(NoExternalUse.class)
+    public static void checkOwnership() {
+        for (String key : List.copyOf(owned.keySet())) {
+            String jobKey = jobKeyOf(key);
+            List<String> names = jobKey == null ? null : ItemChangeApplier.itemPath(jobKey + "/config.xml");
+            Job<?, ?> job = names == null ? null : Jenkins.get().getItemByFullName(String.join("/", names), Job.class);
+            Run<?, ?> run = job == null ? null : job.getBuildByNumber(Integer.parseInt(key.substring(key.lastIndexOf('/') + 1, key.length() - SUFFIX.length())));
+            if (run == null || !run.isLogUpdated()) {
+                continue;
+            }
+            if (!owns(run)) {
+                lost(run);
+            }
+        }
     }
 
     /**
@@ -318,15 +512,30 @@ public final class RunningBuilds {
             return 0;
         }
         int removed = 0;
+        BuildLeases leases = store.leases();
         for (Job<?, ?> job : Jenkins.get().allItems(Job.class)) {
             // per job: a sweep of many jobs takes a while, during which an origin found gone may come back
             Set<String> gone = new HashSet<>();
             int removedHere = 0;
             for (Placeholder p : all(job)) {
                 if (!live.contains(p.origin) && stillGone(store, p.origin, gone)) {
+                    long epoch = 0;
+                    if (leases != null) {
+                        epoch = leases.acquire(p.key);
+                        if (epoch == 0) {
+                            continue; // another controller is adopting it
+                        }
+                        if (adopt(store, job, p.key, epoch)) {
+                            removedHere++;
+                            continue;
+                        }
+                    }
                     LOGGER.info(() -> "Removing placeholder of " + job.getFullName() + " #" + p.number + " left by " + p.controller + " (" + p.origin + "), which is gone");
                     // idempotent, so several controllers noticing at once is harmless
                     store.delete(p.key, PersistenceStore.ANY);
+                    if (leases != null) {
+                        leases.release(p.key, epoch);
+                    }
                     removedHere++;
                 }
             }
@@ -354,6 +563,69 @@ public final class RunningBuilds {
         }
         gone.add(origin);
         return true;
+    }
+
+    /** How many times adoption is retried when the placeholder changes under it. */
+    private static final int ADOPTION_ATTEMPTS = 5;
+
+    /**
+     * Offers a build whose owner is gone to the {@link BuildAdopter}s, with its lease already held.
+     *
+     * @return true if it was adopted
+     */
+    private static boolean adopt(PersistenceStore store, Job<?, ?> job, String key, long epoch) throws IOException {
+        int number = Integer.parseInt(key.substring(key.lastIndexOf('/') + 1, key.length() - SUFFIX.length()));
+        for (int attempt = 0; attempt < ADOPTION_ATTEMPTS; attempt++) {
+            PersistenceStore.Entry entry = store.read(key);
+            if (entry == null) {
+                return true; // completed meanwhile
+            }
+            Placeholder p = Placeholder.fromBytes(key, number, entry.content(), entry.version());
+            BuildAdopter.Adoption adoption = p == null ? null : prepare(job, p);
+            if (adoption == null) {
+                return false; // nobody can adopt it
+            }
+            Placeholder mine = p.withOwner(store.getOrigin(), CONTROLLER_NAME, epoch, p.properties);
+            long version;
+            try {
+                version = store.write(key, mine.toBytes(), p.version);
+            } catch (ConflictException e) {
+                // the previous owner recorded a newer save point while it was being fetched
+                adoption.abandon();
+                LOGGER.fine(() -> key + " changed while preparing its adoption; retrying");
+                continue;
+            }
+            owned.put(key, new Placeholder(key, number, mine.origin, mine.controller, p.displayName, p.startTime, epoch, p.properties, version));
+            invalidate(jobKeyOfRunning(runningKey(job)));
+            LOGGER.info(() -> "Adopting " + job.getFullName() + " #" + number + " from " + p.controller + " (" + p.origin + "), which is gone");
+            adoption.resume(epoch);
+            return true;
+        }
+        return false;
+    }
+
+    @CheckForNull
+    private static BuildAdopter.Adoption prepare(Job<?, ?> job, Placeholder p) {
+        for (BuildAdopter adopter : ExtensionList.lookup(BuildAdopter.class)) {
+            try {
+                BuildAdopter.Adoption adoption = adopter.prepare(job, p);
+                if (adoption != null) {
+                    return adoption;
+                }
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.WARNING, adopter + " failed to prepare adoption of " + p.key, e);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * The placeholder of a build as this controller, its owner, last wrote it, or null if it is not owned here.
+     */
+    @CheckForNull
+    public static Placeholder ownedPlaceholder(@NonNull Run<?, ?> run) {
+        String key = placeholderKey(run);
+        return key == null ? null : owned.get(key);
     }
 
     @Restricted(NoExternalUse.class)
@@ -389,6 +661,7 @@ public final class RunningBuilds {
         @Override
         protected void execute(TaskListener listener) throws IOException {
             if (PersistenceStores.get() != null) {
+                checkOwnership();
                 removeStale();
             }
         }
