@@ -27,6 +27,7 @@ package jenkins.persistence;
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import java.io.IOException;
+import java.util.Set;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
 
@@ -90,6 +91,16 @@ public interface PersistenceStore {
      * @throws ConflictException if {@code expectedVersion} does not match the stored version
      */
     void delete(@NonNull String key, long expectedVersion) throws IOException;
+
+    /**
+     * Lists the names directly below a key, like listing a directory.
+     * For example, with entries {@code jobs/a/config.xml} and {@code jobs/f/jobs/b/config.xml},
+     * the children of {@code jobs} are {@code a} and {@code f}.
+     *
+     * @param parentKey a key without trailing {@code /}
+     */
+    @NonNull
+    Set<String> children(@NonNull String parentKey) throws IOException;
 
     /**
      * Stored content with its version.
