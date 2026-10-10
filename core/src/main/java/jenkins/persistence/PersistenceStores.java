@@ -88,26 +88,38 @@ public final class PersistenceStores {
         if (resolvedFor == j) {
             return resolvedStore;
         }
-        if (j.getInitLevel().compareTo(InitMilestone.EXTENSIONS_AUGMENTED) < 0) {
+        if (j.getInitLevel().compareTo(InitMilestone.EXTENSIONS_AUGMENTED) < 0 || RESOLVING.get() != null) {
             return null;
         }
-        synchronized (PersistenceStores.class) {
-            if (resolvedFor != j) {
-                PersistenceStore store = null;
-                for (PersistenceStoreProvider provider : ExtensionList.lookup(PersistenceStoreProvider.class)) {
-                    store = provider.create();
-                    if (store != null) {
-                        LOGGER.info(() -> "Using persistence store " + provider.getClass().getName());
-                        break;
+        RESOLVING.set(Boolean.TRUE);
+        try {
+            // Load the extension list before taking our own lock: loading extensions takes a global lock,
+            // and threads holding it (instantiating extensions) may themselves read XmlFiles and get here.
+            ExtensionList<PersistenceStoreProvider> providers = ExtensionList.lookup(PersistenceStoreProvider.class);
+            providers.size();
+            synchronized (PersistenceStores.class) {
+                if (resolvedFor != j) {
+                    PersistenceStore store = null;
+                    for (PersistenceStoreProvider provider : providers) {
+                        store = provider.create();
+                        if (store != null) {
+                            LOGGER.info(() -> "Using persistence store " + provider.getClass().getName());
+                            break;
+                        }
                     }
+                    resolvedStore = store;
+                    versions.clear();
+                    resolvedFor = j;
                 }
-                resolvedStore = store;
-                versions.clear();
-                resolvedFor = j;
+                return resolvedStore;
             }
-            return resolvedStore;
+        } finally {
+            RESOLVING.remove();
         }
     }
+
+    /** Set while this thread resolves the store, so that providers reading files do not recurse. */
+    private static final ThreadLocal<Boolean> RESOLVING = new ThreadLocal<>();
 
     /**
      * Finds out whether a file is served by the active store.
