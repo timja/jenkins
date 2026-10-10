@@ -74,6 +74,8 @@ import java.util.regex.Pattern;
 import javax.crypto.SecretKeyFactory;
 import javax.crypto.spec.PBEKeySpec;
 import jenkins.model.Jenkins;
+import jenkins.persistence.PersistenceStore;
+import jenkins.persistence.PersistenceStores;
 import jenkins.security.FIPS140;
 import jenkins.security.NonePasswordComplexityRule;
 import jenkins.security.PasswordComplexityException;
@@ -744,8 +746,24 @@ public class HudsonPrivateSecurityRealm extends AbstractPasswordBasedSecurityRea
         }
 
         public String getProtectedPassword() {
-            // put session Id in it to prevent a replay attack.
-            return Protector.protect(Stapler.getCurrentRequest2().getSession().getId() + ':' + getPassword());
+            // put a value bound to this session in it to prevent a replay attack.
+            return Protector.protect(replayGuard() + ':' + getPassword());
+        }
+
+        /**
+         * Binds the protected password to who is editing it. Normally the session id;
+         * with a {@link PersistenceStore} shared by several controllers, whose sessions are their own,
+         * the signed-in user and their seed (which changes when their sessions are invalidated) instead,
+         * so that the form can be submitted to another controller than the one which rendered it.
+         */
+        static String replayGuard() {
+            if (PersistenceStores.get() == null) {
+                return Stapler.getCurrentRequest2().getSession().getId();
+            }
+            String name = Jenkins.getAuthentication2().getName();
+            User u = User.getById(name, false);
+            UserSeedProperty seed = u == null ? null : u.getProperty(UserSeedProperty.class);
+            return "user:" + name + ":" + (seed == null ? "" : seed.getSeed());
         }
 
         public String getUsername() {
@@ -884,7 +902,7 @@ public class HudsonPrivateSecurityRealm extends AbstractPasswordBasedSecurityRea
                 }
 
                 if (data != null) {
-                    String prefix = Stapler.getCurrentRequest2().getSession().getId() + ':';
+                    String prefix = replayGuard() + ':';
                     if (data.startsWith(prefix)) {
                         // The password is not being changed
                         return Details.fromHashedPassword(data.substring(prefix.length()));
@@ -927,7 +945,7 @@ public class HudsonPrivateSecurityRealm extends AbstractPasswordBasedSecurityRea
                 // will be null if it wasn't encrypted
                 String data = Protector.unprotect(password);
                 if (data != null) {
-                    String prefix = Stapler.getCurrentRequest2().getSession().getId() + ':';
+                    String prefix = replayGuard() + ':';
                     if (data.startsWith(prefix)) {
                         // The password is not being changed
                         return FormValidation.ok();
