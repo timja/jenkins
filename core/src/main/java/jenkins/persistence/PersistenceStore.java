@@ -176,6 +176,16 @@ public interface PersistenceStore {
     }
 
     /**
+     * The build queue shared by the controllers using this store.
+     *
+     * @return the queue, or null if this store does not offer one (each controller then has its own queue)
+     */
+    @CheckForNull
+    default ClusterQueue queue() {
+        return null;
+    }
+
+    /**
      * Identifies this store instance (and so this controller) as the origin of the changes it makes.
      */
     @NonNull
