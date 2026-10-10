@@ -34,12 +34,11 @@ import hudson.util.Function1;
 import io.jenkins.servlet.ServletExceptionWrapper;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletResponse;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
-import java.nio.file.Files;
-import java.nio.file.StandardCopyOption;
 import java.util.Map;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -258,8 +257,7 @@ public abstract class ItemGroupMixIn {
         T result = (T) createProject(src.getDescriptor(), name, false);
 
         // copy config
-        Files.copy(Util.fileToPath(srcConfigFile.getFile()), Util.fileToPath(Items.getConfigFile(result).getFile()),
-                StandardCopyOption.COPY_ATTRIBUTES, StandardCopyOption.REPLACE_EXISTING);
+        Items.getConfigFile(result).writeRaw(srcConfigFile.readRawBytes());
 
         // reload from the new config
         final File rootDir = result.getRootDir();
@@ -281,12 +279,14 @@ public abstract class ItemGroupMixIn {
         Jenkins.checkGoodName(name);
 
         // place it as config.xml
-        File configXml = Items.getConfigFile(getRootDirFor(name)).getFile();
-        final File dir = configXml.getParentFile();
+        final File dir = getRootDirFor(name);
+        final XmlFile configXml = Items.getConfigFile(dir);
         boolean success = false;
         try {
             Util.createDirectories(dir.toPath());
-            XMLUtils.safeTransform(new StreamSource(xml), new StreamResult(configXml));
+            ByteArrayOutputStream buf = new ByteArrayOutputStream();
+            XMLUtils.safeTransform(new StreamSource(xml), new StreamResult(buf));
+            configXml.writeRaw(buf.toByteArray());
 
             // load it
             TopLevelItem result = Items.callWhileUpdatingByXml(() -> (TopLevelItem) Items.load(parent, dir));
@@ -319,6 +319,7 @@ public abstract class ItemGroupMixIn {
         } finally {
             if (!success) {
                 // if anything fails, delete the config file to avoid further confusion
+                configXml.delete();
                 Util.deleteRecursive(dir);
             }
         }
