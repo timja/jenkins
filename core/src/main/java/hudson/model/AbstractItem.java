@@ -70,6 +70,7 @@ import jenkins.model.DirectlyModifiableTopLevelItemGroup;
 import jenkins.model.Jenkins;
 import jenkins.model.Loadable;
 import jenkins.model.queue.ItemDeletion;
+import jenkins.persistence.PersistenceStores;
 import jenkins.security.ExtendedReadRedaction;
 import jenkins.security.XStreamNotDeserializable;
 import jenkins.security.stapler.StaplerNotDispatchable;
@@ -389,6 +390,9 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
                 boolean success = false;
 
                 try { // rename data files
+                    // stored state first: fails if something else already exists at the new name
+                    PersistenceStores.move(oldRoot, newRoot);
+
                     boolean interrupted = false;
                     boolean renamed = false;
 

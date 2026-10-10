@@ -103,6 +103,16 @@ public interface PersistenceStore {
     Set<String> children(@NonNull String parentKey) throws IOException;
 
     /**
+     * Atomically renames a key and every key below it, as when an item directory is renamed or moved.
+     * For example moving {@code jobs/a} to {@code jobs/f/jobs/a} moves {@code jobs/a/config.xml}
+     * and {@code jobs/a/jobs/x/config.xml}, but not {@code jobs/ab/config.xml}.
+     * Moved entries get new versions.
+     *
+     * @throws ConflictException if {@code toPrefix} or anything below it already exists
+     */
+    void move(@NonNull String fromPrefix, @NonNull String toPrefix) throws IOException;
+
+    /**
      * Stored content with its version.
      *
      * @param content the raw bytes

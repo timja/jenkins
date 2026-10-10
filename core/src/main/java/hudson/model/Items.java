@@ -52,6 +52,7 @@ import java.util.StringTokenizer;
 import java.util.function.Predicate;
 import jenkins.model.DirectlyModifiableTopLevelItemGroup;
 import jenkins.model.Jenkins;
+import jenkins.persistence.PersistenceStores;
 import jenkins.util.MemoryReductionUtil;
 import jenkins.util.ThrowingCallable;
 import jenkins.util.ThrowingRunnable;
@@ -609,6 +610,7 @@ public class Items {
         // TODO AbstractItem.renameTo has a more baroque implementation; factor it out into a utility method perhaps?
         File destDir = destination.getRootDirFor(item);
         FileUtils.forceMkdir(destDir.getParentFile());
+        PersistenceStores.move(item.getRootDir(), destDir);
         FileUtils.moveDirectory(item.getRootDir(), destDir);
         oldParent.remove(item);
         I newItem = destination.add(item, name);
