@@ -538,6 +538,7 @@ public final class SharedQueue {
         @Override
         public void onLeft(Queue.LeftItem li) {
             known.remove(li.getId());
+            notClaimed.remove(li.getId());
             if (!li.isCancelled() || PersistenceStores.isApplyingRemoteChange() || !shared(li.task)) {
                 return;
             }
@@ -566,6 +567,59 @@ public final class SharedQueue {
                     }
                 }
             }, attempt == 0 ? 0 : 1L << Math.min(attempt, 6), TimeUnit.SECONDS);
+        }
+    }
+
+    /** Exclusive leases held here on jobs which do not allow concurrent builds: lease key → epoch. */
+    private static final java.util.Map<String, Long> exclusive = new java.util.concurrent.ConcurrentHashMap<>();
+
+    @CheckForNull
+    private static String exclusiveKey(Job<?, ?> job) {
+        String jobKey = PersistenceStores.keyFor(job.getRootDir());
+        return jobKey == null ? null : jobKey + "/" + RunningBuilds.PREFIX + "/exclusive";
+    }
+
+    /**
+     * Takes the exclusive lease on a job which does not allow concurrent builds, so that only one controller runs it at a time.
+     *
+     * @return true if this controller holds it (or the job allows concurrent builds, or there are no leases)
+     */
+    private static boolean acquireExclusive(Job<?, ?> job) throws IOException {
+        BuildLeases leases = PersistenceStores.get().leases();
+        String key = exclusiveKey(job);
+        if (leases == null || key == null || !(job instanceof Queue.Task task) || task.isConcurrentBuild()) {
+            return true;
+        }
+        long epoch = leases.acquire(key);
+        if (epoch == 0) {
+            return false;
+        }
+        exclusive.put(key, epoch);
+        return true;
+    }
+
+    private static void releaseExclusive(Job<?, ?> job) {
+        String key = exclusiveKey(job);
+        Long epoch = key == null ? null : exclusive.remove(key);
+        BuildLeases leases = epoch == null ? null : PersistenceStores.get().leases();
+        if (leases != null) {
+            try {
+                leases.release(key, epoch);
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "Failed to release " + key, e);
+            }
+        }
+    }
+
+    /**
+     * Takes over the exclusive lease of a job after adopting one of its builds (the previous holder is gone).
+     */
+    @Restricted(NoExternalUse.class)
+    public static void adoptedExclusive(@NonNull Job<?, ?> job) {
+        try {
+            acquireExclusive(job);
+        } catch (IOException | RuntimeException e) {
+            LOGGER.log(Level.WARNING, "Failed to take over the exclusive lease of " + job.getFullName(), e);
         }
     }
 
@@ -608,22 +662,40 @@ public final class SharedQueue {
                 // the controller it was requested on goes first (e.g. it may hold the agents the build needs)
                 return new Blocked("Waiting for the controller it was scheduled on");
             }
+            Job<?, ?> job = (Job<?, ?>) item.task;
             if (claiming.add(id)) {
-                claims.submit(() -> claim(id));
+                claims.submit(() -> claim(job, id));
             }
-            return new Blocked("Being claimed for this controller");
+            String why = notClaimed.get(id);
+            return new Blocked(why != null ? why : "Being claimed for this controller");
         }
 
-        /** Off the lock: claims an item for this controller, then has the queue look at it again. */
-        private static void claim(long id) {
+        /**
+         * Off the lock: claims an item for this controller (first taking its job's exclusive lease, for a job allowing
+         * one build at a time), then has the queue look at it again.
+         */
+        private static void claim(Job<?, ?> job, long id) {
+            ClusterQueue cq = queue();
+            boolean held = exclusive.containsKey(exclusiveKey(job));
+            boolean acquired = false;
+            boolean changed = true;
             try {
-                ClusterQueue cq = queue();
                 String me = origin();
                 ClusterQueue.Record r = cq.get(id);
                 // not if a request folded into it since the gate looked pinned it elsewhere (the claim checks it did not since)
-                if (r != null && r.state() == ClusterQueue.State.WAITING && (r.pinnedTo() == null || me.equals(r.pinnedTo()))
-                        && cq.claim(id, r.pinnedTo())) {
-                    LOGGER.fine(() -> "Claimed queue item " + id);
+                if (r != null && r.state() == ClusterQueue.State.WAITING && (r.pinnedTo() == null || me.equals(r.pinnedTo()))) {
+                    if (!acquireExclusive(job)) {
+                        notClaimed.put(id, "A build is already in progress on another controller");
+                        changed = false; // looked at again at the next maintenance, not at once
+                        return;
+                    }
+                    acquired = !held;
+                    notClaimed.remove(id);
+                    if (cq.claim(id, r.pinnedTo())) {
+                        LOGGER.fine(() -> "Claimed queue item " + id);
+                    } else if (acquired) {
+                        releaseExclusive(job);
+                    }
                 }
                 ClusterQueue.Record now = cq.get(id);
                 if (now != null) {
@@ -631,9 +703,14 @@ public final class SharedQueue {
                 }
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.WARNING, "Cannot claim queue item " + id + "; not starting it for now", e);
+                if (acquired && !claimedHere(cq, id)) {
+                    releaseExclusive(job); // else nothing would release it should the item be cancelled
+                }
             } finally {
                 claiming.remove(id);
-                Queue.getInstance().scheduleMaintenance();
+                if (changed) {
+                    Queue.getInstance().scheduleMaintenance();
+                }
             }
         }
     }
@@ -663,7 +740,29 @@ public final class SharedQueue {
 
     @Restricted(NoExternalUse.class)
     @Extension
+    /** Why items could not be claimed here (yet), by id, for the gate to say. */
+    private static final Map<Long, String> notClaimed = new ConcurrentHashMap<>();
+
+    /** Whether a claim that failed with an exception went through after all. */
+    private static boolean claimedHere(ClusterQueue cq, long id) {
+        try {
+            ClusterQueue.Record r = cq.get(id);
+            return r != null && origin().equals(r.claimedBy());
+        } catch (IOException | RuntimeException e) {
+            return false;
+        }
+    }
+
+    @Restricted(NoExternalUse.class)
+    @Extension
     public static final class Starts extends RunListener<Run<?, ?>> {
+        @Override
+        public void onFinalized(Run<?, ?> run) {
+            if (queue() != null) {
+                releaseExclusive(run.getParent());
+            }
+        }
+
         @Override
         public void onStarted(Run<?, ?> run, TaskListener listener) {
             ClusterQueue cq = queue();

@@ -31,6 +31,7 @@ import hudson.ExtensionList;
 import hudson.model.Action;
 import hudson.model.AsyncPeriodicWork;
 import hudson.model.Executor;
+import hudson.model.Item;
 import hudson.model.Job;
 import hudson.model.Result;
 import hudson.model.Run;
@@ -67,8 +68,12 @@ import jenkins.util.Timer;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.HttpResponses;
+import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.export.Exported;
 import org.kohsuke.stapler.export.ExportedBean;
+import org.kohsuke.stapler.interceptor.RequirePOST;
 
 /**
  * Makes builds running on one controller visible on the others, as placeholders, until their record is {@linkplain BuildRecords published}.
@@ -88,6 +93,7 @@ public final class RunningBuilds {
 
     static final String PREFIX = "running";
     private static final String SUFFIX = ".xml";
+    private static final String STOP_SUFFIX = ".stop";
 
     /**
      * How this controller is named in placeholders; defaults to the host name.
@@ -462,6 +468,7 @@ public final class RunningBuilds {
         Placeholder p = owned.remove(key);
         PersistenceStore store = PersistenceStores.get();
         store.delete(key, p == null ? PersistenceStore.ANY : p.version);
+        store.delete(key.substring(0, key.length() - SUFFIX.length()) + STOP_SUFFIX, PersistenceStore.ANY);
         BuildLeases leases = store.leases();
         if (leases != null && p != null) {
             leases.release(key, p.epoch);
@@ -641,6 +648,95 @@ public final class RunningBuilds {
         return true;
     }
 
+    /**
+     * Parsed key of a stop request: {@code jobs/f/jobs/j/running/5.stop} → job key {@code jobs/f/jobs/j}, number 5.
+     */
+    record StopKey(String jobKey, int number) {
+        @CheckForNull
+        static StopKey parse(String key) {
+            String[] segments = key.split("/");
+            int n = segments.length;
+            if (n < 4 || !segments[n - 2].equals(PREFIX) || !segments[n - 1].matches("[0-9]+\\Q" + STOP_SUFFIX + "\\E")) {
+                return null;
+            }
+            String file = segments[n - 1];
+            return new StopKey(String.join("/", Arrays.copyOf(segments, n - 2)), Integer.parseInt(file.substring(0, file.length() - STOP_SUFFIX.length())));
+        }
+    }
+
+    /**
+     * Asks whichever controller runs a build to stop it.
+     * If it runs here, it is stopped right away; otherwise its owner (the holder of its lease, including one that adopts it later)
+     * stops it when it sees the request.
+     *
+     * @param by who asked, for the build log
+     */
+    public static void requestStop(@NonNull Job<?, ?> job, int number, @NonNull String by) throws IOException {
+        String runningKey = runningKey(job);
+        if (runningKey == null) {
+            return;
+        }
+        String key = runningKey + "/" + number + SUFFIX;
+        if (owned.containsKey(key)) {
+            Run<?, ?> run = job.getBuildByNumber(number);
+            if (run != null && run.isLogUpdated()) {
+                interrupt(run, new StoppedElsewhere(CONTROLLER_NAME, by));
+                return;
+            }
+        }
+        PersistenceStores.get().write(runningKey + "/" + number + STOP_SUFFIX,
+                ("controller=" + CONTROLLER_NAME + "\nby=" + by + "\n").getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+    }
+
+    /**
+     * Stops a build owned here for which another controller requested a stop.
+     */
+    static void stopRequested(@NonNull String jobKey, int number) throws IOException {
+        String placeholder = jobKey + "/" + PREFIX + "/" + number + SUFFIX;
+        if (!owned.containsKey(placeholder)) {
+            return; // not ours: its owner handles it
+        }
+        String stopKey = jobKey + "/" + PREFIX + "/" + number + STOP_SUFFIX;
+        PersistenceStore store = PersistenceStores.get();
+        PersistenceStore.Entry request = store.read(stopKey);
+        if (request == null) {
+            return;
+        }
+        Properties p = new Properties();
+        p.load(new StringReader(new String(request.content(), StandardCharsets.UTF_8)));
+        List<String> names = ItemChangeApplier.itemPath(jobKey + "/config.xml");
+        Job<?, ?> job = names == null ? null : Jenkins.get().getItemByFullName(String.join("/", names), Job.class);
+        Run<?, ?> run = job == null ? null : job.getBuildByNumber(number);
+        if (run != null && run.isLogUpdated()) {
+            interrupt(run, new StoppedElsewhere(p.getProperty("controller", "?"), p.getProperty("by", "?")));
+        }
+        store.delete(stopKey, PersistenceStore.ANY);
+    }
+
+    private static void interrupt(Run<?, ?> run, CauseOfInterruption cause) {
+        LOGGER.info(() -> "Stopping " + run + ": " + cause.getShortDescription());
+        Executor executor = run.getExecutor();
+        if (executor != null) {
+            executor.interrupt(Result.ABORTED, cause);
+        }
+    }
+
+    /** Cause of interruption of a build stopped from another controller. */
+    public static final class StoppedElsewhere extends CauseOfInterruption {
+        private final String controller;
+        private final String by;
+
+        StoppedElsewhere(String controller, String by) {
+            this.controller = controller;
+            this.by = by;
+        }
+
+        @Override
+        public String getShortDescription() {
+            return "Stopped from " + controller + " by " + by;
+        }
+    }
+
     /** How many times adoption is retried when the placeholder changes under it. */
     private static final int ADOPTION_ATTEMPTS = 5;
 
@@ -703,6 +799,11 @@ public final class RunningBuilds {
                 adoption.resume(epoch);
             } catch (IOException | RuntimeException e) {
                 resumeFailed(store, job, p, version, e);
+            }
+            SharedQueue.adoptedExclusive(job);
+            String jobKey = jobKeyOfRunning(runningKey(job));
+            if (store.read(jobKey + "/" + PREFIX + "/" + number + STOP_SUFFIX) != null) {
+                stopRequested(jobKey, number); // asked to stop while its owner was gone
             }
             return true;
         }
@@ -843,7 +944,17 @@ public final class RunningBuilds {
 
         @Override
         public String getUrlName() {
-            return null;
+            return "running-elsewhere";
+        }
+
+        /**
+         * Stops a build running on another controller.
+         */
+        @RequirePOST
+        public HttpResponse doStop(@QueryParameter int number) throws IOException {
+            job.checkPermission(Item.CANCEL);
+            requestStop(job, number, Jenkins.getAuthentication2().getName());
+            return HttpResponses.redirectTo("..");
         }
     }
 
