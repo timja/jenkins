@@ -177,7 +177,7 @@ public final class BuildRecords {
     /**
      * Whether builds of this job are shared, so that build numbers taken by other controllers may appear at any time.
      */
-    @Restricted(NoExternalUse.class)
+    @Restricted(Beta.class) // e.g. importing a file-based home
     public static boolean isShared(@NonNull Job<?, ?> job) {
         return buildsKey(job) != null;
     }
@@ -185,7 +185,7 @@ public final class BuildRecords {
     /**
      * Numbers of the builds of a job recorded in the store.
      */
-    @Restricted(NoExternalUse.class)
+    @Restricted(Beta.class) // e.g. importing a file-based home
     @NonNull
     public static Set<Integer> storedNumbers(@NonNull Job<?, ?> job) {
         Set<Integer> numbers = new TreeSet<>();
@@ -210,7 +210,7 @@ public final class BuildRecords {
     /**
      * Publishes a completed build.
      */
-    @Restricted(NoExternalUse.class)
+    @Restricted(Beta.class) // e.g. importing a file-based home
     public static void publish(@NonNull Run<?, ?> run) throws IOException {
         String builds = buildsKey(run.getParent());
         if (builds == null) {
