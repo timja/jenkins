@@ -75,6 +75,7 @@ import jenkins.model.IdStrategy;
 import jenkins.model.Jenkins;
 import jenkins.model.Loadable;
 import jenkins.model.ModelObjectWithContextMenu;
+import jenkins.persistence.PersistenceStores;
 import jenkins.scm.RunWithSCM;
 import jenkins.search.SearchGroup;
 import jenkins.security.HMACConfidentialKey;
@@ -1122,9 +1123,12 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
             DIRNAMES.createMac(); // force the key to be saved during startup
             var instance = getInstance();
             instance.migrateUserIdMapper();
-            var subdirectories = getUsersDirectory().listFiles();
-            if (subdirectories == null) {
-                return;
+            var usersDirectory = getUsersDirectory();
+            var localDirectories = usersDirectory.listFiles();
+            // users may also exist only in a persistence store shared with other controllers
+            var subdirectories = new java.util.TreeSet<File>(localDirectories == null ? List.of() : Arrays.asList(localDirectories));
+            for (String name : PersistenceStores.storedItemNames(usersDirectory)) {
+                subdirectories.add(new File(usersDirectory, name));
             }
             var byName = instance.byName;
             var idStrategy = idStrategy();
