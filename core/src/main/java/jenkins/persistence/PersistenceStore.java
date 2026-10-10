@@ -29,6 +29,7 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import java.io.IOException;
 import java.util.List;
 import java.util.Set;
+import java.util.function.Consumer;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
 
@@ -121,6 +122,34 @@ public interface PersistenceStore {
      * An entry {@linkplain #move moved}: from {@code from} at {@code fromVersion} to {@code to} at {@code version}.
      */
     record Moved(@NonNull String from, long fromVersion, @NonNull String to, long version) {}
+
+    /**
+     * Identifies this store instance (and so this controller) as the origin of the changes it makes.
+     */
+    @NonNull
+    String getOrigin();
+
+    /**
+     * Receives every change made through any instance of the store, including this one, in the order they were made.
+     * Implementations deliver events at least once and must not lose them across reconnects.
+     *
+     * @return a handle which unsubscribes when closed
+     */
+    @NonNull
+    AutoCloseable subscribe(@NonNull Consumer<ChangeEvent> listener);
+
+    /**
+     * A change to one key.
+     *
+     * @param kind what happened
+     * @param key the key changed; for {@link Kind#MOVED} the new key
+     * @param oldKey for {@link Kind#MOVED} the previous key, else null
+     * @param version the version after the change
+     * @param origin {@link #getOrigin} of the store instance which made the change
+     */
+    record ChangeEvent(@NonNull Kind kind, @NonNull String key, @CheckForNull String oldKey, long version, @NonNull String origin) {
+        public enum Kind { WRITTEN, DELETED, MOVED }
+    }
 
     /**
      * Stored content with its version.

@@ -41,6 +41,7 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
 import jenkins.util.SystemProperties;
+import jenkins.util.ThrowingCallable;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
@@ -119,6 +120,33 @@ public final class PersistenceStores {
         } finally {
             RESOLVING.remove();
         }
+    }
+
+    /** Set while this thread applies a change made by another controller. */
+    private static final ThreadLocal<Boolean> APPLYING_REMOTE = new ThreadLocal<>();
+
+    /**
+     * Runs code which brings this controller up to date with a change already made in the store by another controller.
+     * Within it, modifications of owned keys are not written back to the store (they are already there);
+     * only local state such as directories and in-memory objects is updated.
+     */
+    public static <V, T extends Throwable> V applyingRemoteChange(ThrowingCallable<V, T> body) throws T {
+        Boolean old = APPLYING_REMOTE.get();
+        APPLYING_REMOTE.set(Boolean.TRUE);
+        try {
+            return body.call();
+        } finally {
+            if (old == null) {
+                APPLYING_REMOTE.remove();
+            }
+        }
+    }
+
+    /**
+     * Whether this thread is {@linkplain #applyingRemoteChange applying a remote change}.
+     */
+    public static boolean isApplyingRemoteChange() {
+        return APPLYING_REMOTE.get() != null;
     }
 
     /** Set while this thread resolves the store, so that providers reading files do not recurse. */
@@ -221,7 +249,7 @@ public final class PersistenceStores {
         }
         String fromKey = keyFor(from);
         String toKey = keyFor(to);
-        if (fromKey == null || toKey == null || fromKey.equals(toKey)) {
+        if (fromKey == null || toKey == null || fromKey.equals(toKey) || isApplyingRemoteChange()) {
             return;
         }
         if (toKey.startsWith(fromKey + "/") || fromKey.startsWith(toKey + "/")) {
@@ -389,6 +417,9 @@ public final class PersistenceStores {
         }
 
         public long write(@NonNull byte[] content) throws IOException {
+            if (isApplyingRemoteChange()) {
+                return lastSeen(key);
+            }
             Creation creation = creations.get(key);
             boolean createOnly = creation != null && creation.written == PersistenceStore.ABSENT;
             long expected = createOnly ? PersistenceStore.ABSENT : lastSeen(key);
@@ -411,6 +442,9 @@ public final class PersistenceStores {
         }
 
         public void delete() throws IOException {
+            if (isApplyingRemoteChange()) {
+                return;
+            }
             try {
                 store.delete(key, lastSeen(key));
             } catch (ConflictException e) {
