@@ -50,6 +50,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
+import jenkins.util.ClusterSingleton;
 import jenkins.util.SystemProperties;
 import net.sf.json.JSONObject;
 import org.kohsuke.accmod.Restricted;
@@ -177,6 +178,7 @@ public abstract class Telemetry implements ExtensionPoint {
         return components;
     }
 
+    @ClusterSingleton // acts on shared state: once per cluster of controllers sharing it
     @Extension
     public static class TelemetryReporter extends AsyncPeriodicWork {
 

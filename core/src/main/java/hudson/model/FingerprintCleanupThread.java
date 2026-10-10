@@ -30,6 +30,7 @@ import java.util.logging.Logger;
 import jenkins.fingerprints.FileFingerprintStorage;
 import jenkins.fingerprints.FingerprintStorage;
 import jenkins.fingerprints.GlobalFingerprintConfiguration;
+import jenkins.util.ClusterSingleton;
 import org.jenkinsci.Symbol;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
@@ -44,6 +45,7 @@ import org.kohsuke.accmod.restrictions.NoExternalUse;
  *
  * @author Kohsuke Kawaguchi
  */
+@ClusterSingleton // acts on shared state: once per cluster of controllers sharing it
 @Extension @Symbol("fingerprintCleanup")
 @Restricted(NoExternalUse.class)
 public class FingerprintCleanupThread extends AsyncPeriodicWork {
