@@ -286,6 +286,14 @@ public final class ItemChangeApplier {
      * @return false if the key is not a build record
      */
     private boolean build(ChangeEvent e) throws Exception {
+        RunningBuilds.StopKey stop = RunningBuilds.StopKey.parse(e.key());
+        if (stop != null) {
+            if (e.kind() == ChangeEvent.Kind.WRITTEN) {
+                RunningBuilds.stopRequested(stop.jobKey(), stop.number());
+            }
+            applied.incrementAndGet();
+            return true;
+        }
         String runningJob = RunningBuilds.jobKeyOf(e.key());
         if (runningJob != null) {
             RunningBuilds.invalidate(runningJob);
