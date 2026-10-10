@@ -45,6 +45,7 @@ import jenkins.security.LastGrantedAuthoritiesProperty;
 import jenkins.security.seed.UserSeedProperty;
 import jenkins.util.SystemProperties;
 import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.Beta;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.springframework.security.authentication.RememberMeAuthenticationProvider;
 import org.springframework.security.core.Authentication;
@@ -113,7 +114,18 @@ public class TokenBasedRememberMeServices2 extends AbstractRememberMeServices {
     @SuppressWarnings("deprecation")
     public TokenBasedRememberMeServices2(UserDetailsService userDetailsService) {
         super(Jenkins.get().getSecretKey(), new ImpersonatingUserDetailsService2(userDetailsService));
+        setAlwaysRemember(ALWAYS_REMEMBER);
     }
+
+    /**
+     * Whether to issue the remember-me cookie on every login, as if "Keep me signed in" were always checked.
+     * With several controllers behind one load balancer sharing users and keys, this signed cookie authenticates
+     * a browser on whichever controller its next request reaches, without a shared session.
+     */
+    @Restricted(Beta.class)
+    @SuppressFBWarnings(value = "MS_SHOULD_BE_FINAL", justification = "for script console")
+    public static /* Script Console modifiable */ boolean ALWAYS_REMEMBER =
+            SystemProperties.getBoolean(TokenBasedRememberMeServices2.class.getName() + ".alwaysRemember");
 
     protected String makeTokenSignature(long tokenExpiryTime, String username) {
         String userSeed;
