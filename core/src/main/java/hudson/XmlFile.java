@@ -239,6 +239,7 @@ public final class XmlFile {
             } catch (RuntimeException e) {
                 throw new IOException(e);
             }
+            mkdirs(); // the directory itself stays local: other files such as builds live alongside
             route.write(buf.toByteArray());
             return;
         }
@@ -274,6 +275,7 @@ public final class XmlFile {
     public void writeRaw(byte[] content) throws IOException {
         PersistenceStores.Route route = route();
         if (route != null) {
+            mkdirs();
             route.write(content);
             return;
         }
