@@ -67,6 +67,8 @@ public class InMemoryPersistenceStore implements PersistenceStore {
     private final Object delivering;
     /** The thread delivering changes, guarded by {@link #delivering}. */
     private Thread draining;
+    private final Map<String, long[]> leaseEpochs;
+    private final Map<String, String> leaseOwners;
     /** Versions come from one counter, so a key that is deleted and recreated never repeats a version. */
     private long clock;
 
@@ -81,6 +83,8 @@ public class InMemoryPersistenceStore implements PersistenceStore {
         this.listeners = new CopyOnWriteArrayList<>();
         this.outbox = new ArrayDeque<>();
         this.delivering = new Object();
+        this.leaseEpochs = new TreeMap<>();
+        this.leaseOwners = new TreeMap<>();
     }
 
     private InMemoryPersistenceStore(InMemoryPersistenceStore root, String origin) {
@@ -91,6 +95,8 @@ public class InMemoryPersistenceStore implements PersistenceStore {
         this.listeners = root.listeners;
         this.outbox = root.outbox;
         this.delivering = root.delivering;
+        this.leaseEpochs = root.leaseEpochs;
+        this.leaseOwners = root.leaseOwners;
     }
 
     /**
@@ -145,6 +151,62 @@ public class InMemoryPersistenceStore implements PersistenceStore {
                 root.draining = null;
             }
         }
+    }
+
+    /**
+     * Views made by {@link #as} share the liveness of the store they were made from, so tests can override it once.
+     */
+    @Override
+    public java.util.Set<String> liveOrigins() throws java.io.IOException {
+        return root == this ? null : root.liveOrigins();
+    }
+
+    /**
+     * Leases lapse when their owner is missing from {@link #liveOrigins} (when that is null, they never lapse).
+     */
+    @Override
+    @NonNull
+    public BuildLeases leases() {
+        return new BuildLeases() {
+            private boolean alive(String o) throws java.io.IOException {
+                java.util.Set<String> live = liveOrigins();
+                return live == null || live.contains(o);
+            }
+
+            @Override
+            public long acquire(@NonNull String key) throws java.io.IOException {
+                synchronized (root) {
+                    String owner = leaseOwners.get(key);
+                    if (owner != null && owner.equals(origin)) {
+                        return leaseEpochs.get(key)[0];
+                    }
+                    if (owner != null && alive(owner)) {
+                        return 0;
+                    }
+                    long epoch = ++root.clock;
+                    leaseOwners.put(key, origin);
+                    leaseEpochs.put(key, new long[] {epoch});
+                    return epoch;
+                }
+            }
+
+            @Override
+            public boolean holds(@NonNull String key, long epoch) {
+                synchronized (root) {
+                    return origin.equals(leaseOwners.get(key)) && leaseEpochs.get(key)[0] == epoch;
+                }
+            }
+
+            @Override
+            public void release(@NonNull String key, long epoch) {
+                synchronized (root) {
+                    if (holds(key, epoch)) {
+                        leaseOwners.remove(key);
+                        leaseEpochs.remove(key);
+                    }
+                }
+            }
+        };
     }
 
     @Override

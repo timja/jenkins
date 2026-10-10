@@ -149,6 +149,16 @@ public interface PersistenceStore {
     }
 
     /**
+     * Leases on running builds, so that exactly one controller works on each.
+     *
+     * @return the leases, or null if this store does not offer them (builds are then never adopted)
+     */
+    @CheckForNull
+    default BuildLeases leases() {
+        return null;
+    }
+
+    /**
      * Identifies this store instance (and so this controller) as the origin of the changes it makes.
      */
     @NonNull
