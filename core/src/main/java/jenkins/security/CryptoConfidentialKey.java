@@ -37,11 +37,7 @@ public class CryptoConfidentialKey extends ConfidentialKey {
         if (secret == null || cs != lastCS) {
             lastCS = cs;
             try {
-                byte[] payload = load();
-                if (payload == null) {
-                    payload = cs.randomBytes(256);
-                    store(payload);
-                }
+                byte[] payload = loadOrCreate(() -> cs.randomBytes(256));
                 // Due to the stupid US export restriction JDK only ships 128bit version.
                 secret = new SecretKeySpec(payload, 0, 128 / 8, KEY_ALGORITHM);
             } catch (IOException e) {
