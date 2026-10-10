@@ -39,12 +39,14 @@ import java.util.Comparator;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.SortedMap;
 import java.util.function.IntPredicate;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.lazy.AbstractLazyLoadRunMap;
 import jenkins.model.lazy.BuildReference;
+import jenkins.persistence.BuildRecords;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 
@@ -184,7 +186,9 @@ public final class RunMap<R extends Run<?, R>> extends AbstractLazyLoadRunMap<R>
         if (Files.isDirectory(rootDir.toPath())) {
             throw new IllegalStateException("JENKINS-23152: " + rootDir + " already existed; will not overwrite with " + r);
         }
-        if (!r.getClass().getName().equals("hudson.matrix.MatrixRun")) { // JENKINS-26739: grandfathered in
+        if (job != null && BuildRecords.isShared(job)) {
+            proposeSharedNumber(r.getNumber());
+        } else if (!r.getClass().getName().equals("hudson.matrix.MatrixRun")) { // JENKINS-26739: grandfathered in
             proposeNewNumber(r.getNumber());
         }
         try {
@@ -253,13 +257,27 @@ public final class RunMap<R extends Run<?, R>> extends AbstractLazyLoadRunMap<R>
         };
     }
 
+    @Restricted(NoExternalUse.class)
+    @Override
+    protected Set<Integer> storedNumbers() {
+        return job == null ? Set.of() : BuildRecords.storedNumbers(job);
+    }
+
     @Override
     protected R retrieve(File d) throws IOException {
+        if (!new File(d, "build.xml").exists() && job != null && d.getParentFile().equals(job.getBuildDir())) {
+            // a build made by another controller, not yet seen here
+            // (only into the job's current build directory, not one left behind by a rename in progress)
+            BuildRecords.materialize(job, d);
+        }
         if (new File(d, "build.xml").exists()) {
             // if the build result file isn't in the directory, ignore it.
             try {
-                R b = cons.create(d);
-                b.onLoad();
+                R b = BuildRecords.loading(() -> {
+                    R loaded = cons.create(d);
+                    loaded.onLoad();
+                    return loaded;
+                });
                 if (LOGGER.isLoggable(FINEST)) {
                     LOGGER.log(FINEST, "Loaded " + b.getFullDisplayName() + " in " + Thread.currentThread().getName(), new ThisIsHowItsLoaded());
                 }

@@ -78,8 +78,10 @@ public final class PersistenceStores {
     public static /* non-final for script console */ String CONFLICTS = SystemProperties.getString(PersistenceStores.class.getName() + ".conflicts", "warn");
 
     private static volatile PersistenceStore testingStore;
+    private static volatile BlobStore testingBlobStore;
     private static volatile Jenkins resolvedFor;
     private static volatile PersistenceStore resolvedStore;
+    private static volatile BlobStore resolvedBlobStore;
 
     private static final Map<String, Long> versions = new ConcurrentHashMap<>();
     /**
@@ -116,6 +118,8 @@ public final class PersistenceStores {
             // and threads holding it (instantiating extensions) may themselves read XmlFiles and get here.
             ExtensionList<PersistenceStoreProvider> providers = ExtensionList.lookup(PersistenceStoreProvider.class);
             providers.size();
+            ExtensionList<BlobStoreProvider> blobProviders = ExtensionList.lookup(BlobStoreProvider.class);
+            blobProviders.size();
             synchronized (PersistenceStores.class) {
                 if (resolvedFor != j) {
                     PersistenceStore store = null;
@@ -126,7 +130,18 @@ public final class PersistenceStores {
                             break;
                         }
                     }
+                    BlobStore blobs = null;
+                    if (store != null) {
+                        for (BlobStoreProvider provider : blobProviders) {
+                            blobs = provider.create();
+                            if (blobs != null) {
+                                LOGGER.info(() -> "Using blob store " + provider.getClass().getName());
+                                break;
+                            }
+                        }
+                    }
                     resolvedStore = store;
+                    resolvedBlobStore = blobs;
                     versions.clear();
                     elements.clear();
                     resolvedFor = j;
@@ -136,6 +151,18 @@ public final class PersistenceStores {
         } finally {
             RESOLVING.remove();
         }
+    }
+
+    /**
+     * The active blob store, or null if none is configured.
+     * Only available while a {@link #get persistence store} is active.
+     */
+    @CheckForNull
+    public static BlobStore getBlobStore() {
+        if (testingStore != null) {
+            return testingBlobStore;
+        }
+        return get() == null ? null : resolvedBlobStore;
     }
 
     /** Set while this thread applies a change made by another controller. */
@@ -252,7 +279,7 @@ public final class PersistenceStores {
     }
 
     /**
-     * Moves the stored entries below one directory to another, as when an item is renamed or moved.
+     * Moves the stored entries (and blobs) below one directory to another, as when an item is renamed or moved.
      * Does nothing if no store is active or the directories are outside {@code JENKINS_HOME}.
      *
      * @throws ConflictException if something is already stored at the destination, or the item's configuration is no
@@ -272,8 +299,29 @@ public final class PersistenceStores {
             // the entries would be moved below themselves (or over what holds them), and could not be moved back
             throw new IllegalArgumentException("Cannot move " + fromKey + " to " + toKey);
         }
-        List<PersistenceStore.Moved> moved = store.move(fromKey, toKey);
-        checkItemMoved(store, fromKey, toKey, moved);
+        if (store.read(toKey) != null || !store.children(toKey).isEmpty()) {
+            // checked before touching blobs, which would otherwise overwrite those of whatever is at the destination
+            throw new ConflictException(toKey, PersistenceStore.ABSENT, PersistenceStore.ANY);
+        }
+        // blobs first: moving the entries tells other controllers, which may then look for the blobs at the new location
+        BlobStore blobs = getBlobStore();
+        if (blobs != null) {
+            blobs.move(fromKey, toKey);
+        }
+        List<PersistenceStore.Moved> moved;
+        try {
+            moved = store.move(fromKey, toKey);
+            checkItemMoved(store, fromKey, toKey, moved);
+        } catch (IOException | RuntimeException e) {
+            if (blobs != null) {
+                try {
+                    blobs.move(toKey, fromKey);
+                } catch (IOException | RuntimeException x) {
+                    e.addSuppressed(x);
+                }
+            }
+            throw e;
+        }
         // the moved entries have new versions: take them as seen where this JVM had seen the entry as it was moved, so
         // that the moved item's next save is still checked for conflicts; where it had seen an older version (changed
         // elsewhere since), keep that older one, so that the next save conflicts and merges as it would have unmoved
@@ -562,7 +610,13 @@ public final class PersistenceStores {
 
     @Restricted(NoExternalUse.class)
     public static void setForTesting(@CheckForNull PersistenceStore store) {
+        setForTesting(store, null);
+    }
+
+    @Restricted(NoExternalUse.class)
+    public static void setForTesting(@CheckForNull PersistenceStore store, @CheckForNull BlobStore blobs) {
         testingStore = store;
+        testingBlobStore = blobs;
         versions.clear();
         elements.clear();
         conflicts.set(0);
