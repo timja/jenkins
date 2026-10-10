@@ -1218,6 +1218,45 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
     }
 
     /**
+     * Applies a change another controller made to a user's configuration in a shared persistence store:
+     * reloads the user if known here, loads it if new, or forgets it if deleted. Nothing is saved.
+     *
+     * @param dirName the user's directory name under {@code users/}
+     */
+    @Restricted(NoExternalUse.class)
+    public static void changedElsewhere(@NonNull String dirName, boolean deleted) {
+        User known = null;
+        for (User u : AllUsers.values()) {
+            if (dirName.equals(getUserFolderNameFor(u.id))) {
+                known = u;
+                break;
+            }
+        }
+        if (deleted) {
+            if (known != null) {
+                AllUsers.remove(known.id);
+            }
+        } else if (known != null) {
+            known.load();
+        } else {
+            XmlFile xml = new XmlFile(XSTREAM, new File(new File(getUsersDirectory(), dirName), CONFIG_XML));
+            try {
+                if (xml.exists()) {
+                    User user = new User();
+                    xml.unmarshal(user);
+                    if (user.id != null && dirName.equals(getUserFolderNameFor(user.id))) {
+                        user.fixUpAfterLoad();
+                        AllUsers.put(user.id, user);
+                    }
+                }
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "Failed to load " + xml, e);
+            }
+        }
+        UserDetailsCache.get().invalidateAll();
+    }
+
+    /**
      * Resolves User IDs by ID, full names or other strings.
      * <p>
      * This extension point may be useful to map SCM user names to Jenkins {@link User} IDs.

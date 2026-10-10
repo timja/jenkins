@@ -206,6 +206,12 @@ public final class ItemChangeApplier {
         if (build(e)) {
             return;
         }
+        if (!e.key().startsWith("jobs/")) {
+            if (e.version() > PersistenceStores.lastSeen(e.key()) && StaticStateApplier.apply(e.key(), false)) {
+                applied.incrementAndGet();
+            }
+            return;
+        }
         List<String> names = itemPath(e.key());
         if (names == null || e.version() <= PersistenceStores.lastSeen(e.key())) {
             return; // not an item, or already have this version (e.g. loaded it at startup)
@@ -274,6 +280,13 @@ public final class ItemChangeApplier {
 
     private void deleted(ChangeEvent e) throws Exception {
         if (build(e)) {
+            return;
+        }
+        if (!e.key().startsWith("jobs/")) {
+            PersistenceStores.seen(e.key(), PersistenceStore.ABSENT);
+            if (StaticStateApplier.apply(e.key(), true)) {
+                applied.incrementAndGet();
+            }
             return;
         }
         List<String> names = itemPath(e.key());
