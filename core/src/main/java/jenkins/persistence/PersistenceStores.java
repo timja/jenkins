@@ -207,6 +207,26 @@ public final class PersistenceStores {
     }
 
     /**
+     * Moves the stored entries below one directory to another, as when an item is renamed or moved.
+     * Does nothing if no store is active or the directories are outside {@code JENKINS_HOME}.
+     *
+     * @throws ConflictException if something is already stored at the destination
+     */
+    public static void move(@NonNull File from, @NonNull File to) throws IOException {
+        PersistenceStore store = get();
+        if (store == null) {
+            return;
+        }
+        String fromKey = keyFor(from);
+        String toKey = keyFor(to);
+        if (fromKey == null || toKey == null || fromKey.equals(toKey)) {
+            return;
+        }
+        store.move(fromKey, toKey);
+        versions.keySet().removeIf(k -> k.equals(fromKey) || k.startsWith(fromKey + "/"));
+    }
+
+    /**
      * The local file corresponding to a key.
      */
     @NonNull

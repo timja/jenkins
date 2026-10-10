@@ -110,6 +110,25 @@ public class InMemoryPersistenceStore implements PersistenceStore {
         return names;
     }
 
+    @Override
+    public synchronized void move(@NonNull String fromPrefix, @NonNull String toPrefix) throws ConflictException {
+        for (String key : entries.keySet()) {
+            if (key.equals(toPrefix) || key.startsWith(toPrefix + "/")) {
+                throw new ConflictException(toPrefix, ABSENT, entries.get(key).version());
+            }
+        }
+        Map<String, Entry> moved = new TreeMap<>();
+        for (var it = entries.entrySet().iterator(); it.hasNext(); ) {
+            var e = it.next();
+            String key = e.getKey();
+            if (key.equals(fromPrefix) || key.startsWith(fromPrefix + "/")) {
+                moved.put(toPrefix + key.substring(fromPrefix.length()), new Entry(e.getValue().content(), ++clock));
+                it.remove();
+            }
+        }
+        entries.putAll(moved);
+    }
+
     /**
      * Snapshot of the stored keys, for assertions.
      */
