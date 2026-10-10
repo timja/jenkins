@@ -344,6 +344,34 @@ public class Nodes implements PersistenceRoot {
     }
 
     /**
+     * Applies a change another controller made to a node's configuration in a shared persistence store:
+     * loads it again (or for the first time), or forgets it if it was deleted. Nothing is saved.
+     */
+    @Restricted(NoExternalUse.class)
+    public void changedElsewhere(@NonNull String name, boolean deleted) {
+        Node old = getNode(name);
+        if (deleted) {
+            if (old != null) {
+                unload(old);
+                jenkins.updateComputerList();
+                jenkins.trimLabels();
+                NodeListener.fireOnDeleted(old);
+            }
+            return;
+        }
+        Node loaded = load(name);
+        if (loaded == null) {
+            return;
+        }
+        if (old != null) {
+            jenkins.updateComputerList(); // rebind the computer to the new node object
+            NodeListener.fireOnUpdated(old, loaded);
+        } else {
+            NodeListener.fireOnCreated(loaded);
+        }
+    }
+
+    /**
      * Deletes a node's directory, and its configuration from a persistence store sharing it, so that it sees the deletion.
      * The local configuration goes with the directory, which is only unlinked if it is a symbolic link.
      */
