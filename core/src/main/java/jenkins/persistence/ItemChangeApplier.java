@@ -286,6 +286,12 @@ public final class ItemChangeApplier {
      * @return false if the key is not a build record
      */
     private boolean build(ChangeEvent e) throws Exception {
+        String runningJob = RunningBuilds.jobKeyOf(e.key());
+        if (runningJob != null) {
+            RunningBuilds.invalidate(runningJob);
+            applied.incrementAndGet();
+            return true;
+        }
         BuildRecords.RecordKey record = BuildRecords.RecordKey.parse(e.key());
         List<String> names = record == null ? null : itemPath(record.jobKey() + "/config.xml");
         if (names == null) {
@@ -310,6 +316,14 @@ public final class ItemChangeApplier {
     }
 
     private void moved(ChangeEvent e) throws Exception {
+        String runningJob = RunningBuilds.jobKeyOf(e.key());
+        if (runningJob != null) {
+            RunningBuilds.invalidate(runningJob);
+            if (e.oldKey() != null && RunningBuilds.jobKeyOf(e.oldKey()) != null) {
+                RunningBuilds.invalidate(RunningBuilds.jobKeyOf(e.oldKey()));
+            }
+            return;
+        }
         if (BuildRecords.RecordKey.parse(e.key()) != null) {
             build(e);
             return;

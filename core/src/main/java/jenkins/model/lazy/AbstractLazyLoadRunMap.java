@@ -244,6 +244,14 @@ public abstract class AbstractLazyLoadRunMap<R> extends AbstractMap<Integer, R> 
     }
 
     /**
+     * Whether a build number is in the index, without loading the build.
+     */
+    @Restricted(NoExternalUse.class)
+    public final synchronized boolean knows(int buildNumber) {
+        return core.containsKey(buildNumber);
+    }
+
+    /**
      * Drops the loaded instance of a build, if any, so that it is read again from disk when next needed,
      * as after another controller changed its record.
      */
