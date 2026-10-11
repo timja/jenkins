@@ -424,6 +424,30 @@ class BuildRecordsTest {
     }
 
     @Test
+    void fileAddedToACompletedBuildIsRepublished() throws Exception {
+        FreeStyleProject p = project(r, "late");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p);
+        java.nio.file.Files.writeString(new java.io.File(b.getRootDir(), "late.txt").toPath(), "added later");
+        hudson.model.AsyncPeriodicWork.all().get(BuildRecords.LateFiles.class).execute(hudson.model.TaskListener.NULL);
+        wipeAndReload(r);
+        b = r.jenkins.getItemByFullName("late", FreeStyleProject.class).getBuildByNumber(1);
+        assertEquals("added later", java.nio.file.Files.readString(new java.io.File(b.getRootDir(), "late.txt").toPath()));
+    }
+
+    @Test
+    void buildNothingCouldResumeIsClosedAsAborted() throws Exception {
+        FreeStyleProject p = project(r, "lost");
+        r.buildAndAssertSuccess(p);
+        BuildRecords.publishLost(p, 2, System.currentTimeMillis(), "It was running on a controller which is gone.");
+        assertNotNull(record("jobs/lost/builds/2/build.xml"));
+        wipeAndReload(r);
+        FreeStyleBuild lost = r.jenkins.getItemByFullName("lost", FreeStyleProject.class).getBuildByNumber(2);
+        assertNotNull(lost);
+        assertEquals(hudson.model.Result.ABORTED, lost.getResult());
+        assertThat(lost.getLog(), org.hamcrest.Matchers.containsString("a controller which is gone"));
+    }
+
+    @Test
     void renameMovesRecordsAndSnapshots() throws Exception {
         FreeStyleProject p = project(r, "before");
         r.buildAndAssertSuccess(p);

@@ -652,6 +652,13 @@ public final class RunningBuilds {
                     if (now != null && (leases == null || leases.holds(p.key, epoch))) {
                         LOGGER.info(() -> "Removing placeholder of " + job.getFullName() + " #" + p.number + " left by " + p.controller + " (" + p.origin + "), which is gone");
                         try {
+                            // nothing can resume it: close it as aborted rather than let it vanish (Target 12)
+                            BuildRecords.publishLost(job, p.number, p.startTime,
+                                    "This build was running on " + p.controller + ", which is gone, and could not be resumed elsewhere; it is closed as aborted.");
+                        } catch (IOException | RuntimeException e) {
+                            LOGGER.log(Level.WARNING, "Could not close " + job.getFullName() + " #" + p.number + " as aborted", e);
+                        }
+                        try {
                             // only as read: several controllers noticing at once is harmless, and a write since is kept
                             store.delete(p.key, now.version());
                             removedHere++;
@@ -903,7 +910,7 @@ public final class RunningBuilds {
             }
             owned.put(key, new Placeholder(key, number, mine.origin, mine.controller, p.displayName, p.startTime, epoch, p.properties, version));
             invalidate(jobKeyOfRunning(runningKey(job)));
-            LOGGER.info(() -> "Adopting " + job.getFullName() + " #" + number + " from " + p.controller + " (" + p.origin + "), which is gone");
+            LOGGER.info(() -> "Adopting " + job.getFullName() + " #" + number + " from " + p.controller + " (" + p.origin + ")");
             try {
                 adoption.resume(epoch);
             } catch (IOException | RuntimeException e) {
@@ -966,6 +973,48 @@ public final class RunningBuilds {
             throw failure instanceof IOException io ? io : new IOException(failure);
         }
         return null;
+    }
+
+    /**
+     * Gives up a build this controller runs so that another controller can take it over ({@link #takeOver}), for example
+     * a Pipeline waiting for an agent only another controller has (Target 12). The build is then stopped here without
+     * being published, as when ownership is lost.
+     */
+    @Restricted(Beta.class)
+    public static void handOver(@NonNull Run<?, ?> run) throws IOException {
+        String key = placeholderKey(run);
+        PersistenceStore store = PersistenceStores.get();
+        Placeholder p = key == null ? null : owned.get(key);
+        if (p == null || store == null || store.leases() == null) {
+            throw new IOException(run + " is not owned here");
+        }
+        store.leases().release(key, p.epoch);
+        LOGGER.info(() -> "Handed over " + run);
+        lost(run);
+    }
+
+    /**
+     * Takes over a build another controller {@linkplain #handOver handed over}: acquires its lease and adopts it.
+     *
+     * @return whether it was adopted
+     */
+    @Restricted(Beta.class)
+    public static boolean takeOver(@NonNull Job<?, ?> job, int number) throws IOException {
+        PersistenceStore store = PersistenceStores.get();
+        String runningKey = runningKey(job);
+        if (store == null || store.leases() == null || runningKey == null) {
+            return false;
+        }
+        String key = runningKey + "/" + number + SUFFIX;
+        long epoch = store.leases().acquire(key);
+        if (epoch == 0) {
+            return false; // not released (yet), or taken by another controller
+        }
+        if (adopt(store, job, key, epoch)) {
+            return true;
+        }
+        store.leases().release(key, epoch);
+        return false;
     }
 
     /**
