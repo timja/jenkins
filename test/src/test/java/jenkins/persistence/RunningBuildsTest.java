@@ -37,6 +37,7 @@ import hudson.model.AbstractBuild;
 import hudson.model.BuildListener;
 import hudson.model.FreeStyleBuild;
 import hudson.model.FreeStyleProject;
+import hudson.model.Job;
 import hudson.model.queue.QueueTaskFuture;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
@@ -263,6 +264,56 @@ class RunningBuildsTest {
         awaitApplied();
         assertEquals(List.of(), elsewhere(replacement), "the renamed job's build is not shown for a new job under the old name");
         assertEquals(List.of(1), elsewhere(p));
+    }
+
+    @Test
+    void followingABuildElsewhereEndsWithTheRestOfItsRecord() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("followed");
+        r.buildAndAssertSuccess(p);
+        byte[] log;
+        try (InputStream in = p.getBuildByNumber(1).getLogInputStream()) {
+            log = in.readAllBytes();
+        }
+        other.write("jobs/followed/running/2.xml", placeholder("other-controller", "jenkins-a", 2), PersistenceStore.ABSENT);
+        awaitApplied();
+        assertTrue(RunningBuilds.isRunningElsewhere(p, 2));
+
+        // its owner shipped the first 10 bytes; then the build completed: its record published, its shipped log deleted
+        ShippedLog.prefix = java.util.Arrays.copyOf(log, 10);
+        ShippedLog.completed = () -> {
+            try (InputStream snapshot = BLOBS.get("jobs/followed/builds/1/files.tgz")) {
+                byte[] bytes = snapshot.readAllBytes();
+                BLOBS.put("jobs/followed/builds/2/files.tgz", new ByteArrayInputStream(bytes), bytes.length);
+                other.write("jobs/followed/builds/2/build.xml", STORE.read("jobs/followed/builds/1/build.xml").content(), PersistenceStore.ABSENT);
+            }
+        };
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        assertTrue(RunningBuilds.followElsewhere(p, 2, true, out));
+        assertEquals(new String(log, StandardCharsets.UTF_8), out.toString(StandardCharsets.UTF_8), "what was shipped, then the rest from the record");
+    }
+
+    @TestExtension("followingABuildElsewhereEndsWithTheRestOfItsRecord")
+    public static class ShippedLog implements RunningBuilds.RemoteLog {
+        static byte[] prefix;
+        static Completion completed;
+
+        interface Completion {
+            void run() throws Exception;
+        }
+
+        @Override
+        public long copy(Job<?, ?> job, int number, long offset, java.io.OutputStream out) throws java.io.IOException {
+            if (offset == 0) {
+                out.write(prefix);
+                return prefix.length;
+            }
+            try {
+                completed.run();
+            } catch (Exception e) {
+                throw new java.io.IOException(e);
+            }
+            return -1; // deleted once the build completed
+        }
     }
 
     @TestExtension
