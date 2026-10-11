@@ -32,6 +32,7 @@ THE SOFTWARE.
         <j:set var="readOnlyMode" value="${!app.hasPermission(app.ADMINISTER)}"/>
 
         <l:app-bar title="${%Advanced settings}"/>
+  <st:include it="${app.pluginManager}" page="notices.jelly"/>
             <div class="jenkins-form">
 
               <l:isAdmin>

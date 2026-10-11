@@ -32,6 +32,7 @@ THE SOFTWARE.
   <st:adjunct includes="hudson.model.UpdateCenter.update-center" />
   <st:adjunct includes="hudson.model.UpdateCenter._download-failure" />
   <l:app-bar title="${%Download progress}" />
+  <st:include it="${app.pluginManager}" page="notices.jelly"/>
   <st:include page="body.jelly" />
 </l:settings-subpage>
 </j:jelly>
