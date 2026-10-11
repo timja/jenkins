@@ -252,8 +252,20 @@ public final class BuildRecords {
                 blobs.move(base + "/" + upload, base + "/" + SNAPSHOT);
             }
         }
+        if (isDeleted(base)) {
+            discardSnapshot(base);
+            LOGGER.fine(() -> "Not publishing " + run + ": deleted while being published");
+            return;
+        }
         byte[] published = Files.readAllBytes(record);
         publishRecord(lease, base + "/" + RECORD, published);
+        if (isDeleted(base)) {
+            // deleted while we wrote it (a build discarder runs as soon as builds complete): do not leave it behind
+            PersistenceStores.get().delete(base + "/" + RECORD, PersistenceStore.ANY);
+            discardSnapshot(base);
+            LOGGER.fine(() -> "Unpublished " + run + ": deleted while being published");
+            return;
+        }
         // a save made while publishing found no record yet, so republish left it to this: include it
         for (int i = 0; i < 10; i++) {
             byte[] now = Files.readAllBytes(record);
@@ -272,6 +284,27 @@ public final class BuildRecords {
             seen(key, PersistenceStores.get().write(key, content, PersistenceStore.ANY));
         } else {
             seen(key, PersistenceStores.get().writeIfHeld(lease.getKey(), lease.getEpoch(), key, content, PersistenceStore.ANY));
+        }
+    }
+
+    /** Builds deleted here, by key, so that a publication still in progress does not bring them back. */
+    private static final Set<String> deleted = java.util.Collections.newSetFromMap(new java.util.LinkedHashMap<>() {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) {
+            return size() > 10_000;
+        }
+    });
+
+    private static boolean isDeleted(String base) {
+        synchronized (deleted) {
+            return deleted.contains(base);
+        }
+    }
+
+    private static void discardSnapshot(String base) throws IOException {
+        BlobStore blobs = PersistenceStores.getBlobStore();
+        if (blobs != null) {
+            blobs.delete(base);
         }
     }
 
@@ -316,6 +349,9 @@ public final class BuildRecords {
             return;
         }
         String base = builds + "/" + run.getNumber();
+        synchronized (deleted) {
+            deleted.add(base);
+        }
         PersistenceStores.get().delete(base + "/" + RECORD, PersistenceStore.ANY);
         seen(base + "/" + RECORD, PersistenceStore.ABSENT);
         BlobStore blobs = PersistenceStores.getBlobStore();
