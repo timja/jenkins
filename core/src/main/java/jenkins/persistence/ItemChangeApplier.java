@@ -190,7 +190,11 @@ public final class ItemChangeApplier {
         Item item = jenkins.getItemByFullName(fullName);
         if (item instanceof AbstractItem existing) {
             LOGGER.fine(() -> "Reloading " + fullName + " changed elsewhere");
-            existing.load();
+            // under the item's lock, as AbstractItem.save is: a save while the object is half reloaded would write a mix
+            // of the two versions, as of the version just read, so nobody would notice (lost trigger, ET11 scenario 3)
+            synchronized (existing) {
+                existing.load();
+            }
             ItemListener.fireOnUpdated(existing);
             applied.incrementAndGet();
             return;
