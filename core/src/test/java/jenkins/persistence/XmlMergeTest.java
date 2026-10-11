@@ -3,6 +3,7 @@ package jenkins.persistence;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.charset.StandardCharsets;
 import org.junit.jupiter.api.Test;
@@ -80,6 +81,38 @@ class XmlMergeTest {
         XmlMerge.Result r = XmlMerge.merge(b(base), b(base.replace(">1<", ">one<")), b(base.replace(">2<", ">two<")));
         assertNotNull(r);
         assertEquals(1, r.conflicts(), "both changed the list of items");
+    }
+
+    @Test
+    void differentPartsOfOneNestedElementBothSurvive() {
+        // a user record: one controller changes the password, another adds an API token
+        String base = """
+                <?xml version='1.1' encoding='UTF-8'?>
+                <user>
+                  <id>admin</id>
+                  <properties>
+                    <hudson.security.HudsonPrivateSecurityRealm_-Details><passwordHash>old</passwordHash></hudson.security.HudsonPrivateSecurityRealm_-Details>
+                    <jenkins.security.ApiTokenProperty><tokenStore/></jenkins.security.ApiTokenProperty>
+                  </properties>
+                </user>""";
+        String mine = base.replace("<passwordHash>old<", "<passwordHash>new<");
+        String theirs = base.replace("<tokenStore/>", "<tokenStore><name>harness</name></tokenStore>");
+        XmlMerge.Result r = XmlMerge.merge(b(base), b(mine), b(theirs));
+        assertNotNull(r);
+        assertEquals(0, r.conflicts());
+        String merged = s(r.merged());
+        assertTrue(merged.contains("<passwordHash>new</passwordHash>"), merged);
+        assertTrue(merged.contains("<tokenStore><name>harness</name></tokenStore>"), merged);
+        assertTrue(merged.contains("<id>admin</id>"), merged);
+    }
+
+    @Test
+    void sameNestedPartChangedOnBothSidesKeepsMine() {
+        String base = "<user>\n  <properties>\n    <a>1</a>\n    <b>1</b>\n  </properties>\n</user>";
+        XmlMerge.Result r = XmlMerge.merge(b(base), b(base.replace("<a>1<", "<a>mine<")), b(base.replace("<a>1<", "<a>theirs<")));
+        assertNotNull(r);
+        assertEquals(1, r.conflicts());
+        assertTrue(s(r.merged()).contains("<a>mine</a>"));
     }
 
     @Test

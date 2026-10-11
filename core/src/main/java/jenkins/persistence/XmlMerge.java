@@ -78,49 +78,151 @@ public final class XmlMerge {
             if (b == null || m == null || t == null || !b.getTagName().equals(m.getTagName()) || !m.getTagName().equals(t.getTagName())) {
                 return null;
             }
-            Map<String, String> bu = units(b);
-            Map<String, String> mu = units(m);
-            Map<String, String> tu = units(t);
-            if (bu == null || mu == null || tu == null) {
+            int[] conflicts = {0};
+            String inner = mergeChildren(b, m, t, "  ", conflicts);
+            if (inner == null) {
                 return null;
             }
-            int conflicts = 0;
-            Map<String, String> result = new LinkedHashMap<>();
-            List<String> names = new ArrayList<>(mu.keySet());
-            for (String name : tu.keySet()) {
-                if (!names.contains(name)) {
-                    names.add(name);
-                }
-            }
-            for (String name : bu.keySet()) {
-                if (!names.contains(name)) {
-                    names.add(name);
-                }
-            }
-            for (String name : names) {
-                String bv = bu.get(name);
-                String mv = mu.get(name);
-                String tv = tu.get(name);
-                String v;
-                if (Objects.equals(mv, bv)) {
-                    v = tv;
-                } else if (Objects.equals(tv, bv) || Objects.equals(mv, tv)) {
-                    v = mv;
-                } else {
-                    v = mv;
-                    conflicts++;
-                }
-                if (v != null) {
-                    result.put(name, v);
-                }
-            }
-            return new Result(write(m.getTagName(), result, declaration(mine)), conflicts);
+            String root = m.getTagName();
+            String attrs = mergeAttributes(b, m, t, conflicts);
+            String doc = declaration(mine) + "\n<" + root + attrs + ">\n" + inner + "</" + root + ">";
+            return new Result(doc.getBytes(StandardCharsets.UTF_8), conflicts[0]);
         } catch (Exception e) {
             return null;
         }
     }
 
-    private static final String ATTRIBUTES = "@";
+    /**
+     * Merges the children of three versions of an element, by name; one line per child at {@code indent}.
+     *
+     * @return null if an element has text of its own among its children (mixed content)
+     */
+    @CheckForNull
+    private static String mergeChildren(Element b, Element m, Element t, String indent, int[] conflicts) throws Exception {
+        Map<String, List<Element>> bu = children(b);
+        Map<String, List<Element>> mu = children(m);
+        Map<String, List<Element>> tu = children(t);
+        if (bu == null || mu == null || tu == null) {
+            return null;
+        }
+        List<String> names = new ArrayList<>(mu.keySet());
+        for (String name : tu.keySet()) {
+            if (!names.contains(name)) {
+                names.add(name);
+            }
+        }
+        for (String name : bu.keySet()) {
+            if (!names.contains(name)) {
+                names.add(name);
+            }
+        }
+        StringBuilder out = new StringBuilder();
+        for (String name : names) {
+            List<Element> be = bu.get(name);
+            List<Element> me = mu.get(name);
+            List<Element> te = tu.get(name);
+            String bv = serialise(be);
+            String mv = serialise(me);
+            String tv = serialise(te);
+            List<String> chosen;
+            if (Objects.equals(mv, bv)) {
+                chosen = verbatim(te);
+            } else if (Objects.equals(tv, bv) || Objects.equals(mv, tv)) {
+                chosen = verbatim(me);
+            } else if (single(be) && single(me) && single(te) && sameAttributes(be.get(0), me.get(0), te.get(0))
+                    && structured(be.get(0)) && structured(me.get(0)) && structured(te.get(0))) {
+                // changed on both sides, but made of distinctly named parts (e.g. <properties>): merge those
+                Element me0 = me.get(0);
+                String inner = mergeChildren(be.get(0), me0, te.get(0), indent + "  ", conflicts);
+                String open = "<" + me0.getTagName() + attributes(me0);
+                chosen = List.of(inner == null || inner.isEmpty() ? open + "/>" : open + ">\n" + inner + indent + "</" + me0.getTagName() + ">");
+            } else {
+                chosen = verbatim(me);
+                conflicts[0]++;
+            }
+            for (String element : chosen) {
+                out.append(indent).append(element).append('\n'); // verbatim: text content keeps its whitespace
+            }
+        }
+        return out.toString();
+    }
+
+    /** Child elements by name, in order; null if there is non-blank text among them. */
+    @CheckForNull
+    private static Map<String, List<Element>> children(Element e) {
+        Map<String, List<Element>> result = new LinkedHashMap<>();
+        for (Node n = e.getFirstChild(); n != null; n = n.getNextSibling()) {
+            switch (n.getNodeType()) {
+                case Node.ELEMENT_NODE -> result.computeIfAbsent(n.getNodeName(), k -> new ArrayList<>()).add((Element) n);
+                case Node.TEXT_NODE, Node.CDATA_SECTION_NODE -> {
+                    if (!n.getNodeValue().isBlank()) {
+                        return null;
+                    }
+                }
+                case Node.COMMENT_NODE -> { }
+                default -> {
+                    return null;
+                }
+            }
+        }
+        return result;
+    }
+
+    private static boolean single(@CheckForNull List<Element> elements) {
+        return elements != null && elements.size() == 1;
+    }
+
+    /** Whether an element is made only of child elements with distinct names (so they can be merged one by one). */
+    private static boolean structured(Element e) {
+        Map<String, List<Element>> c = children(e);
+        return c != null && !c.isEmpty() && c.values().stream().allMatch(l -> l.size() == 1);
+    }
+
+    private static boolean sameAttributes(Element b, Element m, Element t) {
+        return attributes(b).equals(attributes(m)) && attributes(m).equals(attributes(t));
+    }
+
+    private static String mergeAttributes(Element b, Element m, Element t, int[] conflicts) {
+        String ba = attributes(b);
+        String ma = attributes(m);
+        String ta = attributes(t);
+        if (ma.equals(ba)) {
+            return ta;
+        }
+        if (!ta.equals(ba) && !ta.equals(ma)) {
+            conflicts[0]++;
+        }
+        return ma;
+    }
+
+    private static String attributes(Element e) {
+        StringBuilder attrs = new StringBuilder();
+        NamedNodeMap a = e.getAttributes();
+        for (int i = 0; i < a.getLength(); i++) {
+            Node n = a.item(i);
+            attrs.append(' ').append(n.getNodeName()).append("=\"").append(escapeAttribute(n.getNodeValue())).append('"');
+        }
+        return attrs.toString();
+    }
+
+    @CheckForNull
+    private static String serialise(@CheckForNull List<Element> elements) throws Exception {
+        if (elements == null) {
+            return null;
+        }
+        return String.join(SEPARATOR, verbatim(elements));
+    }
+
+    private static List<String> verbatim(@CheckForNull List<Element> elements) throws Exception {
+        List<String> result = new ArrayList<>();
+        if (elements != null) {
+            for (Element e : elements) {
+                result.add(serialise(e));
+            }
+        }
+        return result;
+    }
+
     /** Between the serialised elements of one unit (cannot occur in XML). */
     private static final String SEPARATOR = "\u0000";
 
@@ -134,38 +236,6 @@ public final class XmlMerge {
         db.setErrorHandler(null);
         Document d = db.parse(new ByteArrayInputStream(xml));
         return d.getDocumentElement();
-    }
-
-    /** name → serialised children of that name, in order; {@link #ATTRIBUTES} → the root's attributes; null if mixed text */
-    @CheckForNull
-    private static Map<String, String> units(Element root) throws Exception {
-        Map<String, StringBuilder> units = new LinkedHashMap<>();
-        StringBuilder attrs = new StringBuilder();
-        NamedNodeMap a = root.getAttributes();
-        for (int i = 0; i < a.getLength(); i++) {
-            Node n = a.item(i);
-            attrs.append(' ').append(n.getNodeName()).append("=\"").append(escapeAttribute(n.getNodeValue())).append('"');
-        }
-        if (!attrs.isEmpty()) {
-            units.put(ATTRIBUTES, attrs);
-        }
-        for (Node n = root.getFirstChild(); n != null; n = n.getNextSibling()) {
-            switch (n.getNodeType()) {
-                case Node.ELEMENT_NODE -> units.computeIfAbsent(n.getNodeName(), k -> new StringBuilder()).append(serialise(n)).append(SEPARATOR);
-                case Node.TEXT_NODE, Node.CDATA_SECTION_NODE -> {
-                    if (!n.getNodeValue().isBlank()) {
-                        return null;
-                    }
-                }
-                case Node.COMMENT_NODE -> { }
-                default -> {
-                    return null;
-                }
-            }
-        }
-        Map<String, String> result = new LinkedHashMap<>();
-        units.forEach((k, v) -> result.put(k, v.toString()));
-        return result;
     }
 
     private static String serialise(Node n) throws Exception {
@@ -191,24 +261,4 @@ public final class XmlMerge {
         return "<?xml version='1.1' encoding='UTF-8'?>";
     }
 
-    private static byte[] write(String root, Map<String, String> units, String declaration) {
-        StringBuilder out = new StringBuilder(declaration).append('\n').append('<').append(root);
-        String attrs = units.get(ATTRIBUTES);
-        if (attrs != null) {
-            out.append(attrs);
-        }
-        out.append(">\n");
-        for (Map.Entry<String, String> u : units.entrySet()) {
-            if (u.getKey().equals(ATTRIBUTES)) {
-                continue;
-            }
-            for (String element : u.getValue().split(SEPARATOR)) {
-                if (!element.isEmpty()) {
-                    out.append("  ").append(element).append('\n'); // verbatim: text content keeps its whitespace
-                }
-            }
-        }
-        out.append("</").append(root).append('>');
-        return out.toString().getBytes(StandardCharsets.UTF_8);
-    }
 }
