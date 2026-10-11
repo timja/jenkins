@@ -262,10 +262,17 @@ public final class ItemChangeApplier {
         }
         if (!e.key().startsWith("jobs/")) {
             if (e.version() > PersistenceStores.lastSeen(e.key())) {
-                if (e.key().equals("config.xml") && jenkins.hasUnsavedGlobalChanges() && retryLater(e)) {
-                    return; // as for items, below
-                }
-                if (StaticStateApplier.apply(e.key(), false)) {
+                if (e.key().equals("config.xml")) {
+                    // check and reload under one lock (Jenkins.save and reloadGlobalConfig take it), as for items below
+                    synchronized (jenkins) {
+                        if (jenkins.hasUnsavedGlobalChanges() && retryLater(e)) {
+                            return;
+                        }
+                        if (StaticStateApplier.apply(e.key(), false)) {
+                            applied.incrementAndGet();
+                        }
+                    }
+                } else if (StaticStateApplier.apply(e.key(), false)) {
                     applied.incrementAndGet();
                 }
                 retries.remove(e.key());

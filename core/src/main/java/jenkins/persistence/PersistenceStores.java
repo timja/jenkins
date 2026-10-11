@@ -1042,7 +1042,7 @@ public final class PersistenceStores {
                 }
                 Long merged = mergeAndWrite(content, expected);
                 if (merged != null) {
-                    version = merged;
+                    return merged; // seen and remembered as the object in memory has it, until it is reloaded
                 } else {
                     LOGGER.log(Level.WARNING, e.getMessage() + "; overwriting (last writer wins)");
                     version = store.write(key, content, PersistenceStore.ANY);
@@ -1080,14 +1080,18 @@ public final class PersistenceStores {
                 }
                 try {
                     long version = store.write(key, result.merged(), theirs.version());
-                    merges.incrementAndGet();
+                    // the object in memory still has only this JVM's side until it is reloaded (queued below): a save of
+                    // it meanwhile must conflict and merge again, against what it holds, rather than overwrite the
+                    // merged content with its stale part (a setter saving twice, ET11 scenario 3)
+                    seen(key, theirs.version());
+                    remember(key, theirs.version(), mine);
                     if (result.conflicts() > 0) {
                         LOGGER.warning(() -> key + " was changed meanwhile; merged, but " + result.conflicts()
                                 + " part(s) changed on both sides keep this controller's version");
                     } else {
                         LOGGER.info(() -> key + " was changed meanwhile; merged both changes");
                     }
-                    remember(key, version, result.merged());
+                    merges.incrementAndGet();
                     ItemChangeApplier.reload(key); // this JVM's object lacks the other change
                     return version;
                 } catch (ConflictException again) {
