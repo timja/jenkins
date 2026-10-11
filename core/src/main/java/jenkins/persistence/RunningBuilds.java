@@ -38,6 +38,7 @@ import hudson.model.Result;
 import hudson.model.Run;
 import hudson.model.TaskListener;
 import hudson.model.listeners.RunListener;
+import java.io.File;
 import java.io.IOException;
 import java.io.StringReader;
 import java.io.StringWriter;
@@ -418,6 +419,67 @@ public final class RunningBuilds {
         if (store.read(jobKey + "/" + PREFIX + "/" + run.getNumber() + STOP_SUFFIX) != null) {
             stopRequested(jobKey, run.getNumber());
         }
+    }
+
+    /**
+     * Takes over the lease of a build this controller's previous incarnation (the same name, another origin) was running,
+     * before it is loaded from this home.
+     *
+     * @return false if another controller holds it, so the local copy must not be loaded (nor resumed)
+     */
+    static boolean reclaim(@NonNull Job<?, ?> job, int number) throws IOException {
+        PersistenceStore store = PersistenceStores.get();
+        String runningKey = store == null ? null : runningKey(job);
+        if (runningKey == null) {
+            return true;
+        }
+        String key = runningKey + "/" + number + SUFFIX;
+        if (owned.containsKey(key)) {
+            return true;
+        }
+        Placeholder cached = null;
+        for (Placeholder p : all(job)) {
+            if (p.number == number) {
+                cached = p;
+            }
+        }
+        if (cached == null || !CONTROLLER_NAME.equals(cached.controller) || store.getOrigin().equals(cached.origin)
+                || !new File(new File(job.getBuildDir(), String.valueOf(number)), "build.xml").isFile()) {
+            return true; // not one this controller was running before a restart
+        }
+        PersistenceStore.Entry entry = store.read(key);
+        Placeholder p = entry == null ? null : Placeholder.fromBytes(key, number, entry.content(), entry.version());
+        if (p == null || !CONTROLLER_NAME.equals(p.controller)) {
+            if (p != null) {
+                LOGGER.info(() -> job.getFullName() + " #" + number + " was adopted by " + p.controller + " while this controller restarted; not resuming it here");
+                return false;
+            }
+            return true; // completed meanwhile
+        }
+        if (store.getOrigin().equals(p.origin)) {
+            return true;
+        }
+        BuildLeases leases = store.leases();
+        long epoch = leases == null ? p.epoch : leases.acquire(key);
+        if (epoch == 0) {
+            LOGGER.info(() -> "Another controller holds the lease on " + job.getFullName() + " #" + number + "; not resuming it here");
+            return false;
+        }
+        Placeholder mine = p.withOwner(store.getOrigin(), CONTROLLER_NAME, epoch, p.properties);
+        long version;
+        try {
+            version = store.write(key, mine.toBytes(), p.version);
+        } catch (ConflictException e) {
+            LOGGER.info(() -> job.getFullName() + " #" + number + " changed while being reclaimed after a restart; not resuming it here");
+            if (leases != null) {
+                leases.release(key, epoch);
+            }
+            return false;
+        }
+        owned.put(key, new Placeholder(key, number, mine.origin, mine.controller, p.displayName, p.startTime, epoch, p.properties, version));
+        invalidate(jobKeyOfRunning(runningKey));
+        LOGGER.info(() -> "Reclaimed " + job.getFullName() + " #" + number + " from this controller's previous run (" + p.origin + ") with epoch " + epoch);
+        return true;
     }
 
     /**
@@ -1029,6 +1091,25 @@ public final class RunningBuilds {
     @Restricted(NoExternalUse.class)
     @Extension
     public static final class Listener extends RunListener<Run<?, ?>> {
+
+        /**
+         * A build this controller was running before it restarted with its home (e.g. a safe restart to apply plugin
+         * changes) is loaded, and a Pipeline then resumed, from that home: first take its lease over from the previous
+         * incarnation, as an adopter would, so that no other controller adopts it too. If another controller holds it
+         * already (it adopted the build meanwhile), the local copy is not loaded: that controller's is the build.
+         */
+        @Override
+        public boolean allowLoad(@NonNull Job<?, ?> job, int buildNumber) {
+            if (PersistenceStores.isApplyingRemoteChange()) {
+                return true;
+            }
+            try {
+                return reclaim(job, buildNumber);
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.WARNING, "Could not reclaim " + job.getFullName() + " #" + buildNumber + " after a restart", e);
+                return true;
+            }
+        }
 
         @Override
         public void onStarted(Run<?, ?> run, TaskListener listener) {
