@@ -307,7 +307,7 @@ public final class XmlFile {
      */
     @Restricted(Beta.class)
     public byte[] readRawBytes() throws IOException {
-        try (InputStream in = open()) {
+        try (InputStream in = open(false)) {
             return in.readAllBytes();
         }
     }
@@ -378,7 +378,7 @@ public final class XmlFile {
      */
     public Reader readRaw() throws IOException {
         try {
-            InputStream fileInputStream = open();
+            InputStream fileInputStream = open(false);
             try {
                 return new InputStreamReader(fileInputStream, sniffEncoding());
             } catch (IOException ex) {
@@ -428,7 +428,7 @@ public final class XmlFile {
             }
         }
 
-        try (InputStream in = open()) {
+        try (InputStream in = open(false)) {
             InputSource input = new InputSource(file.toURI().toASCIIString());
             input.setByteStream(in);
             SAXParserFactory spf = SAXParserFactory.newInstance();
@@ -493,11 +493,19 @@ public final class XmlFile {
      * Opens the content, from the {@link PersistenceStore} if it serves this file, else from the local file.
      */
     private InputStream open() throws IOException {
+        return open(true);
+    }
+
+    /**
+     * @param loading whether the content is read into an object (this JVM then knows that version: a later write of
+     *     the object expects it, and merges against it); other reads (raw text, a snapshot file) only look
+     */
+    private InputStream open(boolean loading) throws IOException {
         PersistenceStores.Route route = route();
         if (route == null) {
             return Files.newInputStream(file.toPath());
         }
-        PersistenceStore.Entry entry = route.read();
+        PersistenceStore.Entry entry = loading ? route.read() : route.peek();
         if (entry == null) {
             throw new NoSuchFileException(file.toString(), null, "not found in persistence store as " + route.key());
         }
@@ -509,7 +517,7 @@ public final class XmlFile {
      */
     private void materialize(PersistenceStores.Route route) {
         try {
-            PersistenceStore.Entry entry = route.read();
+            PersistenceStore.Entry entry = route.peek();
             if (entry == null) {
                 return;
             }
