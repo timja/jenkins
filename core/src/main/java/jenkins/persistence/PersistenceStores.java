@@ -755,7 +755,7 @@ public final class PersistenceStores {
     /** Records that an object is in sync with the store (just saved, or reloaded). */
     @Restricted(NoExternalUse.class)
     public static void synced(@NonNull XmlFile file, @NonNull Object o) {
-        String key = keyFor(file.getFile());
+        String key = keyFor(file.getPath());
         if (key != null) {
             try {
                 snapshots.put(key, serialise(file, o));
@@ -772,7 +772,7 @@ public final class PersistenceStores {
      */
     @Restricted(NoExternalUse.class)
     public static boolean hasUnsavedChanges(@NonNull XmlFile file, @NonNull Object o) {
-        String key = keyFor(file.getFile());
+        String key = keyFor(file.getPath());
         byte[] snapshot = key == null ? null : snapshots.get(key);
         if (snapshot == null) {
             return false;
@@ -790,7 +790,7 @@ public final class PersistenceStores {
     public static final class Snapshots extends hudson.model.listeners.SaveableListener {
         @Override
         public void onChange(hudson.model.Saveable o, XmlFile file) {
-            if (o != null && file != null && route(file.getFile()) != null) {
+            if (o != null && file != null && route(file.getPath()) != null) {
                 synced(file, o);
             }
         }
