@@ -755,6 +755,31 @@ public final class RunningBuilds {
         }
     }
 
+    private static final java.util.concurrent.atomic.AtomicBoolean sweeping = new java.util.concurrent.atomic.AtomicBoolean();
+
+    /**
+     * Adopts or closes the builds of controllers which are gone, now rather than at the next periodic sweep: for a store
+     * noticing that a controller has left the cluster (Target 14, faster failover).
+     */
+    @Restricted(Beta.class)
+    public static void sweepSoon() {
+        jenkins.util.Timer.get().submit(() -> {
+            if (!sweeping.compareAndSet(false, true)) {
+                return; // one sweep at a time; the periodic one follows anyway
+            }
+            try (hudson.security.ACLContext ignored = hudson.security.ACL.as2(hudson.security.ACL.SYSTEM2)) {
+                int n = removeStale();
+                if (n > 0) {
+                    LOGGER.info(() -> "Took care of " + n + " build(s) of controllers which left the cluster");
+                }
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.WARNING, "Could not sweep the builds of controllers which left", e);
+            } finally {
+                sweeping.set(false);
+            }
+        });
+    }
+
     /**
      * Removes placeholders whose controller is no longer alive.
      *
@@ -1472,7 +1497,7 @@ public final class RunningBuilds {
     }
 
     /** The number of the newest build of a job running on another controller, if newer than this controller's newest. */
-    @Restricted(NoExternalUse.class)
+    @Restricted(Beta.class)
     public static int newerElsewhere(@NonNull Job<?, ?> job) {
         List<Placeholder> remote = elsewhere(job);
         Run<?, ?> local = job.getLastBuild();
