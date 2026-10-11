@@ -1078,7 +1078,7 @@ public final class PersistenceStores {
                     ItemChangeApplier.reload(key);
                     throw e;
                 }
-                version = merged;
+                return merged; // seen and remembered as the object in memory has it, until it is reloaded
             }
             if (creation != null) {
                 creation.written = version;
@@ -1112,9 +1112,13 @@ public final class PersistenceStores {
                 }
                 try {
                     long version = store.write(key, result.merged(), theirs.version());
-                    merges.incrementAndGet();
+                    // the object in memory still has only this JVM's side until it is reloaded (queued below): a save of
+                    // it meanwhile must conflict and merge again, against what it holds, rather than overwrite the
+                    // merged content with its stale part (a setter saving twice, ET11 scenario 3)
+                    seen(key, theirs.version());
+                    remember(key, theirs.version(), mine);
                     LOGGER.info(() -> key + " was changed meanwhile; merged both changes");
-                    remember(key, version, result.merged());
+                    merges.incrementAndGet();
                     ItemChangeApplier.reload(key); // this JVM's object lacks the other change
                     return version;
                 } catch (ConflictException again) {
