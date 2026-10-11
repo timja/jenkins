@@ -45,6 +45,8 @@ import jenkins.model.Named;
 import jenkins.search.SearchGroup;
 import jenkins.util.SystemProperties;
 import jenkins.util.io.OnMaster;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.Beta;
 import org.kohsuke.stapler.StaplerRequest2;
 
 /**
@@ -181,6 +183,17 @@ public interface Item extends PersistenceRoot, FullyNamedModelObject, Searchable
      *      URL that ends with '/'.
      */
     String getShortUrl();
+
+    /**
+     * An identity of this item that renames and moves do not change, for data kept about it elsewhere; null if this
+     * kind of item has none.
+     *
+     * @since TODO
+     */
+    @Restricted(Beta.class)
+    default @CheckForNull String getItemUuid() {
+        return null;
+    }
 
     /**
      * Returns the absolute URL of this item. This relies on the current

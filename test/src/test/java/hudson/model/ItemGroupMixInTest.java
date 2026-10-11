@@ -226,7 +226,9 @@ class ItemGroupMixInTest {
 
         Item foo = r.jenkins.createProjectFromXML("foo", new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8)));
         // if no exception then JAXP is swallowing these - so there should be no entity in the description.
-        assertThat(Items.getConfigFile(foo).asString(), containsString("<description/>"));
+        // (an item created from XML is saved once more, with an identity of its own: an empty element either way)
+        assertThat(Items.getConfigFile(foo).asString(), org.hamcrest.Matchers.anyOf(
+                containsString("<description/>"), containsString("<description></description>")));
     }
 
     @Issue("JENKINS-61956")
