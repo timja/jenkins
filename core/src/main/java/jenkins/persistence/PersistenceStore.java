@@ -97,6 +97,25 @@ public interface PersistenceStore {
     void delete(@NonNull String key, long expectedVersion) throws IOException;
 
     /**
+     * Deletes every key below a prefix ({@code prefix/…}), each with its deletion event (Target 15): e.g. all the build
+     * records of a deleted job. Stores override this to do it at once instead of key by key.
+     *
+     * @return how many keys were deleted
+     */
+    default int deleteAll(@NonNull String prefix) throws IOException {
+        int n = 0;
+        for (String child : children(prefix)) {
+            String key = prefix + "/" + child;
+            if (read(key) != null) {
+                delete(key, ANY);
+                n++;
+            }
+            n += deleteAll(key);
+        }
+        return n;
+    }
+
+    /**
      * Lists the names directly below a key, like listing a directory.
      * For example, with entries {@code jobs/a/config.xml} and {@code jobs/f/jobs/b/config.xml},
      * the children of {@code jobs} are {@code a} and {@code f}.

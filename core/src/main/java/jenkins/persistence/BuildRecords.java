@@ -754,10 +754,8 @@ public final class BuildRecords {
             return;
         }
         PersistenceStore store = PersistenceStores.get();
-        Set<String> numbers = store.children(builds);
-        for (String number : numbers) {
-            store.delete(builds + "/" + number + "/" + RECORD, PersistenceStore.ANY);
-        }
+        Set<String> numbers = store.children(builds); // whose snapshots go, should the job be made again meanwhile
+        store.deleteAll(builds); // at once (Target 15): a job with 20,000 builds was 20,000 transactions
         String running = builds.substring(0, builds.length() - "builds".length()) + RunningBuilds.PREFIX;
         for (String name : store.children(running)) {
             store.delete(running + "/" + name, PersistenceStore.ANY);
