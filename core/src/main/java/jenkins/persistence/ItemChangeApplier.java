@@ -555,6 +555,14 @@ public final class ItemChangeApplier {
      * @return false if the key is not a build record
      */
     private boolean build(ChangeEvent e) throws Exception {
+        RunningBuilds.DeliveryKey delivery = RunningBuilds.DeliveryKey.parse(e.key());
+        if (delivery != null) {
+            if (e.kind() == ChangeEvent.Kind.WRITTEN) {
+                Timer.get().submit(() -> RunningBuilds.delivered(delivery.jobKey(), delivery.number(), delivery.id(), 0));
+            }
+            applied.incrementAndGet();
+            return true;
+        }
         RunningBuilds.StopKey stop = RunningBuilds.StopKey.parse(e.key());
         if (stop != null) {
             if (e.kind() == ChangeEvent.Kind.WRITTEN) {
