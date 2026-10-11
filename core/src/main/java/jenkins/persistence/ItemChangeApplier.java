@@ -720,7 +720,7 @@ public final class ItemChangeApplier {
         }
         List<String> names = new ArrayList<>();
         for (int i = 1; i < segments.length - 1; i += 2) {
-            if (i > 1 && !segments[i - 1].equals("jobs")) {
+            if (i > 1 && !segments[i - 1].equals("jobs") && !segments[i - 1].equals("branches")) {
                 return null; // e.g. jobs/x/promotions/p/config.xml: a sub-item of x (SubItems), not an item
             }
             names.add(segments[i]);

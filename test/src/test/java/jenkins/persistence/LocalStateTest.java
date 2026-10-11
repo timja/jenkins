@@ -116,6 +116,7 @@ class LocalStateTest {
         assertNull(SubItems.ownerKey("jobs/m/config.xml"));
         assertNull(ItemChangeApplier.itemPath("jobs/p/promotions/release/config.xml"), "not an item called p/release");
         assertEquals(List.of("f", "p"), ItemChangeApplier.itemPath("jobs/f/jobs/p/config.xml"));
+        assertEquals(List.of("mb", "main"), ItemChangeApplier.itemPath("jobs/mb/branches/main/config.xml"), "multibranch children");
         FreeStyleProject p = r.createFreeStyleProject("promoted");
         STORE.as("other-controller").write("jobs/promoted/promotions/release/config.xml",
                 "<?xml version='1.1' encoding='UTF-8'?><process/>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);

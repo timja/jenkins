@@ -1375,8 +1375,10 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
      *
      */
     public void setNoUsageStatistics(Boolean noUsageStatistics) throws IOException {
-        this.noUsageStatistics = noUsageStatistics;
-        save();
+        synchronized (this) { // as save() and reloadGlobalConfig() are: a reload never overwrites the assignment
+            this.noUsageStatistics = noUsageStatistics;
+            save();
+        }
     }
 
     public Api getApi() {
@@ -1721,8 +1723,10 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
      * Sets the system message.
      */
     public void setSystemMessage(String message) throws IOException {
-        this.systemMessage = message;
-        save();
+        synchronized (this) { // as save() and reloadGlobalConfig() are: a reload never overwrites the assignment
+            this.systemMessage = message;
+            save();
+        }
     }
 
     @StaplerDispatchable
@@ -2362,8 +2366,10 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
      *      null to the default value.
      */
     public void setQuietPeriod(Integer quietPeriod) throws IOException {
-        this.quietPeriod = quietPeriod;
-        save();
+        synchronized (this) { // as save() and reloadGlobalConfig() are: a reload never overwrites the assignment
+            this.quietPeriod = quietPeriod;
+            save();
+        }
     }
 
     /**
@@ -2374,8 +2380,10 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
     }
 
     public void setScmCheckoutRetryCount(int scmCheckoutRetryCount) throws IOException {
-        this.scmCheckoutRetryCount = scmCheckoutRetryCount;
-        save();
+        synchronized (this) { // as save() and reloadGlobalConfig() are: a reload never overwrites the assignment
+            this.scmCheckoutRetryCount = scmCheckoutRetryCount;
+            save();
+        }
     }
 
     @Override
@@ -3314,8 +3322,10 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
     }
 
     public void setMode(Mode m) throws IOException {
-        this.mode = m;
-        save();
+        synchronized (this) { // as save() and reloadGlobalConfig() are: a reload never overwrites the assignment
+            this.mode = m;
+            save();
+        }
     }
 
     @Override
@@ -3325,8 +3335,10 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
 
     @Override
     public void setLabelString(String label) throws IOException {
-        _setLabelString(label);
-        save();
+        synchronized (this) { // as save() and reloadGlobalConfig() are: a reload never overwrites the assignment
+            _setLabelString(label);
+            save();
+        }
     }
 
     private void _setLabelString(String label) {
