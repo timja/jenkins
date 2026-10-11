@@ -19,6 +19,7 @@ import java.nio.file.InvalidPathException;
 import java.nio.file.LinkOption;
 import java.security.GeneralSecurityException;
 import java.security.SecureRandom;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.crypto.BadPaddingException;
 import javax.crypto.Cipher;
@@ -174,7 +175,16 @@ public class DefaultConfidentialStore extends ConfidentialStore {
             return super.loadOrCreate(key, generator);
         }
         String storeKey = SHARED_PREFIX + key.getId();
-        PersistenceStore.Entry shared = store.read(storeKey);
+        PersistenceStore.Entry shared;
+        try {
+            shared = store.read(storeKey);
+        } catch (IOException e) {
+            // the store is unreachable and this key has never been used here: a temporary key, never written, so that
+            // whatever needs it (e.g. a page) works now; the cluster's key is used, or created, once the store is back
+            // and this controller restarts (Target 14)
+            LOGGER.log(Level.WARNING, "The persistence store is unreachable: using a temporary " + key.getId(), e);
+            return generator.generate();
+        }
         if (shared == null) {
             byte[] value = generator.generate();
             byte[] encrypted = encrypt(key, value);
