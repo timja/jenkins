@@ -31,6 +31,7 @@ import static org.hamcrest.Matchers.startsWith;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -306,6 +307,7 @@ class SharedQueueTest {
         other.cancel(rec.id());
         awaitMirrored();
         assertTrue(Queue.getInstance().isEmpty());
+        assertFalse(SharedQueue.takenElsewhere(rec.id()), "cancelled, not taken");
     }
 
     @Test
@@ -475,6 +477,7 @@ class SharedQueueTest {
         assertNull(p.getLastBuild(), "never started here");
         assertTrue(Queue.getInstance().isEmpty());
         assertEquals("other-controller", STORE.clusterQueue().get(rec.id()).claimedBy());
+        assertTrue(SharedQueue.takenElsewhere(rec.id()), "its local copy left because the other controller took it");
     }
 
     @Test
