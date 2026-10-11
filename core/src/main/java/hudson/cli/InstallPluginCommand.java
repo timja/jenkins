@@ -42,7 +42,10 @@ import java.util.List;
 import java.util.Set;
 import java.util.jar.JarFile;
 import java.util.jar.Manifest;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import jenkins.model.Jenkins;
+import jenkins.plugins.PluginArchiveListener;
 import org.apache.commons.io.FileUtils;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.Option;
@@ -55,6 +58,8 @@ import org.kohsuke.args4j.Option;
  */
 @Extension
 public class InstallPluginCommand extends CLICommand {
+
+    private static final Logger LOGGER = Logger.getLogger(InstallPluginCommand.class.getName());
 
     @Override
     public String getShortDescription() {
@@ -184,8 +189,23 @@ public class InstallPluginCommand extends CLICommand {
         if (pluginName == null) {
             throw new IllegalArgumentException("JAR manifest lacks a Short-Name attribute and so does not look like a plugin");
         }
+        try {
+            for (PluginArchiveListener l : PluginArchiveListener.all()) {
+                l.beforeInstall(pluginName, tmpFile);
+            }
+        } catch (AbortException e) {
+            Files.deleteIfExists(tmpFile.toPath());
+            throw e;
+        }
         File target = new File(Jenkins.get().getPluginManager().rootDir, pluginName + ".jpi");
         Files.move(tmpFile.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        for (PluginArchiveListener l : PluginArchiveListener.all()) {
+            try {
+                l.installed(pluginName, target);
+            } catch (RuntimeException e) {
+                LOGGER.log(Level.WARNING, "Listener failed on the install of " + target, e);
+            }
+        }
         return target;
     }
 }
