@@ -235,6 +235,18 @@ public class DefaultConfidentialStore extends ConfidentialStore {
                 LOGGER.warning(() -> "Key " + f.getName() + " differs from the one other controllers use; seed the same secrets/ on every controller");
             }
         }
+        // and keeps a local copy of every key the cluster has, so that a key first used here while the store is
+        // unreachable (e.g. one signing pages) is still the cluster's, not a new one (Target 14)
+        for (String name : store.children(SHARED_PREFIX.substring(0, SHARED_PREFIX.length() - 1))) {
+            File f = new File(cs.rootDir, name);
+            if (f.exists() || name.equals("master.key") || name.endsWith(".tmp") || name.contains("/")) {
+                continue;
+            }
+            PersistenceStore.Entry shared = store.read(SHARED_PREFIX + name);
+            if (shared != null) {
+                Files.write(f.toPath(), shared.content());
+            }
+        }
     }
 
     /**
