@@ -268,7 +268,7 @@ public final class PersistenceStores {
      * Whether a key is declared per controller (Target 15): by a {@link LocalFiles} pattern, or as the root file of a
      * {@link PerController} class.
      */
-    @Restricted(NoExternalUse.class)
+    @Restricted(Beta.class)
     public static boolean declaredLocal(@NonNull String key) {
         java.nio.file.Path path = java.nio.file.Path.of(key);
         for (java.nio.file.PathMatcher m : localPatterns) {

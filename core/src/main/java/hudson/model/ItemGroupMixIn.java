@@ -292,6 +292,10 @@ public abstract class ItemGroupMixIn {
         final File rootDir = result.getRootDir();
         result = Items.callWhileUpdatingByXml(() -> (T) Items.load(parent, rootDir));
         result.onCopiedFrom(src);
+        if (result instanceof AbstractItem copy) {
+            copy.newItemUuid(); // a copy is another item (it had the source's from the copied configuration)
+            copy.save();
+        }
 
         add(result);
         ItemListener.fireOnCopied(src, result);
