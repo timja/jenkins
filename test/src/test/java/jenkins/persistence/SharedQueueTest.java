@@ -298,6 +298,37 @@ class SharedQueueTest {
     }
 
     @Test
+    void schedulingHereWhileTheSameItemArrivesFromElsewhereBuildsOnce() throws Exception {
+        long grace = SharedQueue.ORIGIN_GRACE_MILLIS;
+        SharedQueue.ORIGIN_GRACE_MILLIS = 500;
+        try {
+            FreeStyleProject p = r.createFreeStyleProject("race");
+            for (int round = 1; round <= 5; round++) {
+                // the other controller publishes the job at the same moment as it is scheduled here
+                long id = other.nextId();
+                Thread elsewhere = new Thread(() -> {
+                    try {
+                        other.publish(new ClusterQueue.Record(id, "race", "race", SharedQueue.toXml(List.of(new CauseAction(new Cause.UserIdCause("there")))),
+                                System.currentTimeMillis() + 1_000, ClusterQueue.State.WAITING, "other-controller", null, null, 0));
+                    } catch (Exception e) {
+                        throw new AssertionError(e);
+                    }
+                });
+                elsewhere.start();
+                p.scheduleBuild2(1, new CauseAction(new Cause.UserIdCause("here")));
+                elsewhere.join();
+                for (int i = 0; i < 150 && (p.getBuilds().size() < round || p.isBuilding() || !Queue.getInstance().isEmpty()); i++) {
+                    Thread.sleep(100);
+                }
+                Thread.sleep(2_000); // a second build would have started by now
+                assertEquals(round, p.getBuilds().size(), "one build per round");
+            }
+        } finally {
+            SharedQueue.ORIGIN_GRACE_MILLIS = grace;
+        }
+    }
+
+    @Test
     void schedulingHereFoldsIntoItemFromElsewhere() throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("folded");
         ClusterQueue.Record rec = publishElsewhere("folded", 60_000, "carol");
