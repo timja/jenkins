@@ -557,7 +557,21 @@ public final class BuildRecords {
             Path dir = Files.createTempDirectory("lost-build");
             Path snapshot = Files.createTempFile("lost-build", ".tgz");
             try {
-                Files.writeString(dir.resolve("log"), reason + "\nFinished: ABORTED\n", StandardCharsets.UTF_8);
+                // what the build had printed, if its log was shipped while it ran (Target 15), then why it ended
+                try (OutputStream log = Files.newOutputStream(dir.resolve("log"))) {
+                    for (LostLog l : ExtensionList.lookup(LostLog.class)) {
+                        try (InputStream shipped = l.shippedLog(base)) {
+                            if (shipped != null) {
+                                shipped.transferTo(log);
+                                log.write('\n');
+                                break;
+                            }
+                        } catch (IOException | RuntimeException x) {
+                            LOGGER.log(Level.WARNING, "Could not read the shipped log of " + base, x);
+                        }
+                    }
+                    log.write((reason + "\nFinished: ABORTED\n").getBytes(StandardCharsets.UTF_8));
+                }
                 try (OutputStream out = new GZIPOutputStream(Files.newOutputStream(snapshot))) {
                     new FilePath(dir.toFile()).tar(out, new DirScanner.Glob("**", null, false));
                 } catch (InterruptedException e) {
@@ -587,6 +601,22 @@ public final class BuildRecords {
         try (InputStream in = blobs.get(key)) {
             return in != null;
         }
+    }
+
+    /**
+     * The log a build printed while it ran, kept outside its controller (Target 15): when that controller dies and the
+     * build cannot be resumed, the build is closed as aborted with this output in its console, not just the reason.
+     *
+     * @since TODO
+     */
+    @Restricted(Beta.class)
+    public interface LostLog extends hudson.ExtensionPoint {
+        /**
+         * @param base the build's key, such as {@code jobs/p/builds/5}
+         * @return the shipped log, or null if this extension kept none
+         */
+        @CheckForNull
+        InputStream shippedLog(@NonNull String base) throws IOException;
     }
 
     @CheckForNull
