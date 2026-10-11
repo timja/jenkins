@@ -300,6 +300,17 @@ class BuildRecordsTest {
     }
 
     @Test
+    void buildDeletedWhileBeingPublishedStaysDeleted() throws Exception {
+        FreeStyleProject p = project(r, "discarded");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p);
+        // a build discarder runs as soon as builds complete, possibly before or while one is being published
+        BuildRecords.delete(b);
+        BuildRecords.publish(b);
+        assertNull(record("jobs/discarded/builds/1/build.xml"), "not brought back by a late publication");
+        assertThat(BLOBS.keys(), org.hamcrest.Matchers.not(org.hamcrest.Matchers.hasItem("jobs/discarded/builds/1/files.tgz")));
+    }
+
+    @Test
     void renameMovesRecordsAndSnapshots() throws Exception {
         FreeStyleProject p = project(r, "before");
         r.buildAndAssertSuccess(p);
