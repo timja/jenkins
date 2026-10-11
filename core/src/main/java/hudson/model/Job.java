@@ -313,7 +313,8 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
      */
     public boolean isBuilding() {
         RunT b = getLastBuild();
-        return b != null && b.isBuilding();
+        // or on another controller of a cluster sharing build records (e.g. renames are refused meanwhile, here too)
+        return b != null && b.isBuilding() || !jenkins.persistence.RunningBuilds.elsewhere(this).isEmpty();
     }
 
     /**

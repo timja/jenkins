@@ -337,7 +337,9 @@ class ClusterCoordinationTest {
         Thread.sleep(6_000);
         assertNull(down.getLastBuild());
         Queue.Item item = Queue.getInstance().getItems()[0];
-        assertThat(item.getWhy(), containsString("Upstream project up is building on jenkins-b"));
+        // core's own check now sees the build running elsewhere (Job.isBuilding), before SharedBlocking's
+        assertThat(item.getWhy(), org.hamcrest.Matchers.anyOf(containsString("Upstream project up is building on jenkins-b"),
+                containsString("Upstream project ‘up’ is already building")));
 
         other.delete("jobs/up/running/1.xml", PersistenceStore.ANY);
         awaitApplied();
