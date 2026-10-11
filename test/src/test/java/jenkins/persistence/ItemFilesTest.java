@@ -1,0 +1,115 @@
+/*
+ * The MIT License
+ *
+ * Copyright (c) 2026, Jenkins project contributors
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+
+package jenkins.persistence;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import hudson.model.FreeStyleProject;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.jvnet.hudson.test.JenkinsRule;
+import org.jvnet.hudson.test.TestExtension;
+import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
+
+/** Opt-in sharing of plugins' own files in item directories (Target 15). */
+@WithJenkins
+class ItemFilesTest {
+
+    static final InMemoryPersistenceStore STORE = new InMemoryPersistenceStore(
+            key -> key.startsWith("jobs/") && key.endsWith("/config.xml") && !key.contains("/builds/"));
+    static final InMemoryBlobStore BLOBS = new InMemoryBlobStore();
+
+    @BeforeEach
+    void enable() {
+        System.setProperty(ItemFiles.class.getName() + ".enabled", "true");
+    }
+
+    @AfterEach
+    void disable() {
+        System.clearProperty(ItemFiles.class.getName() + ".enabled");
+    }
+
+    @Test
+    void aPluginsFileIsSharedAndTakenElsewhere(JenkinsRule r) throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("p");
+        Path state = p.getRootDir().toPath().resolve("my-plugin-state.txt");
+        Files.writeString(state, "v1");
+        ItemFiles.publish(p);
+        assertNotNull(STORE.read("jobs/p/item-files.json"), "a manifest");
+        assertFalse(new String(STORE.read("jobs/p/item-files.json").content(), StandardCharsets.UTF_8).contains("config.xml"),
+                "what the store has already is left out");
+        // a fresh copy of the directory, as on another controller
+        Files.delete(state);
+        ItemFiles.forgetForTests();
+        ItemFiles.take(p);
+        assertEquals("v1", Files.readString(state));
+        // changed elsewhere: taken here, where it did not change
+        String manifest = new String(STORE.read("jobs/p/item-files.json").content(), StandardCharsets.UTF_8);
+        byte[] v2 = "v2".getBytes(StandardCharsets.UTF_8);
+        String sha2 = java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(v2));
+        BLOBS.put("jobs/p/item-files/" + sha2, new java.io.ByteArrayInputStream(v2), v2.length);
+        // written with this controller's origin, so the store listener does not take it too, racing with the steps below
+        STORE.write("jobs/p/item-files.json",
+                manifest.replaceAll("\"my-plugin-state.txt\":\"[0-9a-f]+\"", "\"my-plugin-state.txt\":\"" + sha2 + "\"")
+                        .getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        ItemFiles.take(p);
+        assertEquals("v2", Files.readString(state));
+        // a change made here and not shared yet is not overwritten by what is shared
+        Files.writeString(state, "v3");
+        ItemFiles.take(p);
+        assertEquals("v3", Files.readString(state));
+        ItemFiles.publish(p);
+        assertTrue(new String(STORE.read("jobs/p/item-files.json").content(), StandardCharsets.UTF_8)
+                .contains(java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest("v3".getBytes(StandardCharsets.UTF_8)))),
+                "and is shared next");
+        Files.delete(state);
+        ItemFiles.publish(p);
+        assertFalse(new String(STORE.read("jobs/p/item-files.json").content(), StandardCharsets.UTF_8).contains("my-plugin-state"),
+                "removed here: removed from the manifest");
+    }
+
+    @TestExtension
+    public static class Provider implements PersistenceStoreProvider {
+        @Override
+        public PersistenceStore create() {
+            return STORE;
+        }
+    }
+
+    @TestExtension
+    public static class Blobs implements BlobStoreProvider {
+        @Override
+        public BlobStore create() {
+            return BLOBS;
+        }
+    }
+}
