@@ -159,6 +159,10 @@ class RunningBuildsTest {
                 containsString("{\"controller\":\"jenkins-a\",\"number\":2}"));
         assertThat(wc.goTo("job/remote/").asNormalizedText(), containsString("#2 on jenkins-a"));
         assertEquals(hudson.model.BallColor.BLUE_ANIME, p.getIconColor(), "the job shows as building");
+        assertTrue(p.isBuilding(), "building elsewhere");
+        org.jvnet.hudson.test.JenkinsRule.WebClient rc = r.createWebClient().withThrowExceptionOnFailingStatusCode(false);
+        assertEquals(400, rc.getPage(rc.addCrumb(new org.htmlunit.WebRequest(new java.net.URL(r.getURL(), "job/remote/confirmRename?newName=renamed"), org.htmlunit.HttpMethod.POST))).getWebResponse().getStatusCode(),
+                "no rename while it builds on another controller");
         String history = wc.goTo("job/remote/buildHistory/ajax").getWebResponse().getContentAsString();
         assertThat("the build list shows it", history, containsString("Running on jenkins-a"));
         assertThat(history, containsString("running-elsewhere/stop?number=2"));
