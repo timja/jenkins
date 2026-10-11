@@ -38,6 +38,7 @@ import hudson.model.PersistenceRoot;
 import hudson.model.Queue;
 import hudson.model.Saveable;
 import hudson.model.listeners.SaveableListener;
+import hudson.slaves.AbstractCloudSlave;
 import hudson.slaves.EphemeralNode;
 import hudson.slaves.OfflineCause;
 import java.io.File;
@@ -222,7 +223,20 @@ public class Nodes implements PersistenceRoot {
     }
 
     public XmlFile getConfigFile(Node node) {
+        if (node instanceof AbstractCloudSlave) {
+            // launched by this controller's cloud: other controllers sharing a persistence store must not launch it too
+            String key = PersistenceStores.keyFor(new File(node.getRootDir(), "config.xml"));
+            if (key != null) {
+                PersistenceStores.keepLocal(key, true);
+            }
+        }
         return getConfigFile(node.getRootDir());
+    }
+
+    /** Whether a node is a cloud agent which another controller launched (its configuration came from the store). */
+    private static boolean launchedElsewhere(Node n, File dir) {
+        String key = PersistenceStores.keyFor(new File(dir, "config.xml"));
+        return n instanceof AbstractCloudSlave && key != null && !PersistenceStores.isKeptLocal(key);
     }
 
     public XmlFile getConfigFile(File dir) {
@@ -396,6 +410,10 @@ public class Nodes implements PersistenceRoot {
             route.delete();
         }
         Util.deleteRecursive(new File(getRootDir(), nodeName));
+        String key = PersistenceStores.keyFor(new File(getRootDir(), nodeName + File.separator + "config.xml"));
+        if (key != null) {
+            PersistenceStores.keepLocal(key, false);
+        }
     }
 
     @Override
@@ -442,7 +460,11 @@ public class Nodes implements PersistenceRoot {
         {
             for (File subdir : subdirs) {
                 try {
-                    load(subdir, newNodes);
+                    Node n = load(subdir, newNodes);
+                    boolean local = localDirs != null && Arrays.asList(localDirs).contains(subdir);
+                    if (n != null && !local && launchedElsewhere(n, subdir)) {
+                        newNodes.remove(n.getNodeName()); // only in the store: another controller's cloud agent
+                    }
                 } catch (IOException e) {
                     LOGGER.log(Level.WARNING, "could not load " + subdir, e);
                 }
@@ -496,6 +518,10 @@ public class Nodes implements PersistenceRoot {
             XmlFile xmlFile = getConfigFile(name);
             if (xmlFile.checkExists()) {
                 Node n = (Node) xmlFile.read();
+                if (launchedElsewhere(n, new File(getRootDir(), name))) {
+                    LOGGER.fine(() -> "not loading " + name + ", a cloud agent of another controller");
+                    return null;
+                }
                 if (vetoable && !allowLoad(n)) {
                     Node old = nodes.get(n.getNodeName());
                     if (old != null) { // as if deleted: it would not be here after a restart either

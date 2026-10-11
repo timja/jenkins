@@ -212,10 +212,33 @@ public final class PersistenceStores {
             return null;
         }
         String key = keyFor(file);
-        if (key == null || !store.owns(key)) {
+        if (key == null || !store.owns(key) || localOnly.contains(key)) {
             return null;
         }
         return new Route(store, key);
+    }
+
+    /** Keys the store owns which this controller nevertheless keeps to itself, such as its own cloud agents. */
+    private static final Set<String> localOnly = ConcurrentHashMap.newKeySet();
+
+    /**
+     * Keeps a key on this controller's filesystem, or stops doing so: it is then neither read from nor written to the
+     * store, although the store owns such keys. For state belonging to this controller alone, such as the agents its
+     * clouds launched (another controller must not launch them too).
+     */
+    @Restricted(NoExternalUse.class)
+    public static void keepLocal(@NonNull String key, boolean local) {
+        if (local) {
+            localOnly.add(key);
+        } else {
+            localOnly.remove(key);
+        }
+    }
+
+    /** Whether a key is {@linkplain #keepLocal kept local}. */
+    @Restricted(NoExternalUse.class)
+    public static boolean isKeptLocal(@NonNull String key) {
+        return localOnly.contains(key);
     }
 
     /**
