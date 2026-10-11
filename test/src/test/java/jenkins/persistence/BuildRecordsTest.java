@@ -440,6 +440,7 @@ class BuildRecordsTest {
         r.buildAndAssertSuccess(p);
         BuildRecords.publishLost(p, 2, System.currentTimeMillis(), "It was running on a controller which is gone.");
         assertNotNull(record("jobs/lost/builds/2/build.xml"));
+        assertEquals(hudson.model.Result.ABORTED, p.getBuildByNumber(2).getResult(), "the publishing controller lists it too");
         wipeAndReload(r);
         FreeStyleBuild lost = r.jenkins.getItemByFullName("lost", FreeStyleProject.class).getBuildByNumber(2);
         assertNotNull(lost);

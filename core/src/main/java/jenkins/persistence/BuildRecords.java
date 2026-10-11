@@ -455,6 +455,7 @@ public final class BuildRecords {
         try {
             store.write(base + "/" + RECORD, record.getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
             LOGGER.info(() -> "Closed " + job.getFullName() + " #" + number + " as aborted: " + reason);
+            writtenElsewhere(job, number); // this controller's own write raises no event here
         } catch (ConflictException e) {
             LOGGER.fine(() -> job.getFullName() + " #" + number + " was published meanwhile");
         }
