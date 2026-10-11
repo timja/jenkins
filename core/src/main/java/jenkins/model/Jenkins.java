@@ -3589,6 +3589,14 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
     }
 
     /**
+     * Whether the global configuration changed in memory since it was last saved or reloaded (a save is pending).
+     */
+    @Restricted(NoExternalUse.class)
+    public synchronized boolean hasUnsavedGlobalChanges() {
+        return jenkins.persistence.PersistenceStores.hasUnsavedChanges(getConfigFile(), this);
+    }
+
+    /**
      * Applies global configuration saved by another controller sharing a {@link jenkins.persistence.PersistenceStore}:
      * re-reads {@code config.xml} into this instance, as {@link #load} does at startup, and re-derives what depends on it,
      * including the inbound agent listener's port.
@@ -3608,6 +3616,7 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
         trimLabels();
         launchTcpSlaveAgentListener(); // on the port now configured, or none
         LOGGER.fine("Reloaded global configuration changed elsewhere");
+        jenkins.persistence.PersistenceStores.synced(getConfigFile(), this);
     }
 
     /**
