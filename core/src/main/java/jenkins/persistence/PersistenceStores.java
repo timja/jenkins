@@ -136,12 +136,24 @@ public final class PersistenceStores {
                     }
                     BlobStore blobs = null;
                     if (store != null) {
-                        for (BlobStoreProvider provider : blobProviders) {
-                            blobs = provider.create();
-                            if (blobs != null) {
-                                LOGGER.info(() -> "Using blob store " + provider.getClass().getName());
-                                break;
+                        try {
+                            for (BlobStoreProvider provider : blobProviders) {
+                                blobs = provider.create();
+                                if (blobs != null) {
+                                    LOGGER.info(() -> "Using blob store " + provider.getClass().getName());
+                                    break;
+                                }
                             }
+                        } catch (RuntimeException e) {
+                            // do not leave the store behind (it may already take part in the cluster as a member)
+                            if (store instanceof AutoCloseable c) {
+                                try {
+                                    c.close();
+                                } catch (Exception x) {
+                                    e.addSuppressed(x);
+                                }
+                            }
+                            throw e;
                         }
                     }
                     resolvedStore = store;

@@ -299,7 +299,8 @@ public final class RunningBuilds {
                 }
             }
         } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Could not list running builds below " + runningKey, e);
+            // not cached: the next call asks the store again (Target 14)
+            throw new java.io.UncheckedIOException(e);
         }
         placeholders.sort(Comparator.comparingInt(Placeholder::getNumber).reversed());
         return List.copyOf(placeholders);
@@ -313,7 +314,12 @@ public final class RunningBuilds {
             return List.of();
         }
         String jobKey = runningKey.substring(0, runningKey.length() - PREFIX.length() - 1);
-        return cache.computeIfAbsent(jobKey, k -> load(store, runningKey));
+        try {
+            return cache.computeIfAbsent(jobKey, k -> load(store, runningKey));
+        } catch (java.io.UncheckedIOException e) {
+            LOGGER.log(Level.FINE, "Could not list running builds below " + runningKey, e.getCause());
+            return List.of();
+        }
     }
 
     /**
@@ -676,6 +682,27 @@ public final class RunningBuilds {
     /** Lets a stopped build finish writing locally before its copy is discarded. */
     private static final int DISCARD_DELAY_SECONDS = 5;
 
+    /** Builds started here whose placeholder and lease could not be recorded (the store was unreachable): retried. */
+    private static final Map<String, Boolean> unregistered = new ConcurrentHashMap<>();
+
+    /** Records builds as running whose registration failed when they started (Target 14). */
+    static void registerPending() {
+        for (String id : List.copyOf(unregistered.keySet())) {
+            Run<?, ?> run = Run.fromExternalizableId(id);
+            if (run == null || !run.isLogUpdated()) {
+                unregistered.remove(id);
+                continue;
+            }
+            try {
+                started(run);
+                unregistered.remove(id);
+                LOGGER.info(() -> "Recorded " + run + " as running, after the store was back");
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.FINE, "Still cannot record " + run + " as running", e);
+            }
+        }
+    }
+
     /**
      * Checks that this controller still holds the leases of the builds it runs, and stops those it does not.
      */
@@ -745,7 +772,12 @@ public final class RunningBuilds {
                             BuildRecords.publishLost(job, p.number, p.startTime,
                                     "This build was running on " + p.controller + ", which is gone, and could not be resumed elsewhere; it is closed as aborted.");
                         } catch (IOException | RuntimeException e) {
-                            LOGGER.log(Level.WARNING, "Could not close " + job.getFullName() + " #" + p.number + " as aborted", e);
+                            // keep the placeholder (and release the lease), so that the next sweep tries again (Target 14)
+                            LOGGER.log(Level.WARNING, "Could not close " + job.getFullName() + " #" + p.number + " as aborted; will retry", e);
+                            if (leases != null) {
+                                leases.release(p.key, epoch);
+                            }
+                            continue;
                         }
                         try {
                             // only as read: several controllers noticing at once is harmless, and a write since is kept
@@ -1211,7 +1243,8 @@ public final class RunningBuilds {
             try {
                 started(run);
             } catch (IOException | RuntimeException e) {
-                LOGGER.log(Level.WARNING, "Failed to record " + run + " as running", e);
+                LOGGER.log(Level.WARNING, "Failed to record " + run + " as running; will retry", e);
+                unregistered.put(run.getExternalizableId(), Boolean.TRUE);
             }
         }
     }
@@ -1232,6 +1265,7 @@ public final class RunningBuilds {
         @Override
         protected void execute(TaskListener listener) throws IOException {
             if (PersistenceStores.get() != null) {
+                registerPending();
                 checkOwnership();
                 removeStale();
             }

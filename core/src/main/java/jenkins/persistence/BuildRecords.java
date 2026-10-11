@@ -231,6 +231,15 @@ public final class BuildRecords {
     }
 
     /**
+     * Publishes a completed build again after files of it changed elsewhere than in its record (for example the rest
+     * of a log shipped late), so that other controllers fetch it anew.
+     */
+    @Restricted(Beta.class)
+    public static void republishFiles(@NonNull Run<?, ?> run) throws IOException {
+        publish(run, true);
+    }
+
+    /**
      * @param filesChanged whether only files of the build directory changed (not its record): the record is then marked
      *     so that it gets a new version, and other controllers fetch the new snapshot
      */
@@ -979,6 +988,76 @@ public final class BuildRecords {
         }
     }
 
+    /**
+     * Completed builds whose record or placeholder removal failed (e.g. the store was unreachable): retried until both
+     * are done (Target 14). Until then the build stays "running" for the other controllers, rather than vanishing.
+     */
+    private static final Map<String, Map.Entry<String, Integer>> unpublished = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Publishes a completed build's record, then removes its running placeholder; queues a retry if either fails. */
+    static void complete(@NonNull Run<?, ?> run) {
+        String key = run.getParent().getFullName() + "#" + run.getNumber();
+        try {
+            publish(run);
+        } catch (LeaseLostException e) {
+            // taken over while it was being published: the new owner publishes it; nothing of it is left from here
+            LOGGER.warning(() -> "Not publishing " + run + ": " + e.getMessage());
+            unpublished.remove(key);
+            RunningBuilds.lost(run);
+            RunningBuilds.discard(run);
+            return;
+        } catch (IOException | RuntimeException e) {
+            LOGGER.log(Level.WARNING, "Failed to publish " + run + "; will retry", e);
+            unpublished.put(key, Map.entry(run.getParent().getFullName(), run.getNumber()));
+            return;
+        }
+        // after the record exists, so other controllers always see one or the other
+        try {
+            RunningBuilds.finished(run);
+            unpublished.remove(key);
+        } catch (IOException | RuntimeException e) {
+            LOGGER.log(Level.WARNING, "Failed to remove running placeholder of " + run + "; will retry", e);
+            unpublished.put(key, Map.entry(run.getParent().getFullName(), run.getNumber()));
+        }
+    }
+
+    /** Retries {@link #complete} for builds whose publication failed. */
+    @Restricted(NoExternalUse.class)
+    @Extension
+    public static final class Unpublished extends hudson.model.AsyncPeriodicWork {
+        public Unpublished() {
+            super("Completed builds not yet published");
+        }
+
+        @Override
+        public long getRecurrencePeriod() {
+            return java.util.concurrent.TimeUnit.SECONDS.toMillis(15);
+        }
+
+        @Override
+        protected void execute(hudson.model.TaskListener listener) {
+            for (Map.Entry<String, Map.Entry<String, Integer>> e : Map.copyOf(unpublished).entrySet()) {
+                Job<?, ?> job = jenkins.model.Jenkins.get().getItemByFullName(e.getValue().getKey(), Job.class);
+                Run<?, ?> run = job == null ? null : job.getBuildByNumber(e.getValue().getValue());
+                if (run == null || RunningBuilds.wasLost(run)) {
+                    unpublished.remove(e.getKey());
+                    continue;
+                }
+                LOGGER.info(() -> "Retrying the publication of " + run);
+                complete(run);
+            }
+        }
+
+        @Override
+        protected Level getNormalLoggingLevel() {
+            return Level.FINE;
+        }
+    }
+
+    static int unpublishedCount() {
+        return unpublished.size();
+    }
+
     @Restricted(NoExternalUse.class)
     @Extension
     public static final class Publisher extends RunListener<Run<?, ?>> {
@@ -995,23 +1074,7 @@ public final class BuildRecords {
                 RunningBuilds.discard(run);
                 return;
             }
-            try {
-                publish(run);
-            } catch (LeaseLostException e) {
-                // taken over while it was being published: the new owner publishes it; nothing of it is left from here
-                LOGGER.warning(() -> "Not publishing " + run + ": " + e.getMessage());
-                RunningBuilds.lost(run);
-                RunningBuilds.discard(run);
-                return;
-            } catch (IOException | RuntimeException e) {
-                LOGGER.log(Level.WARNING, "Failed to publish " + run, e);
-            }
-            // after the record exists, so other controllers always see one or the other
-            try {
-                RunningBuilds.finished(run);
-            } catch (IOException | RuntimeException e) {
-                LOGGER.log(Level.WARNING, "Failed to remove running placeholder of " + run, e);
-            }
+            complete(run);
         }
 
         @Override

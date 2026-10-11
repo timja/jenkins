@@ -127,6 +127,9 @@ public final class ItemChangeApplier {
     /** Changes queued again by their retry (by identity: one delivered twice is equal to it). */
     private final Set<ChangeEvent> retrying = java.util.Collections.synchronizedSet(java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()));
     private static final int MAX_RETRIES = 3;
+    /** How many times a change that failed to apply has been retried, by key. */
+    private final Map<String, Integer> failures = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final int MAX_FAILURES = 8;
 
     /**
      * Puts off applying a change to an object with a save pending, for a second, at most {@link #MAX_RETRIES} times.
@@ -275,8 +278,19 @@ public final class ItemChangeApplier {
             }
             try {
                 apply(e);
+                failures.remove(e.key());
             } catch (Exception | LinkageError x) {
-                LOGGER.log(Level.WARNING, "Failed to apply " + e, x);
+                // e.g. the store was unreachable while reading the new content: try again a few times with backoff,
+                // or this controller keeps the old version until the next change of that key (Target 14)
+                int n = failures.merge(e.key(), 1, Integer::sum);
+                if (n <= MAX_FAILURES) {
+                    LOGGER.log(Level.INFO, "Failed to apply " + e + "; retrying (" + n + "/" + MAX_FAILURES + ")", x);
+                    pending.incrementAndGet();
+                    Timer.get().schedule(() -> queue.add(e), Math.min(60, 1L << n), java.util.concurrent.TimeUnit.SECONDS);
+                } else {
+                    failures.remove(e.key());
+                    LOGGER.log(Level.WARNING, "Failed to apply " + e, x);
+                }
             } finally {
                 retire(e);
                 pending.decrementAndGet();

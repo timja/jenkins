@@ -1076,14 +1076,28 @@ public final class SharedQueue {
             if (cq == null || id <= 0) {
                 return;
             }
+            recordStart(cq, id, run.getNumber(), 0);
+        }
+
+        /**
+         * Marks the item started, retrying while the store is unreachable: an item left claimed would be put back into
+         * the queue (and built again) if this controller later went away (Target 14).
+         */
+        private static void recordStart(ClusterQueue cq, long id, int number, int attempt) {
             try {
                 ClusterQueue.Record r = cq.get(id);
                 if (r != null && origin().equals(r.claimedBy())) {
-                    cq.started(id, run.getNumber());
+                    cq.started(id, number);
                 }
                 Reservations.release(id);
             } catch (IOException | RuntimeException e) {
-                LOGGER.log(Level.WARNING, "Failed to record that " + run + " started", e);
+                if (attempt < 30) {
+                    LOGGER.log(Level.INFO, "Failed to record that queue item " + id + " started; retrying", e);
+                    jenkins.util.Timer.get().schedule(() -> recordStart(cq, id, number, attempt + 1),
+                            Math.min(30, 1L << Math.min(attempt, 5)), java.util.concurrent.TimeUnit.SECONDS);
+                } else {
+                    LOGGER.log(Level.WARNING, "Failed to record that queue item " + id + " started", e);
+                }
             }
         }
     }
@@ -1095,6 +1109,8 @@ public final class SharedQueue {
     @Extension(ordinal = 100)
     public static final class Ids extends QueueIdStrategy {
         private static final QueueIdStrategy LOCAL = new QueueIdStrategy.DefaultStrategy();
+        /** Local ids taken while the cluster sequence is unreachable are offset by this much (2^52). */
+        static final long LOCAL_RANGE = 1L << 52;
         /** The id of the mirror being created. */
         static final ThreadLocal<Long> MIRRORED = new ThreadLocal<>();
 
@@ -1109,7 +1125,10 @@ public final class SharedQueue {
                 try {
                     return nextId(cq);
                 } catch (IOException | RuntimeException e) {
+                    // the store is unreachable: an id from a range the cluster sequence never reaches, so that it
+                    // cannot collide with one handed out elsewhere (Target 14)
                     LOGGER.log(Level.WARNING, "Cannot get a cluster-wide queue id; using a local one", e);
+                    return LOCAL_RANGE + LOCAL.generateIdFor(project, actions);
                 }
             }
             return withoutSharedQueue().generateIdFor(project, actions);
