@@ -48,6 +48,9 @@ public class ConsoleCommand extends CLICommand {
         try {
             int n = Integer.parseInt(build);
             run = job.getBuildByNumber(n);
+            if (run == null && jenkins.persistence.RunningBuilds.followElsewhere(job, n, follow, stdout)) {
+                return 0; // running on another controller of a cluster (Target 15)
+            }
             if (run == null)
                 throw new IllegalArgumentException("No such build #" + n);
         } catch (NumberFormatException e) {

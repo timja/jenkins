@@ -42,6 +42,7 @@ import hudson.security.ACL;
 import hudson.security.ACLContext;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.StringReader;
 import java.io.StringWriter;
 import java.net.InetAddress;
@@ -1023,6 +1024,92 @@ public final class RunningBuilds {
                 Timer.get().schedule(() -> delivered(jobKey, number, id, 0), 1, TimeUnit.SECONDS); // once resumed
             }
         }
+    }
+
+    /**
+     * The log of a build running on another controller, readable here (Target 15): e.g. from where its owner ships it.
+     */
+    @Restricted(Beta.class)
+    public interface RemoteLog extends hudson.ExtensionPoint {
+        /**
+         * Copies a build's log from {@code offset}.
+         *
+         * @return the offset after what was copied, or -1 if this extension cannot read that build's log
+         */
+        long copy(@NonNull Job<?, ?> job, int number, long offset, @NonNull java.io.OutputStream out) throws IOException;
+    }
+
+    /** Whether a build of a job is running on another controller. */
+    @Restricted(Beta.class)
+    public static boolean isRunningElsewhere(@NonNull Job<?, ?> job, int number) {
+        for (Placeholder p : elsewhere(job)) {
+            if (p.getNumber() == number) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Writes the log of a build running on another controller (Target 15), for the CLI's {@code console} and
+     * {@code build -f}; with {@code follow}, until it completes, then the rest from its record.
+     *
+     * @return false if the build does not run elsewhere, or no {@link RemoteLog} can read its log
+     */
+    @Restricted(Beta.class)
+    public static boolean followElsewhere(@NonNull Job<?, ?> job, int number, boolean follow, @NonNull java.io.OutputStream out)
+            throws IOException, InterruptedException {
+        if (!isRunningElsewhere(job, number)) {
+            return false;
+        }
+        long offset = 0;
+        while (true) {
+            long next = -1;
+            for (RemoteLog l : ExtensionList.lookup(RemoteLog.class)) {
+                next = l.copy(job, number, offset, out);
+                if (next >= 0) {
+                    break;
+                }
+            }
+            if (next < 0) {
+                return offset > 0; // nobody can read it (or no more)
+            }
+            offset = next;
+            out.flush();
+            if (!follow) {
+                return true;
+            }
+            invalidate(jobKeyOfRunning(runningKey(job)));
+            if (!isRunningElsewhere(job, number)) {
+                Run<?, ?> done = awaitRecord(job, number, 60);
+                if (done != null) {
+                    try (InputStream in = done.getLogInputStream()) {
+                        in.skipNBytes(Math.min(offset, done.getLogText().length()));
+                        in.transferTo(out);
+                    } catch (java.io.EOFException e) {
+                        // the record's log is shorter than what was shipped (e.g. a lost build's)
+                    }
+                }
+                out.flush();
+                return true;
+            }
+            Thread.sleep(1000);
+        }
+    }
+
+    /** The record of a build which completed on another controller, once published here (waiting up to {@code seconds}). */
+    @Restricted(Beta.class)
+    @CheckForNull
+    public static Run<?, ?> awaitRecord(@NonNull Job<?, ?> job, int number, int seconds) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(seconds);
+        while (System.nanoTime() < deadline) {
+            Run<?, ?> run = job.getBuildByNumber(number);
+            if (run != null && !run.isLogUpdated()) {
+                return run;
+            }
+            Thread.sleep(500);
+        }
+        return null;
     }
 
     /**

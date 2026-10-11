@@ -1528,6 +1528,32 @@ public final class SharedQueue {
     // ------------------------------------------------------------------ queue items not (or no longer) here
 
     /**
+     * The number of the build a queue item became on another controller (Target 15: for the CLI's {@code build -s},
+     * whose local item is cancelled when another controller starts it), waiting up to {@code seconds}; -1 if it did not
+     * (it was cancelled).
+     */
+    @Restricted(Beta.class)
+    public static int startedElsewhere(long id, int seconds) throws InterruptedException {
+        ClusterQueue cq = queue();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(seconds);
+        while (cq != null && System.nanoTime() < deadline) {
+            try {
+                ClusterQueue.Record r = cq.get(id);
+                if (r == null || r.state() == ClusterQueue.State.CANCELLED) {
+                    return -1;
+                }
+                if (r.state() == ClusterQueue.State.STARTED && r.buildNumber() > 0) {
+                    return r.buildNumber();
+                }
+            } catch (IOException e) {
+                LOGGER.log(Level.FINE, "Cannot look up queue item " + id, e);
+            }
+            Thread.sleep(500);
+        }
+        return -1;
+    }
+
+    /**
      * An item of the shared queue which is not in this controller's queue, for {@code queue/item/<id>}.
      */
     @Restricted(NoExternalUse.class)
