@@ -1015,6 +1015,12 @@ public final class PersistenceStores {
             return entry;
         }
 
+        /** Reads the current content without this JVM taking that version as the one its object holds. */
+        @CheckForNull
+        public PersistenceStore.Entry peek() throws IOException {
+            return store.read(key);
+        }
+
         public boolean exists() throws IOException {
             return store.read(key) != null;
         }

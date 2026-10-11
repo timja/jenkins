@@ -133,6 +133,25 @@ class StaticStateApplierTest {
     }
 
     @Test
+    void readingTheRawFileDoesNotHideAChangeMadeElsewhere() throws Exception {
+        r.jenkins.save();
+        String base = text("config.xml");
+        long merges = PersistenceStores.getMergeCount();
+        synchronized (r.jenkins) {
+            other.write("config.xml", base.replaceFirst("<scmCheckoutRetryCount>[0-9]+</scmCheckoutRetryCount>",
+                    "<scmCheckoutRetryCount>5</scmCheckoutRetryCount>").getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+            // e.g. GET config.xml over REST: the object in memory does not have that version
+            new hudson.XmlFile(jenkins.model.Jenkins.XSTREAM, new java.io.File(r.jenkins.getRootDir(), "config.xml")).asString();
+            r.jenkins.setQuietPeriod(8);
+        }
+        awaitApplied();
+        assertEquals(merges + 1, PersistenceStores.getMergeCount(), "the save still conflicted, and was merged");
+        String stored = text("config.xml");
+        assertTrue(stored.contains("<quietPeriod>8</quietPeriod>"), stored);
+        assertTrue(stored.contains("<scmCheckoutRetryCount>5</scmCheckoutRetryCount>"), stored);
+    }
+
+    @Test
     void concurrentSavesOfDifferentSettingsAreMerged() throws Exception {
         r.jenkins.save(); // what this controller last wrote: the base
         String base = text("config.xml");
