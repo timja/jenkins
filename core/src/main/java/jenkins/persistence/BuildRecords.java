@@ -110,7 +110,7 @@ public final class BuildRecords {
      * Never part of a snapshot: the record itself, artifacts (use an external {@link jenkins.model.ArtifactManager}),
      * and state only needed while a build runs.
      */
-    static final List<String> DEFAULT_EXCLUDES = List.of(RECORD, "archive/**", "program.dat", "workflow/**", "stashes/**", "**/*.tmp");
+    static final List<String> DEFAULT_EXCLUDES = List.of(RECORD, "archive/**", "program.dat", "workflow/**", "stashes/**", "**/*.tmp", Manifest.NAME);
 
     /** Set while this thread loads a build, so that saves made while loading are not republished. */
     private static final ThreadLocal<Boolean> LOADING = new ThreadLocal<>();
@@ -331,11 +331,13 @@ public final class BuildRecords {
                     return;
                 }
                 recentlyPublished.put(base, new Published(new java.lang.ref.WeakReference<>(run), signature, System.currentTimeMillis()));
+                Manifest.write(dir, signature);
                 LOGGER.fine(() -> "Published files added to " + run);
                 return;
             }
             publishRecord(lease, base + "/" + RECORD, published);
             recentlyPublished.put(base, new Published(new java.lang.ref.WeakReference<>(run), signature, System.currentTimeMillis()));
+            Manifest.write(dir, signature);
             // a save made while publishing found no record yet, so republish left it to this: include it
             for (int i = 0; i < 10; i++) {
                 byte[] now = Files.readAllBytes(record);
@@ -387,7 +389,7 @@ public final class BuildRecords {
             files.filter(Files::isRegularFile).sorted().forEach(f -> {
                 String rel = root.relativize(f).toString().replace(File.separatorChar, '/');
                 if (rel.equals(RECORD) || rel.startsWith("archive/") || rel.startsWith("workflow/") || rel.startsWith("stashes/")
-                        || rel.equals("program.dat") || rel.endsWith(".tmp")) {
+                        || rel.equals("program.dat") || rel.endsWith(".tmp") || rel.equals(Manifest.NAME)) {
                     return;
                 }
                 b.append(rel).append(' ').append(f.toFile().length()).append(' ').append(f.toFile().lastModified()).append('\n');
@@ -414,9 +416,19 @@ public final class BuildRecords {
             return java.util.concurrent.TimeUnit.SECONDS.toMillis(Long.getLong(BuildRecords.class.getName() + ".lateFilesPeriodSeconds", 60));
         }
 
+        /** Builds looked at by the broader scan per run, at most; the next run carries on (Target 15). */
+        static final int SCAN_LIMIT = Integer.getInteger(BuildRecords.class.getName() + ".lateFilesScanLimit", 1000);
+        static final long SCAN_MILLIS = java.util.concurrent.TimeUnit.MINUTES.toMillis(10);
+        private long lastScan;
+        private int scanFrom;
+
         @Override
         protected void execute(hudson.model.TaskListener listener) {
             long now = System.currentTimeMillis();
+            if (now - lastScan > SCAN_MILLIS) {
+                lastScan = now;
+                scanLoaded();
+            }
             for (Map.Entry<String, Published> e : recentlyPublished.entrySet()) {
                 Published p = e.getValue();
                 Run<?, ?> run = p.run().get();
@@ -436,9 +448,83 @@ public final class BuildRecords {
             }
         }
 
+        /**
+         * Builds held in memory here, whichever controller published them and however long ago, whose directories
+         * gained files since (compared with their {@link Manifest}): plugins add files through a loaded build.
+         */
+        private void scanLoaded() {
+            List<Run<?, ?>> loaded = new ArrayList<>();
+            for (Job<?, ?> job : jenkins.model.Jenkins.get().allItems(Job.class)) {
+                RunMap<?> runs = runsOf(job);
+                if (runs != null && buildsKey(job) != null) {
+                    loaded.addAll(runs.getLoadedBuilds().values());
+                }
+            }
+            int n = loaded.size();
+            int from = n == 0 ? 0 : scanFrom % n;
+            int count = Math.min(n, SCAN_LIMIT);
+            for (int i = 0; i < count; i++) {
+                Run<?, ?> run = loaded.get((from + i) % n);
+                if (run.isBuilding() || !Manifest.filesAdded(run.getRootDir())) {
+                    continue;
+                }
+                try {
+                    if (PersistenceStores.get().read(recordKeyOf(run)) != null && !isDeleted(baseOf(run), run)) {
+                        LOGGER.fine(() -> "Republishing " + run + ": files were added to it");
+                        publish(run, true);
+                    }
+                } catch (IOException | RuntimeException x) {
+                    LOGGER.log(Level.WARNING, "Could not republish " + run, x);
+                }
+            }
+            scanFrom = from + count;
+        }
+
         @Override
         protected Level getNormalLoggingLevel() {
             return Level.FINE;
+        }
+    }
+
+    @CheckForNull
+    private static String baseOf(Run<?, ?> run) {
+        String builds = buildsKey(run.getParent());
+        return builds == null ? null : builds + "/" + run.getNumber();
+    }
+
+    @NonNull
+    private static String recordKeyOf(Run<?, ?> run) {
+        String base = baseOf(run);
+        return base == null ? "" : base + "/" + RECORD;
+    }
+
+    /**
+     * What a build directory held when it was last published or fetched here: {@link #signature} of it, in a file the
+     * snapshot leaves out (Target 15). Files added later (by a plugin, possibly long after the build) are told apart
+     * from it, also after a restart and on a controller which did not publish the build.
+     */
+    static final class Manifest {
+        static final String NAME = ".cnj-published";
+
+        static void write(File dir, String signature) {
+            try {
+                Files.writeString(new File(dir, NAME).toPath(), signature, StandardCharsets.UTF_8);
+            } catch (IOException e) {
+                LOGGER.log(Level.FINE, "Could not record what " + dir + " holds", e);
+            }
+        }
+
+        /** Whether files were added or changed since the manifest was written (false if there is none). */
+        static boolean filesAdded(File dir) {
+            Path manifest = new File(dir, NAME).toPath();
+            if (!Files.isRegularFile(manifest)) {
+                return false;
+            }
+            try {
+                return !Files.readString(manifest, StandardCharsets.UTF_8).equals(signature(dir));
+            } catch (IOException e) {
+                return false;
+            }
         }
     }
 
@@ -792,6 +878,7 @@ public final class BuildRecords {
                 throw (IOException) new InterruptedIOException().initCause(e);
             }
         }
+        Manifest.write(dir, signature(dir)); // what it holds as published: files added later are told apart
         // last, as on the publishing side: a local build.xml means the directory is complete
         writeRecord(dir, record.content());
         seen(base + "/" + RECORD, record.version());
@@ -858,18 +945,31 @@ public final class BuildRecords {
         File dir = new File(job.getBuildDir(), String.valueOf(number));
         // under the lock materialization holds (RunMap.retrieve): one in progress is waited for and then refreshed,
         // rather than taken for not there yet and left with the record it read before this change
+        Run<?, ?> toPublish = null;
         synchronized (runs) {
             if (new File(dir, RECORD).isFile()) {
                 PersistenceStore.Entry record = PersistenceStores.get().read(builds + "/" + number + "/" + RECORD);
                 if (record == null) {
                     return; // deleted since; the deletion event follows
                 }
-                LOGGER.fine(() -> "Refreshing " + job.getFullName() + " #" + number + " changed elsewhere");
-                // its files may have changed too (a later snapshot): drop the local copy, materialised again when next needed
-                runs.unload(number);
-                Util.deleteRecursive(dir);
-                Files.createDirectories(dir.toPath());
-                runs.recognizeNumber(number);
+                if (Manifest.filesAdded(dir)) {
+                    // files were added here since this copy was published or fetched: publish them (with the record as
+                    // written elsewhere) rather than dropping them with the local copy (Target 15)
+                    Run<?, ?> loaded = runs.getLoadedBuilds().get(number);
+                    if (loaded != null) {
+                        LOGGER.info(() -> job.getFullName() + " #" + number + " changed elsewhere while files were added to it here; publishing them");
+                        writeRecord(dir, record.content());
+                        toPublish = loaded;
+                    }
+                }
+                if (toPublish == null) {
+                    LOGGER.fine(() -> "Refreshing " + job.getFullName() + " #" + number + " changed elsewhere");
+                    // its files may have changed too (a later snapshot): drop the local copy, materialised again when next needed
+                    runs.unload(number);
+                    Util.deleteRecursive(dir);
+                    Files.createDirectories(dir.toPath());
+                    runs.recognizeNumber(number);
+                }
             } else {
                 LOGGER.fine(() -> "Recognizing " + job.getFullName() + " #" + number + " completed elsewhere");
                 Files.createDirectories(dir.toPath());
@@ -877,6 +977,10 @@ public final class BuildRecords {
                 runs.unload(number);
                 runs.recognizeNumber(number);
             }
+        }
+        if (toPublish != null) {
+            publish(toPublish, true); // not under the lock: it uploads
+            runs.unload(number); // loaded again with the record as written elsewhere
         }
         PeepholePermalink.changedElsewhere(job, number, false);
     }
@@ -1271,7 +1375,11 @@ public final class BuildRecords {
                 return;
             }
             try {
-                republish(run);
+                if (Manifest.filesAdded(run.getRootDir()) && PersistenceStores.get().read(recordKeyOf(run)) != null) {
+                    publish(run, true); // files were added too (Target 15): the record alone would leave them out
+                } else {
+                    republish(run);
+                }
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.WARNING, "Failed to republish " + run, e);
             }

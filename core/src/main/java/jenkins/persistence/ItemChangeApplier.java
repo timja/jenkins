@@ -411,6 +411,13 @@ public final class ItemChangeApplier {
             }
             return;
         }
+        String owner = SubItems.ownerKey(e.key());
+        if (owner != null) {
+            // a promotion process or matrix configuration (Target 15): its job loads it, from its directory
+            Util.createDirectories(SubItems.dirOf(e.key()).toPath());
+            reload(owner);
+            return;
+        }
         List<String> names = itemPath(e.key());
         if (names == null || e.version() <= PersistenceStores.lastSeen(e.key())) {
             return; // not an item, or already have this version (e.g. loaded it at startup)
@@ -433,11 +440,15 @@ public final class ItemChangeApplier {
             LOGGER.fine(() -> "Reloading " + fullName + " changed elsewhere");
             // under the item's lock, as AbstractItem.save is: a save while the object is half reloaded would write a mix
             // of the two versions, as of the version just read, so nobody would notice (lost trigger, ET11 scenario 3)
+            // the new version is read outside the lock; only what changed is copied in under it (Target 15)
+            ItemReload.Prepared prepared = ItemReload.prepare(existing);
             synchronized (existing) {
                 if (PersistenceStores.hasUnsavedChanges(existing.getConfigFile(), existing) && retryLater(e)) {
                     return; // its save is pending: it will conflict and be merged, and reloaded with both changes
                 }
-                PersistenceStores.reload(existing.getConfigFile(), existing, existing::load); // a display name cleared, say
+                if (prepared == null || !ItemReload.apply(existing, prepared)) {
+                    PersistenceStores.reload(existing.getConfigFile(), existing, existing::load); // a display name cleared, say
+                }
                 PersistenceStores.synced(existing.getConfigFile(), existing);
             }
             applied(e.key());
@@ -470,6 +481,13 @@ public final class ItemChangeApplier {
             if (created instanceof AbstractItem ai) {
                 PersistenceStores.synced(ai.getConfigFile(), ai);
             }
+        } else if (parent instanceof RemoteItemGroup group && Items.load(parent, dir) instanceof TopLevelItem created) {
+            // just the new child (Target 15): reloading the folder would reload every child already in it
+            if (created instanceof AbstractItem ai) {
+                PersistenceStores.synced(ai.getConfigFile(), ai);
+            }
+            group.addRemotelyCreated(created);
+            ItemListener.fireOnCreated(created);
         } else if (parent instanceof AbstractItem folder) {
             // reloading the folder loads children which so far exist only in the store; under its lock, as items are
             // reloaded above, so that a save of the folder meanwhile does not store a mix of the two versions
@@ -515,6 +533,12 @@ public final class ItemChangeApplier {
             if (StaticStateApplier.apply(e.key(), true)) {
                 applied.incrementAndGet();
             }
+            return;
+        }
+        String owner = SubItems.ownerKey(e.key());
+        if (owner != null) {
+            Util.deleteRecursive(SubItems.dirOf(e.key())); // its job reloads without it
+            reload(owner);
             return;
         }
         List<String> names = itemPath(e.key());
@@ -696,6 +720,9 @@ public final class ItemChangeApplier {
         }
         List<String> names = new ArrayList<>();
         for (int i = 1; i < segments.length - 1; i += 2) {
+            if (i > 1 && !segments[i - 1].equals("jobs")) {
+                return null; // e.g. jobs/x/promotions/p/config.xml: a sub-item of x (SubItems), not an item
+            }
             names.add(segments[i]);
         }
         return names;

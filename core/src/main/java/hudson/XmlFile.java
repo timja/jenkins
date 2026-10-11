@@ -62,6 +62,7 @@ import java.util.logging.Logger;
 import javax.xml.XMLConstants;
 import javax.xml.parsers.ParserConfigurationException;
 import javax.xml.parsers.SAXParserFactory;
+import jenkins.persistence.MaterializedFiles;
 import jenkins.persistence.PersistenceStore;
 import jenkins.persistence.PersistenceStores;
 import org.apache.commons.io.IOUtils;
@@ -160,11 +161,13 @@ public final class XmlFile {
     /**
      * The file on the local filesystem.
      * If the content is served by a {@link PersistenceStore}, the current content is first copied to this file,
-     * which then acts as a read-only snapshot: changes made to it directly are not seen by other controllers.
+     * which then acts as a copy: changes made to it directly are written back to the store (merged with changes made
+     * meanwhile), at the next {@code getFile()} and periodically.
      */
     public File getFile() {
         PersistenceStores.Route route = route();
         if (route != null) {
+            MaterializedFiles.writeBack(route); // changed on disk since the last copy (Target 15): keep that change
             materialize(route);
         }
         return file;
@@ -217,6 +220,7 @@ public final class XmlFile {
     }
 
     private Object unmarshal(Object o, boolean nullOut) throws IOException {
+        PersistenceStores.declare(file, o);
         try (InputStream in = new BufferedInputStream(open())) {
             // TODO: expose XStream the driver from XStream
             if (nullOut) {
@@ -233,6 +237,7 @@ public final class XmlFile {
         if (LOGGER.isLoggable(Level.FINEST)) {
             LOGGER.log(Level.FINEST, new Throwable(), () -> "Writing " + file);
         }
+        PersistenceStores.declare(file, o);
         PersistenceStores.Route route = route();
         if (route != null) {
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
@@ -522,6 +527,7 @@ public final class XmlFile {
                 return;
             }
             if (file.isFile() && Arrays.equals(Files.readAllBytes(file.toPath()), entry.content())) {
+                MaterializedFiles.materialized(route.key(), file, entry);
                 return;
             }
             LOGGER.log(Level.FINE, new Throwable("caller"), () -> "Materializing " + route.key() + " to " + file);
@@ -534,6 +540,7 @@ public final class XmlFile {
             } finally {
                 w.abort();
             }
+            MaterializedFiles.materialized(route.key(), file, entry);
         } catch (IOException | InvalidPathException e) {
             LOGGER.log(Level.WARNING, "Failed to materialize " + route.key() + " to " + file, e);
         }
