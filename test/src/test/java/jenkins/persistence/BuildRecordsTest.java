@@ -559,6 +559,30 @@ class BuildRecordsTest {
     }
 
     @Test
+    void aClosedBuildKeepsWhatItPrinted() throws Exception {
+        FreeStyleProject p = project(r, "shipped");
+        r.buildAndAssertSuccess(p);
+        ShippedLogs.LOGS.put("jobs/shipped/builds/2", "tick 1\ntick 2\n");
+        BuildRecords.publishLost(p, 2, System.currentTimeMillis(), "It was running on a controller which is gone.");
+        wipeAndReload(r);
+        String log = r.jenkins.getItemByFullName("shipped", FreeStyleProject.class).getBuildByNumber(2).getLog();
+        assertThat(log, org.hamcrest.Matchers.containsString("tick 1\ntick 2"));
+        assertThat(log, org.hamcrest.Matchers.containsString("a controller which is gone"));
+        assertTrue(log.indexOf("tick 2") < log.indexOf("a controller which is gone"), "what it printed, then why it ended");
+    }
+
+    @TestExtension("aClosedBuildKeepsWhatItPrinted")
+    public static final class ShippedLogs implements BuildRecords.LostLog {
+        static final java.util.Map<String, String> LOGS = new java.util.concurrent.ConcurrentHashMap<>();
+
+        @Override
+        public java.io.InputStream shippedLog(String base) {
+            String log = LOGS.get(base);
+            return log == null ? null : new java.io.ByteArrayInputStream(log.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
     void renameMovesRecordsAndSnapshots() throws Exception {
         FreeStyleProject p = project(r, "before");
         r.buildAndAssertSuccess(p);
