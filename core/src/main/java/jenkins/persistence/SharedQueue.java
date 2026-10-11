@@ -1528,6 +1528,27 @@ public final class SharedQueue {
     // ------------------------------------------------------------------ queue items not (or no longer) here
 
     /**
+     * Whether a queue item left this controller's queue because another controller claimed or started it, rather
+     * than because it was cancelled (Target 15). Its local copy leaves as cancelled either way, so a
+     * {@link hudson.model.queue.QueueListener#onLeft} that fails on cancellation should not when this is true.
+     */
+    @Restricted(Beta.class)
+    public static boolean takenElsewhere(long id) {
+        ClusterQueue cq = queue();
+        if (cq == null) {
+            return false;
+        }
+        try {
+            ClusterQueue.Record r = cq.get(id);
+            return r != null && (r.state() == ClusterQueue.State.CLAIMED || r.state() == ClusterQueue.State.STARTED)
+                    && !origin().equals(r.claimedBy());
+        } catch (IOException e) {
+            LOGGER.log(Level.FINE, "Cannot look up queue item " + id, e);
+            return false;
+        }
+    }
+
+    /**
      * The number of the build a queue item became on another controller (Target 15: for the CLI's {@code build -s},
      * whose local item is cancelled when another controller starts it), waiting up to {@code seconds}; -1 if it did not
      * (it was cancelled).
