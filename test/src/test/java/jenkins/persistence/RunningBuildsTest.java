@@ -165,6 +165,13 @@ class RunningBuildsTest {
         // its links answer here too (no owner routing in core): the build, running there
         assertThat(wc.goTo("job/remote/2/").asNormalizedText(), containsString("Running on controller jenkins-a"));
         assertThat(wc.goTo("job/remote/2/console").asNormalizedText(), containsString("This build runs on controller jenkins-a"));
+        String api = wc.goTo("job/remote/api/json?tree=lastBuild[number,building,result,url],builds[number,building],allBuilds[number]", "application/json")
+                .getWebResponse().getContentAsString();
+        assertThat("lastBuild is the build running elsewhere", api, containsString("\"lastBuild\":{\"_class\":\"jenkins.persistence.RunningBuilds$RemoteBuild\",\"building\":true,"
+                + "\"number\":2,\"result\":null,\"url\":\"" + r.getURL() + "job/remote/2/\"}"));
+        assertThat("builds lists it first", api, containsString("\"builds\":[{\"_class\":\"jenkins.persistence.RunningBuilds$RemoteBuild\",\"building\":true,\"number\":2},"
+                + "{\"_class\":\"hudson.model.FreeStyleBuild\",\"building\":false,\"number\":1}]"));
+        assertThat(api, containsString("\"allBuilds\":[{\"_class\":\"jenkins.persistence.RunningBuilds$RemoteBuild\",\"number\":2},{\"_class\":\"hudson.model.FreeStyleBuild\",\"number\":1}]"));
 
         // the other controller completes it: record first, then the placeholder goes
         try (InputStream snapshot = BLOBS.get("jobs/remote/builds/1/files.tgz")) {
@@ -175,6 +182,8 @@ class RunningBuildsTest {
         awaitApplied();
         assertEquals(List.of(), elsewhere(p), "hidden once the completed record is known");
         assertEquals(hudson.model.BallColor.BLUE, p.getIconColor());
+        assertThat("once completed, the real build", wc.goTo("job/remote/api/json?tree=lastBuild[number,building]", "application/json").getWebResponse().getContentAsString(),
+                containsString("\"lastBuild\":{\"_class\":\"hudson.model.FreeStyleBuild\",\"building\":false,\"number\":2}"));
         assertEquals(2, p.getLastBuild().getNumber());
 
         other.delete("jobs/remote/running/2.xml", PersistenceStore.ANY);

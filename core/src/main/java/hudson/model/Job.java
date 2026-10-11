@@ -782,7 +782,6 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
      *
      * @return never null. The first entry is the latest build.
      */
-    @Exported(name = "allBuilds", visibility = -2)
     @WithBridgeMethods(List.class)
     public RunList<RunT> getBuilds() {
         return RunList.fromRuns(_getRuns().values());
@@ -793,9 +792,26 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
      *
      * @since 1.485
      */
-    @Exported(name = "builds")
     public RunList<RunT> getNewBuilds() {
         return getBuilds().limit(100);
+    }
+
+    /**
+     * {@link #getBuilds} for the REST API, with builds running on other controllers of a cluster sharing build records.
+     */
+    @Exported(name = "allBuilds", visibility = -2)
+    @Restricted(NoExternalUse.class)
+    public List<Object> getAllBuildsForApi() {
+        return jenkins.persistence.RunningBuilds.withRemote(this, getBuilds(), -1);
+    }
+
+    /**
+     * {@link #getNewBuilds} for the REST API, with builds running on other controllers of a cluster sharing build records.
+     */
+    @Exported(name = "builds")
+    @Restricted(NoExternalUse.class)
+    public List<Object> getNewBuildsForApi() {
+        return jenkins.persistence.RunningBuilds.withRemote(this, getBuilds().limit(100), 100);
     }
 
     /**
@@ -972,10 +988,19 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
     protected abstract void removeRun(RunT run);
 
     /**
+     * {@link #getLastBuild} for the REST API: a build running on another controller of a cluster sharing build records,
+     * if newer.
+     */
+    @Exported(name = "lastBuild")
+    @Restricted(NoExternalUse.class)
+    public Object getLastBuildForApi() {
+        return jenkins.persistence.RunningBuilds.lastWithRemote(this, getLastBuild());
+    }
+
+    /**
      * Returns the newest build.
      * @see LazyBuildMixIn#getLastBuild
      */
-    @Exported
     @QuickSilver
     public RunT getLastBuild() {
         SortedMap<Integer, ? extends RunT> runs = _getRuns();
