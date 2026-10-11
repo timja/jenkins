@@ -226,6 +226,14 @@ public final class BuildRecords {
      */
     @Restricted(Beta.class) // e.g. importing a file-based home
     public static void publish(@NonNull Run<?, ?> run) throws IOException {
+        publish(run, false);
+    }
+
+    /**
+     * @param filesChanged whether only files of the build directory changed (not its record): the record is then marked
+     *     so that it gets a new version, and other controllers fetch the new snapshot
+     */
+    private static void publish(@NonNull Run<?, ?> run, boolean filesChanged) throws IOException {
         String builds = buildsKey(run.getParent());
         if (builds == null) {
             return;
@@ -290,7 +298,12 @@ public final class BuildRecords {
         }
         try {
             byte[] published = Files.readAllBytes(record);
-            publishRecord(lease, base + "/" + RECORD, published);
+            byte[] content = published;
+            if (filesChanged) {
+                content = (new String(content, StandardCharsets.UTF_8) + "\n<!-- files updated " + System.currentTimeMillis() + " -->")
+                        .getBytes(StandardCharsets.UTF_8);
+            }
+            publishRecord(lease, base + "/" + RECORD, content);
             recentlyPublished.put(base, new Published(new java.lang.ref.WeakReference<>(run), signature(dir), System.currentTimeMillis()));
             // a save made while publishing found no record yet, so republish left it to this: include it
             for (int i = 0; i < 10; i++) {
@@ -382,7 +395,7 @@ public final class BuildRecords {
                 if (!signature(run.getRootDir()).equals(p.signature())) {
                     try {
                         LOGGER.fine(() -> "Republishing " + run + ": files were added to it after it was published");
-                        publish(run);
+                        publish(run, true);
                     } catch (IOException | RuntimeException x) {
                         LOGGER.log(Level.WARNING, "Could not republish " + run, x);
                     }
@@ -814,9 +827,11 @@ public final class BuildRecords {
                     return; // deleted since; the deletion event follows
                 }
                 LOGGER.fine(() -> "Refreshing " + job.getFullName() + " #" + number + " changed elsewhere");
-                writeRecord(dir, record.content());
-                seen(builds + "/" + number + "/" + RECORD, record.version());
+                // its files may have changed too (a later snapshot): drop the local copy, materialised again when next needed
                 runs.unload(number);
+                Util.deleteRecursive(dir);
+                Files.createDirectories(dir.toPath());
+                runs.recognizeNumber(number);
             } else {
                 LOGGER.fine(() -> "Recognizing " + job.getFullName() + " #" + number + " completed elsewhere");
                 Files.createDirectories(dir.toPath());
