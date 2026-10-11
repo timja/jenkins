@@ -49,6 +49,7 @@ import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
@@ -290,6 +291,7 @@ public final class BuildRecords {
         try {
             byte[] published = Files.readAllBytes(record);
             publishRecord(lease, base + "/" + RECORD, published);
+            recentlyPublished.put(base, new Published(new java.lang.ref.WeakReference<>(run), signature(dir), System.currentTimeMillis()));
             // a save made while publishing found no record yet, so republish left it to this: include it
             for (int i = 0; i < 10; i++) {
                 byte[] now = Files.readAllBytes(record);
@@ -322,6 +324,160 @@ public final class BuildRecords {
         } else {
             seen(key, PersistenceStores.get().writeIfHeld(lease.getKey(), lease.getEpoch(), key, content, PersistenceStore.ANY));
         }
+    }
+
+    /** A build published here recently, and the signature of its directory when it was. */
+    private record Published(java.lang.ref.WeakReference<Run<?, ?>> run, String signature, long at) {}
+
+    private static final Map<String, Published> recentlyPublished = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** How long after publishing a build files added to its directory are still published (Target 12). */
+    static final long LATE_FILES_MILLIS = java.util.concurrent.TimeUnit.HOURS.toMillis(1);
+
+    /** Paths, sizes and modification times of what a snapshot would hold. */
+    static String signature(File dir) {
+        StringBuilder b = new StringBuilder();
+        Path root = dir.toPath();
+        try (java.util.stream.Stream<Path> files = Files.walk(root)) {
+            files.filter(Files::isRegularFile).sorted().forEach(f -> {
+                String rel = root.relativize(f).toString().replace(File.separatorChar, '/');
+                if (rel.equals(RECORD) || rel.startsWith("archive/") || rel.startsWith("workflow/") || rel.startsWith("stashes/")
+                        || rel.equals("program.dat") || rel.endsWith(".tmp")) {
+                    return;
+                }
+                b.append(rel).append(' ').append(f.toFile().length()).append(' ').append(f.toFile().lastModified()).append('\n');
+            });
+        } catch (IOException | java.io.UncheckedIOException e) {
+            return "";
+        }
+        return b.toString();
+    }
+
+    /**
+     * Republishes recently completed builds whose directories changed without their record being saved, as when a
+     * plugin adds a file to a completed build: their snapshots would otherwise miss it on other controllers.
+     */
+    @Restricted(NoExternalUse.class)
+    @Extension
+    public static final class LateFiles extends hudson.model.AsyncPeriodicWork {
+        public LateFiles() {
+            super("Files added to completed builds");
+        }
+
+        @Override
+        public long getRecurrencePeriod() {
+            return java.util.concurrent.TimeUnit.SECONDS.toMillis(Long.getLong(BuildRecords.class.getName() + ".lateFilesPeriodSeconds", 60));
+        }
+
+        @Override
+        protected void execute(hudson.model.TaskListener listener) {
+            long now = System.currentTimeMillis();
+            for (Map.Entry<String, Published> e : recentlyPublished.entrySet()) {
+                Published p = e.getValue();
+                Run<?, ?> run = p.run().get();
+                if (run == null || now - p.at() > LATE_FILES_MILLIS || isDeleted(e.getKey(), run)) {
+                    recentlyPublished.remove(e.getKey());
+                    continue;
+                }
+                if (!signature(run.getRootDir()).equals(p.signature())) {
+                    try {
+                        LOGGER.fine(() -> "Republishing " + run + ": files were added to it after it was published");
+                        publish(run);
+                    } catch (IOException | RuntimeException x) {
+                        LOGGER.log(Level.WARNING, "Could not republish " + run, x);
+                    }
+                }
+            }
+        }
+
+        @Override
+        protected Level getNormalLoggingLevel() {
+            return Level.FINE;
+        }
+    }
+
+    /**
+     * Publishes a build which can no longer run anywhere (its controller died, nothing could resume it) as aborted, so
+     * that it stays in the history with a console saying what happened, rather than vanishing (Target 12).
+     */
+    @Restricted(NoExternalUse.class)
+    public static void publishLost(@NonNull Job<?, ?> job, int number, long startTime, @NonNull String reason) throws IOException {
+        String builds = buildsKey(job);
+        if (builds == null) {
+            return;
+        }
+        String base = builds + "/" + number;
+        PersistenceStore store = PersistenceStores.get();
+        if (store.read(base + "/" + RECORD) != null) {
+            return; // published meanwhile (e.g. it completed after all)
+        }
+        Class<?> buildClass = buildClassOf(job);
+        if (buildClass == null) {
+            LOGGER.warning(() -> "Cannot tell the build class of " + job + "; not closing #" + number);
+            return;
+        }
+        String tag = Run.XSTREAM2.getMapper().serializedClass(buildClass);
+        String record = "<?xml version='1.1' encoding='UTF-8'?>\n<" + tag + ">\n  <actions/>\n  <timestamp>" + startTime + "</timestamp>\n"
+                + "  <startTime>" + startTime + "</startTime>\n  <result>ABORTED</result>\n  <duration>0</duration>\n"
+                + "  <charset>UTF-8</charset>\n  <keepLog>false</keepLog>\n  <completed>true</completed>\n</" + tag + ">";
+        BlobStore blobs = PersistenceStores.getBlobStore();
+        if (blobs != null && !hasBlob(blobs, base + "/" + SNAPSHOT)) {
+            Path dir = Files.createTempDirectory("lost-build");
+            Path snapshot = Files.createTempFile("lost-build", ".tgz");
+            try {
+                Files.writeString(dir.resolve("log"), reason + "\nFinished: ABORTED\n", StandardCharsets.UTF_8);
+                try (OutputStream out = new GZIPOutputStream(Files.newOutputStream(snapshot))) {
+                    new FilePath(dir.toFile()).tar(out, new DirScanner.Glob("**", null, false));
+                } catch (InterruptedException e) {
+                    throw (IOException) new InterruptedIOException().initCause(e);
+                }
+                try (InputStream in = Files.newInputStream(snapshot)) {
+                    blobs.put(base + "/" + SNAPSHOT, in, Files.size(snapshot));
+                }
+            } finally {
+                Files.deleteIfExists(snapshot);
+                Util.deleteRecursive(dir.toFile());
+            }
+        }
+        try {
+            store.write(base + "/" + RECORD, record.getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+            LOGGER.info(() -> "Closed " + job.getFullName() + " #" + number + " as aborted: " + reason);
+        } catch (ConflictException e) {
+            LOGGER.fine(() -> job.getFullName() + " #" + number + " was published meanwhile");
+        }
+    }
+
+    private static boolean hasBlob(BlobStore blobs, String key) {
+        try (InputStream in = blobs.get(key)) {
+            return in != null;
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    @CheckForNull
+    private static Class<?> buildClassOf(Job<?, ?> job) {
+        for (Class<?> c = job.getClass(); c != null; c = c.getSuperclass()) {
+            try {
+                java.lang.reflect.Method m = c.getDeclaredMethod("getBuildClass");
+                m.setAccessible(true);
+                return (Class<?>) m.invoke(job);
+            } catch (NoSuchMethodException e) {
+                // look further up
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                return null;
+            }
+        }
+        if (job instanceof jenkins.model.lazy.LazyBuildMixIn.LazyLoadingJob<?, ?> lazy) {
+            try {
+                java.lang.reflect.Method m = jenkins.model.lazy.LazyBuildMixIn.class.getDeclaredMethod("getBuildClass");
+                m.setAccessible(true);
+                return (Class<?>) m.invoke(lazy.getLazyBuildMixIn());
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                return null;
+            }
+        }
+        return null;
     }
 
     /**
