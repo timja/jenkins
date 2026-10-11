@@ -56,6 +56,7 @@ import java.util.stream.Stream;
 import jenkins.model.DirectlyModifiableTopLevelItemGroup;
 import jenkins.model.Jenkins;
 import jenkins.persistence.PersistenceStore.ChangeEvent;
+import jenkins.util.Timer;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 
@@ -115,6 +116,28 @@ public final class ItemChangeApplier {
             a.pending.incrementAndGet();
             a.queue.add(new ChangeEvent(ChangeEvent.Kind.WRITTEN, key, null, Long.MAX_VALUE, MERGED));
         }
+    }
+
+    /** How many times the application of a key's change has been put off, by key. */
+    private final Map<String, Integer> retries = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final int MAX_RETRIES = 3;
+
+    /**
+     * Puts off applying a change to an object with a save pending, for a second, at most {@link #MAX_RETRIES} times.
+     *
+     * @return false if it has been put off enough: apply it now
+     */
+    private boolean retryLater(ChangeEvent e) {
+        int n = retries.merge(e.key(), 1, Integer::sum);
+        if (n > MAX_RETRIES) {
+            retries.remove(e.key());
+            LOGGER.fine(() -> "Applying " + e + " although its object still has unsaved changes");
+            return false;
+        }
+        pending.incrementAndGet();
+        Timer.get().schedule(() -> queue.add(e), 1, java.util.concurrent.TimeUnit.SECONDS);
+        LOGGER.fine(() -> "Putting off " + e + ": its object has a save pending");
+        return true;
     }
 
     /** The origin of {@link #reload} events (never a controller's). */
@@ -238,8 +261,14 @@ public final class ItemChangeApplier {
             return;
         }
         if (!e.key().startsWith("jobs/")) {
-            if (e.version() > PersistenceStores.lastSeen(e.key()) && StaticStateApplier.apply(e.key(), false)) {
-                applied.incrementAndGet();
+            if (e.version() > PersistenceStores.lastSeen(e.key())) {
+                if (e.key().equals("config.xml") && jenkins.hasUnsavedGlobalChanges() && retryLater(e)) {
+                    return; // as for items, below
+                }
+                if (StaticStateApplier.apply(e.key(), false)) {
+                    applied.incrementAndGet();
+                }
+                retries.remove(e.key());
             }
             return;
         }
@@ -257,8 +286,13 @@ public final class ItemChangeApplier {
             // under the item's lock, as AbstractItem.save is: a save while the object is half reloaded would write a mix
             // of the two versions, as of the version just read, so nobody would notice (lost trigger, ET11 scenario 3)
             synchronized (existing) {
+                if (PersistenceStores.hasUnsavedChanges(existing.getConfigFile(), existing) && retryLater(e)) {
+                    return; // its save is pending: it will conflict and be merged, and reloaded with both changes
+                }
                 PersistenceStores.reload(existing.getConfigFile(), existing, existing::load); // a display name cleared, say
+                PersistenceStores.synced(existing.getConfigFile(), existing);
             }
+            retries.remove(e.key());
             ItemListener.fireOnUpdated(existing);
             applied.incrementAndGet();
             return;

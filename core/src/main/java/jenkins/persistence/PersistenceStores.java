@@ -26,6 +26,8 @@ package jenkins.persistence;
 
 import com.thoughtworks.xstream.XStream;
 import com.thoughtworks.xstream.io.HierarchicalStreamReader;
+import hudson.XmlFile;
+
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.ExtensionList;
@@ -704,6 +706,57 @@ public final class PersistenceStores {
             bases.put(key, new Base(version, content));
         } else {
             bases.remove(key);
+        }
+    }
+
+    /** Own serialisation of objects as last saved here or reloaded from the store, by key (Target 11). */
+    private static final Map<String, byte[]> snapshots = new ConcurrentHashMap<>();
+
+    private static byte[] serialise(@NonNull XmlFile file, @NonNull Object o) {
+        return file.getXStream().toXML(o).getBytes(java.nio.charset.StandardCharsets.UTF_8);
+    }
+
+    /** Records that an object is in sync with the store (just saved, or reloaded). */
+    @Restricted(NoExternalUse.class)
+    public static void synced(@NonNull XmlFile file, @NonNull Object o) {
+        String key = keyFor(file.getFile());
+        if (key != null) {
+            try {
+                snapshots.put(key, serialise(file, o));
+            } catch (RuntimeException e) {
+                snapshots.remove(key);
+            }
+        }
+    }
+
+    /**
+     * Whether an object has changed in memory since it was last saved or reloaded, so that a save of it is pending
+     * (a setter changes a field, then saves). Reloading it now would lose that change, and the save would then write
+     * the old value as of the new version; left alone, the save conflicts and is merged instead.
+     */
+    @Restricted(NoExternalUse.class)
+    public static boolean hasUnsavedChanges(@NonNull XmlFile file, @NonNull Object o) {
+        String key = keyFor(file.getFile());
+        byte[] snapshot = key == null ? null : snapshots.get(key);
+        if (snapshot == null) {
+            return false;
+        }
+        try {
+            return !java.util.Arrays.equals(snapshot, serialise(file, o));
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** Takes snapshots of routed files as they are saved here. */
+    @Restricted(NoExternalUse.class)
+    @hudson.Extension
+    public static final class Snapshots extends hudson.model.listeners.SaveableListener {
+        @Override
+        public void onChange(hudson.model.Saveable o, XmlFile file) {
+            if (o != null && file != null && route(file.getFile()) != null) {
+                synced(file, o);
+            }
         }
     }
 
