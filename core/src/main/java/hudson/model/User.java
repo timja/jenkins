@@ -1279,11 +1279,19 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
                 }
             }
         } else if (known != null) {
-            try {
-                PersistenceStores.reload(known.getConfigFile(), known, known::load); // a description cleared, say
-            } catch (IOException e) {
-                LOGGER.log(Level.WARNING, "Failed to read user " + dirName + ", changed elsewhere", e);
-                known.load();
+            // under the user's lock, as save() takes it, so a save never writes a half-reloaded user; and not while a
+            // save of it is pending here: that save conflicts and is merged instead (put off and retried, Target 14)
+            synchronized (known) {
+                if (jenkins.persistence.PersistenceStores.hasUnsavedChanges(known.getConfigFile(), known)) {
+                    throw new IllegalStateException("User " + known.id + " has a save pending; applying the change later");
+                }
+                try {
+                    PersistenceStores.reload(known.getConfigFile(), known, known::load); // a description cleared, say
+                } catch (IOException e) {
+                    LOGGER.log(Level.WARNING, "Failed to read user " + dirName + ", changed elsewhere", e);
+                    known.load();
+                }
+                jenkins.persistence.PersistenceStores.synced(known.getConfigFile(), known);
             }
         } else {
             XmlFile xml = new XmlFile(XSTREAM, new File(new File(getUsersDirectory(), dirName), CONFIG_XML));
