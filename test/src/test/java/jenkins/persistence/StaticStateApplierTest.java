@@ -455,6 +455,42 @@ class StaticStateApplierTest {
         assertNull(r.jenkins.getNode("n2"), "deleted elsewhere");
     }
 
+    /** A cloud agent, as a cloud plugin's (e.g. a Kubernetes pod) would be. */
+    public static final class TestCloudAgent extends hudson.slaves.AbstractCloudSlave {
+        TestCloudAgent(String name) throws Exception {
+            super(name, "/tmp/" + name, new hudson.slaves.JNLPLauncher());
+        }
+
+        @Override
+        public hudson.slaves.AbstractCloudComputer<?> createComputer() {
+            return new hudson.slaves.AbstractCloudComputer<>(this);
+        }
+
+        @Override
+        protected void _terminate(hudson.model.TaskListener listener) {}
+
+        @TestExtension
+        public static final class DescriptorImpl extends hudson.model.Slave.SlaveDescriptor {}
+    }
+
+    @Test
+    void cloudAgentsStayWithTheirController() throws Exception {
+        r.jenkins.addNode(new TestCloudAgent("pod1"));
+        assertNull(STORE.read("nodes/pod1/config.xml"), "this controller's cloud agent is not shared");
+        assertNotNull(r.jenkins.getNode("pod1"));
+
+        // one written to the store by another controller (e.g. an older version) is not taken up here
+        r.createSlave("n0", null, null);
+        String cloudXml = text("nodes/n0/config.xml").replace("<name>n0</name>", "<name>pod2</name>")
+                .replaceFirst("<slave>", "<jenkins.persistence.StaticStateApplierTest_-TestCloudAgent>")
+                .replaceFirst("</slave>\\s*$", "</jenkins.persistence.StaticStateApplierTest_-TestCloudAgent>");
+        writeElsewhere("nodes/pod2/config.xml", cloudXml);
+        assertNull(r.jenkins.getNode("pod2"), "another controller's cloud agent is not launched here");
+
+        r.jenkins.removeNode(r.jenkins.getNode("pod1"));
+        assertNull(r.jenkins.getNode("pod1"));
+    }
+
     @Test
     void aNodeDeletedElsewhereDoesNotComeBackFromACopyHere() throws Exception {
         r.createSlave("n5", null, null);
