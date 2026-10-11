@@ -28,6 +28,7 @@ import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import hudson.Extension;
+import hudson.ExtensionList;
 import hudson.init.InitMilestone;
 import hudson.init.Initializer;
 import hudson.init.Terminator;
@@ -200,17 +201,35 @@ public final class SharedQueue {
         return bytes.toByteArray();
     }
 
+    /** pipeline-build-step's handler of downstream outcomes delivered across controllers ({@link RunningBuilds.Delivery}). */
+    private static final String BUILD_STEP_DELIVERY = "org.jenkinsci.plugins.workflow.support.steps.build.BuildTriggerDelivery";
+
+    /**
+     * The controller a downstream build must run on, or null if any may run it. A {@code build} step waiting for its
+     * downstream build to complete gets the outcome delivered wherever the downstream build runs (Target 15), when
+     * pipeline-build-step can take deliveries; one waiting only for the start ({@code waitForStart}) needs the started
+     * build itself, so it stays pinned to the controller that scheduled it.
+     */
     @CheckForNull
     private static String pinnedTo(@NonNull List<Action> actions) {
         for (Action a : actions) {
             if (a.getClass().getName().equals(BUILD_TRIGGER_ACTION)) {
-                return origin();
+                boolean delivered = ExtensionList.lookup(RunningBuilds.Delivery.class).stream()
+                        .anyMatch(d -> d.getClass().getName().equals(BUILD_STEP_DELIVERY));
+                if (!delivered || Queue.XSTREAM.toXML(a).contains("<waitForStart>true</waitForStart>")) {
+                    return origin();
+                }
             }
             if (a instanceof ParametersAction pa && pa.getParameters().stream().anyMatch(FileParameterValue.class::isInstance)) {
                 return origin(); // the uploaded file is only here
             }
         }
         return null;
+    }
+
+    /** Whether a pin still holds: its controller is alive (a pin to one that died must not keep the item forever). */
+    private static boolean pinHolds(@NonNull String pinnedTo) {
+        return seemsAlive(pinnedTo); // as last read, off the queue lock
     }
 
     static String toXml(@NonNull List<? extends Action> actions) {
@@ -878,7 +897,7 @@ public final class SharedQueue {
         if (r.claimedBy() != null) {
             return me.equals(r.claimedBy());
         }
-        if (r.pinnedTo() != null) {
+        if (r.pinnedTo() != null && pinHolds(r.pinnedTo())) {
             return me.equals(r.pinnedTo());
         }
         if (me.equals(r.origin())) {
@@ -994,7 +1013,7 @@ public final class SharedQueue {
                 Timer.get().submit(() -> dropLocal(id));
                 return new Blocked(r.state() == ClusterQueue.State.STARTED && me.equals(r.claimedBy()) ? "Started already" : "Starting on another controller");
             }
-            if (r.pinnedTo() != null && !me.equals(r.pinnedTo())) {
+            if (r.pinnedTo() != null && !me.equals(r.pinnedTo()) && pinHolds(r.pinnedTo())) {
                 return new Blocked("Waiting for the controller that scheduled it (it waits for the result)");
             }
             if (!me.equals(r.origin()) && System.currentTimeMillis() < r.dueAt() + ORIGIN_GRACE_MILLIS && seemsAlive(r.origin())) {

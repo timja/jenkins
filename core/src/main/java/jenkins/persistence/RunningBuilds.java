@@ -98,6 +98,8 @@ public final class RunningBuilds {
     static final String PREFIX = "running";
     private static final String SUFFIX = ".xml";
     private static final String STOP_SUFFIX = ".stop";
+    /** Deliveries for a running build's steps: {@code running/<N>.deliver-<id>} (Target 15). */
+    private static final String DELIVER_INFIX = ".deliver-";
 
     /**
      * How this controller is named in placeholders; defaults to the host name.
@@ -651,6 +653,14 @@ public final class RunningBuilds {
         PersistenceStore store = PersistenceStores.get();
         store.delete(key, p == null ? PersistenceStore.ANY : p.version);
         store.delete(key.substring(0, key.length() - SUFFIX.length()) + STOP_SUFFIX, PersistenceStore.ANY);
+        String base = key.substring(0, key.length() - SUFFIX.length());
+        String dir = base.substring(0, base.lastIndexOf('/'));
+        String prefix = base.substring(base.lastIndexOf('/') + 1) + DELIVER_INFIX;
+        for (String name : store.children(dir)) {
+            if (name.startsWith(prefix)) {
+                store.delete(dir + "/" + name, PersistenceStore.ANY); // too late to deliver: the build is done
+            }
+        }
         BuildLeases leases = store.leases();
         if (leases != null && p != null) {
             leases.release(key, p.epoch);
@@ -912,6 +922,107 @@ public final class RunningBuilds {
         }
         gone.add(origin);
         return true;
+    }
+
+    /**
+     * Something for a running build, from another controller (Target 15): typically the outcome a step of it waits for,
+     * such as a {@code build} step's downstream build completing on another controller. Delivered by
+     * {@link #deliver} to whichever controller owns the build, now or once one adopts it.
+     */
+    @Restricted(Beta.class)
+    public interface Delivery extends hudson.ExtensionPoint {
+        /**
+         * @param run the build, owned and running here
+         * @param id as given to {@link #deliver}
+         * @return true once handled (the delivery is then forgotten); false if not for this handler, or not possible yet
+         *     (it is offered again a few seconds later, for a while)
+         */
+        boolean deliver(@NonNull Run<?, ?> run, @NonNull String id, @NonNull String payload) throws Exception;
+    }
+
+    /**
+     * Delivers something to a running build wherever it runs (Target 15): handled here at once if this controller
+     * owns it; else stored for its owner, which handles it when told of it, or after adopting the build.
+     *
+     * @param id unique for this build and purpose; must not end with {@code .xml}
+     */
+    @Restricted(Beta.class)
+    public static void deliver(@NonNull Job<?, ?> job, int number, @NonNull String id, @NonNull String payload) throws IOException {
+        String runningKey = runningKey(job);
+        if (runningKey == null) {
+            return;
+        }
+        PersistenceStores.get().write(runningKey + "/" + number + DELIVER_INFIX + id, payload.getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        if (owned.containsKey(runningKey + "/" + number + SUFFIX)) {
+            String jobKey = jobKeyOfRunning(runningKey);
+            Timer.get().submit(() -> delivered(jobKey, number, id, 0));
+        }
+    }
+
+    /** Parsed key of a delivery: {@code jobs/j/running/5.deliver-x} → job key {@code jobs/j}, number 5, id {@code x}. */
+    record DeliveryKey(String jobKey, int number, String id) {
+        @CheckForNull
+        static DeliveryKey parse(String key) {
+            String[] segments = key.split("/");
+            int n = segments.length;
+            if (n < 4 || !segments[n - 2].equals(PREFIX)) {
+                return null;
+            }
+            String file = segments[n - 1];
+            int at = file.indexOf(DELIVER_INFIX);
+            if (at <= 0 || !file.substring(0, at).matches("[0-9]+")) {
+                return null;
+            }
+            return new DeliveryKey(String.join("/", Arrays.copyOf(segments, n - 2)), Integer.parseInt(file.substring(0, at)),
+                    file.substring(at + DELIVER_INFIX.length()));
+        }
+    }
+
+    private static final int DELIVERY_ATTEMPTS = 60;
+
+    /** Hands a stored delivery to the {@link Delivery} handlers, if the build is owned and running here. */
+    static void delivered(@NonNull String jobKey, int number, @NonNull String id, int attempt) {
+        if (!owned.containsKey(jobKey + "/" + PREFIX + "/" + number + SUFFIX)) {
+            return; // not ours: its owner handles it, now or after adopting the build
+        }
+        String key = jobKey + "/" + PREFIX + "/" + number + DELIVER_INFIX + id;
+        try {
+            PersistenceStore store = PersistenceStores.get();
+            PersistenceStore.Entry e = store.read(key);
+            if (e == null) {
+                return; // handled already
+            }
+            List<String> names = ItemChangeApplier.itemPath(jobKey + "/config.xml");
+            Job<?, ?> job = names == null ? null : Jenkins.get().getItemByFullName(String.join("/", names), Job.class);
+            Run<?, ?> run = job == null ? null : job.getBuildByNumber(number);
+            if (run != null && run.isLogUpdated()) {
+                String payload = new String(e.content(), StandardCharsets.UTF_8);
+                for (Delivery d : ExtensionList.lookup(Delivery.class)) {
+                    if (d.deliver(run, id, payload)) {
+                        store.delete(key, PersistenceStore.ANY);
+                        LOGGER.fine(() -> "Delivered " + id + " to " + run);
+                        return;
+                    }
+                }
+            }
+        } catch (Exception x) {
+            LOGGER.log(Level.WARNING, "Could not deliver " + key, x);
+        }
+        if (attempt < DELIVERY_ATTEMPTS) {
+            Timer.get().schedule(() -> delivered(jobKey, number, id, attempt + 1), 5, TimeUnit.SECONDS);
+        } else {
+            LOGGER.warning(() -> "Gave up delivering " + key);
+        }
+    }
+
+    /** Deliveries stored for a build while nobody owned it (its owner died). */
+    private static void pendingDeliveries(String jobKey, int number) throws IOException {
+        for (String name : PersistenceStores.get().children(jobKey + "/" + PREFIX)) {
+            if (name.startsWith(number + DELIVER_INFIX)) {
+                String id = name.substring((number + DELIVER_INFIX).length());
+                Timer.get().schedule(() -> delivered(jobKey, number, id, 0), 1, TimeUnit.SECONDS); // once resumed
+            }
+        }
     }
 
     /**
@@ -1182,7 +1293,9 @@ public final class RunningBuilds {
             SharedQueue.resumedExclusive(job, number); // loaded now (or not resumed, and let go of): the queue sees it
             // asked to stop while its owner was gone; it runs here now whatever this finds, so nothing below throws: a
             // caller takes an exception for "not resumed", and releases the lease
-            stopIfRequested(jobKeyOfRunning(runningKey(job)), number, 0);
+            String jobKey = jobKeyOfRunning(runningKey(job));
+            stopIfRequested(jobKey, number, 0);
+            pendingDeliveries(jobKey, number); // e.g. a downstream build completed while its owner was gone
             return Adoption.ADOPTED;
         }
         // its owner kept changing it: not as gone as it seemed; a later sweep looks again
