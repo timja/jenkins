@@ -1037,16 +1037,19 @@ public final class RunningBuilds {
                     break;
                 }
             }
-            if (next < 0) {
-                return offset > 0; // nobody can read it (or no more)
+            if (next < 0 && (offset == 0 || !follow)) {
+                return offset > 0; // nobody can read it
             }
-            offset = next;
-            out.flush();
-            if (!follow) {
-                return true;
+            if (next >= 0) {
+                offset = next;
+                out.flush();
+                if (!follow) {
+                    return true;
+                }
+                invalidate(jobKeyOfRunning(runningKey(job)));
             }
-            invalidate(jobKeyOfRunning(runningKey(job)));
-            if (!isRunningElsewhere(job, number)) {
+            // a shipped log that is gone (next < 0) was deleted once the build completed: the rest is in its record
+            if (next < 0 || !isRunningElsewhere(job, number)) {
                 Run<?, ?> done = awaitRecord(job, number, 60);
                 if (done != null) {
                     try (InputStream in = done.getLogInputStream()) {
