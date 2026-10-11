@@ -1278,6 +1278,154 @@ public final class RunningBuilds {
     }
 
     /**
+     * A build running on another controller, as the REST API shows it among a job's builds (Target 14): the same
+     * properties, with the same visibility, as a {@link Run} that is building. Its own URL (and API) is answered by the
+     * controller running it.
+     */
+    @ExportedBean
+    @Restricted(Beta.class)
+    public static final class RemoteBuild {
+        private final Job<?, ?> job;
+        private final Placeholder p;
+
+        RemoteBuild(Job<?, ?> job, Placeholder p) {
+            this.job = job;
+            this.p = p;
+        }
+
+        @Exported(visibility = 2)
+        public int getNumber() {
+            return p.number;
+        }
+
+        @Exported(visibility = 2)
+        public String getUrl() {
+            return Jenkins.get().getRootUrlFromRequest() + job.getUrl() + p.number + "/";
+        }
+
+        @Exported
+        public String getId() {
+            return String.valueOf(p.number);
+        }
+
+        @Exported
+        public String getDisplayName() {
+            return p.displayName;
+        }
+
+        @Exported
+        public String getFullDisplayName() {
+            return job.getFullDisplayName() + " " + p.displayName;
+        }
+
+        @Exported
+        public boolean isBuilding() {
+            return true;
+        }
+
+        @Exported
+        public boolean isInProgress() {
+            return true;
+        }
+
+        @Exported
+        public Object getResult() {
+            return null;
+        }
+
+        @Exported
+        public long getTimestamp() {
+            return p.startTime;
+        }
+
+        @Exported
+        public long getDuration() {
+            return 0;
+        }
+
+        @Exported
+        public long getEstimatedDuration() {
+            return job.getEstimatedDuration();
+        }
+
+        @Exported
+        public String getDescription() {
+            return null;
+        }
+
+        @Exported
+        public boolean isKeepLog() {
+            return false;
+        }
+
+        @Exported
+        public long getQueueId() {
+            return -1;
+        }
+
+        @Exported
+        public Object getExecutor() {
+            return null;
+        }
+
+        @Exported
+        public List<Object> getArtifacts() {
+            return List.of();
+        }
+
+        /** Which controller runs it (not on a {@link Run}). */
+        @Exported
+        public String getController() {
+            return p.controller;
+        }
+    }
+
+    /**
+     * A job's builds for the REST API: this controller's, and those running on other controllers, newest first.
+     */
+    @Restricted(NoExternalUse.class)
+    public static List<Object> withRemote(@NonNull Job<?, ?> job, @NonNull List<? extends Run<?, ?>> local, int limit) {
+        List<Placeholder> remote = elsewhere(job);
+        if (remote.isEmpty()) {
+            return limit < 0 || local.size() <= limit ? List.copyOf(local) : List.copyOf(local.subList(0, limit));
+        }
+        List<Object> all = new ArrayList<>(local.size() + remote.size());
+        java.util.Iterator<? extends Run<?, ?>> l = local.iterator();
+        java.util.Iterator<Placeholder> r = remote.iterator(); // both newest first
+        Run<?, ?> nextLocal = l.hasNext() ? l.next() : null;
+        Placeholder nextRemote = r.hasNext() ? r.next() : null;
+        while ((nextLocal != null || nextRemote != null) && (limit < 0 || all.size() < limit)) {
+            if (nextRemote != null && (nextLocal == null || nextRemote.number > nextLocal.getNumber())) {
+                all.add(new RemoteBuild(job, nextRemote));
+                nextRemote = r.hasNext() ? r.next() : null;
+            } else {
+                all.add(nextLocal);
+                nextLocal = l.hasNext() ? l.next() : null;
+            }
+        }
+        return all;
+    }
+
+    /** A job's newest build for the REST API: this controller's, or one running on another controller if newer. */
+    @Restricted(NoExternalUse.class)
+    @CheckForNull
+    public static Object lastWithRemote(@NonNull Job<?, ?> job, @CheckForNull Run<?, ?> local) {
+        List<Placeholder> remote = elsewhere(job);
+        if (!remote.isEmpty() && (local == null || remote.get(0).number > local.getNumber())) {
+            return new RemoteBuild(job, remote.get(0));
+        }
+        return local;
+    }
+
+    /** The number of the newest build of a job running on another controller, if newer than this controller's newest. */
+    @Restricted(NoExternalUse.class)
+    public static int newerElsewhere(@NonNull Job<?, ?> job) {
+        List<Placeholder> remote = elsewhere(job);
+        Run<?, ?> local = job.getLastBuild();
+        return !remote.isEmpty() && (local == null || remote.get(0).number > local.getNumber()) ? remote.get(0).number : 0;
+    }
+
+    /**
      * Lists the builds of a job running on other controllers, on the job page and in its REST API.
      */
     @ExportedBean
