@@ -66,7 +66,10 @@ import org.kohsuke.accmod.restrictions.NoExternalUse;
  * <p>Also remembers, per key, the version this JVM last read or wrote, so that writes can detect
  * modifications made by other controllers in the meantime.
  * What happens on such a conflict depends on {@code -Djenkins.persistence.PersistenceStores.conflicts}:
- * {@code warn} (the default) logs and overwrites, {@code fail} throws {@link ConflictException}.
+ * {@code warn} (the default) merges what can be merged, else logs and overwrites; {@code fail} throws {@link ConflictException};
+ * {@code strict-ui} (Target 15) is {@code warn}, except that a save made by a web request (a form, {@code config.xml})
+ * which changed the same part as the change made meanwhile, or cannot be merged, is refused, so that the user reloads
+ * instead of silently overwriting someone else's change.
  *
  * @since TODO
  */
@@ -76,7 +79,7 @@ public final class PersistenceStores {
     private static final Logger LOGGER = Logger.getLogger(PersistenceStores.class.getName());
 
     /**
-     * Conflict policy: {@code warn} or {@code fail}.
+     * Conflict policy: {@code warn}, {@code strict-ui} or {@code fail}.
      */
     @Restricted(NoExternalUse.class)
     public static /* non-final for script console */ String CONFLICTS = SystemProperties.getString(PersistenceStores.class.getName() + ".conflicts", "warn");
@@ -800,6 +803,14 @@ public final class PersistenceStores {
     private static final int MERGE_ATTEMPTS = 5;
     private static final int MAX_BASE_SIZE = 1024 * 1024;
     private static final AtomicLong merges = new AtomicLong();
+    /** Saves refused by the {@code strict-ui} policy (Target 15). */
+    private static final AtomicLong unresolved = new AtomicLong();
+
+    /** How many saves the {@code strict-ui} policy refused, since this controller started. */
+    @Restricted(Beta.class)
+    public static long getRefusedCount() {
+        return unresolved.get();
+    }
 
     private static void remember(String key, long version, byte[] content) {
         if (key.endsWith(".xml") && content.length <= MAX_BASE_SIZE) {
@@ -1202,7 +1213,12 @@ public final class PersistenceStores {
                 if (createOnly || "fail".equals(CONFLICTS)) {
                     throw e;
                 }
-                Long merged = mergeAndWrite(content, expected);
+                boolean strict = "strict-ui".equals(CONFLICTS) && org.kohsuke.stapler.Stapler.getCurrentRequest2() != null;
+                Long merged = mergeAndWrite(content, expected, strict);
+                if (merged == null && strict) {
+                    unresolved.incrementAndGet();
+                    throw new ConflictException(key, expected, -1); // shown to the user: reload, then save again
+                }
                 if (merged != null) {
                     return merged; // seen and remembered as the object in memory has it, until it is reloaded
                 } else {
@@ -1226,7 +1242,7 @@ public final class PersistenceStores {
          * @return the new version, or null if the contents cannot be merged
          */
         @CheckForNull
-        private Long mergeAndWrite(byte[] mine, long expected) throws IOException {
+        private Long mergeAndWrite(byte[] mine, long expected, boolean refuseConflicts) throws IOException {
             Base base = bases.get(key);
             if (base == null || base.version() != expected || !key.endsWith(".xml")) {
                 return null;
@@ -1237,7 +1253,7 @@ public final class PersistenceStores {
                     return null; // deleted meanwhile
                 }
                 XmlMerge.Result result = XmlMerge.merge(base.content(), mine, theirs.content());
-                if (result == null) {
+                if (result == null || refuseConflicts && result.conflicts() > 0) {
                     return null;
                 }
                 try {
