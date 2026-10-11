@@ -45,6 +45,7 @@ import java.util.Set;
 import java.util.stream.Collectors;
 import jenkins.model.HistoricalBuild;
 import jenkins.model.queue.QueueItem;
+import jenkins.persistence.RunningBuilds;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 
@@ -263,6 +264,18 @@ public class HistoryPageFilter<T> {
 
             return Long.compare(o2QID, o1QID);
         });
+    }
+
+    /**
+     * Builds of this job running on other controllers of a cluster (cloud-native Jenkins): shown above this
+     * controller's own builds, on the newest page and when not searching.
+     */
+    @Restricted(NoExternalUse.class)
+    public List<RunningBuilds.Placeholder> getRunningElsewhere() {
+        if (hasUpPage || (searchString != null && !searchString.isEmpty()) || widget == null || !(widget.owner instanceof Job<?, ?> job)) {
+            return List.of();
+        }
+        return RunningBuilds.elsewhere(job);
     }
 
     private long getNextBuildNumber(@NonNull Object entry) {

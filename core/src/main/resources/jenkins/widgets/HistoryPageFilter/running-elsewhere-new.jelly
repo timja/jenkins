@@ -1,0 +1,32 @@
+<?jelly escape-by-default='true'?>
+<!-- builds of this job running on other controllers of a cluster (cloud-native Jenkins) -->
+<j:jelly xmlns:j="jelly:core" xmlns:l="/lib/layout" xmlns:i="jelly:fmt">
+  <j:forEach var="p" items="${it.runningElsewhere}">
+    <j:set var="link" value="${it.widget.baseUrl}/${p.number}/" />
+    <div class="app-temporary-list__item">
+      <div class="app-build-item">
+        <a href="${link}console" class="app-build-item__icon" data-html-tooltip="${%runningOn(p.controller)}">
+          <l:icon src="symbol-status-nobuilt-anime" />
+        </a>
+        <div class="app-temporary-list__item__details" href="${link}">
+          <div class="app-temporary-list__item__details__text">
+            <a class="app-temporary-list__item__label" href="${link}">${p.displayName}</a>
+            <div class="app-temporary-list__item__description">
+              <div class="jenkins-details">
+                <div class="jenkins-details__item">
+                  <div class="jenkins-details__item__icon"><l:icon src="symbol-information-circle" /></div>
+                  <span>${%runningOn(p.controller)}, <i:formatDate value="${p.startDate}" type="time" timeStyle="short" /></span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="app-temporary-list__item__actions">
+          <j:if test="${it.widget.owner.hasPermission(it.widget.owner.CANCEL)}">
+            <l:stopButton href="${it.widget.baseUrl}/running-elsewhere/stop?number=${p.number}" alt="${%Cancel}" />
+          </j:if>
+        </div>
+      </div>
+    </div>
+  </j:forEach>
+</j:jelly>

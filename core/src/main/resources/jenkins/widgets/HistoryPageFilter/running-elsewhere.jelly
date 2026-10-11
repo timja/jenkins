@@ -1,0 +1,27 @@
+<?jelly escape-by-default='true'?>
+<!-- builds of this job running on other controllers of a cluster (cloud-native Jenkins) -->
+<j:jelly xmlns:j="jelly:core" xmlns:l="/lib/layout" xmlns:i="jelly:fmt">
+  <j:forEach var="p" items="${it.runningElsewhere}">
+    <j:set var="link" value="${it.widget.baseUrl}/${p.number}/" />
+    <div class="app-builds-container__item">
+      <a class="app-builds-container__item__icon" href="${link}console"
+         tooltip="${%runningOn(p.controller)}" data-tooltip-append-to-parent="true">
+        <l:icon src="symbol-status-nobuilt-anime" />
+      </a>
+      <div class="app-builds-container__item__inner">
+        <a href="${link}" class="app-builds-container__item__inner__link">
+          ${p.displayName}
+          <span class="app-builds-container__item__time">
+            <i:formatDate value="${p.startDate}" type="time" timeStyle="short" />
+          </span>
+        </a>
+        <div class="app-builds-container__item__inner__controls">
+          <j:if test="${it.widget.owner.hasPermission(it.widget.owner.CANCEL)}">
+            <l:stopButton href="${it.widget.baseUrl}/running-elsewhere/stop?number=${p.number}" alt="${%Cancel}" />
+          </j:if>
+        </div>
+      </div>
+      <div class="app-builds-container__item__description">${%runningOn(p.controller)}</div>
+    </div>
+  </j:forEach>
+</j:jelly>
