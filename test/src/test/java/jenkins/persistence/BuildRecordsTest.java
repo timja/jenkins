@@ -435,6 +435,16 @@ class BuildRecordsTest {
     }
 
     @Test
+    void deletedJobIsDroppedFromTheLateFilesSweep() throws Exception {
+        FreeStyleProject p = project(r, "gone");
+        r.buildAndAssertSuccess(p);
+        assertTrue(BuildRecords.recentlyPublished.keySet().stream().anyMatch(k -> k.startsWith("jobs/gone/")));
+        p.delete();
+        hudson.model.AsyncPeriodicWork.all().get(BuildRecords.LateFiles.class).execute(hudson.model.TaskListener.NULL);
+        assertTrue(BuildRecords.recentlyPublished.keySet().stream().noneMatch(k -> k.startsWith("jobs/gone/")), "not republished every minute");
+    }
+
+    @Test
     void buildNothingCouldResumeIsClosedAsAborted() throws Exception {
         FreeStyleProject p = project(r, "lost");
         r.buildAndAssertSuccess(p);

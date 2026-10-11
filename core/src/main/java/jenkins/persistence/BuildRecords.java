@@ -342,7 +342,7 @@ public final class BuildRecords {
     /** A build published here recently, and the signature of its directory when it was. */
     private record Published(java.lang.ref.WeakReference<Run<?, ?>> run, String signature, long at) {}
 
-    private static final Map<String, Published> recentlyPublished = new java.util.concurrent.ConcurrentHashMap<>();
+    static final Map<String, Published> recentlyPublished = new java.util.concurrent.ConcurrentHashMap<>();
 
     /** How long after publishing a build files added to its directory are still published (Target 12). */
     static final long LATE_FILES_MILLIS = java.util.concurrent.TimeUnit.HOURS.toMillis(1);
@@ -388,7 +388,8 @@ public final class BuildRecords {
             for (Map.Entry<String, Published> e : recentlyPublished.entrySet()) {
                 Published p = e.getValue();
                 Run<?, ?> run = p.run().get();
-                if (run == null || now - p.at() > LATE_FILES_MILLIS || isDeleted(e.getKey(), run)) {
+                if (run == null || now - p.at() > LATE_FILES_MILLIS || isDeleted(e.getKey(), run)
+                        || !new File(run.getRootDir(), RECORD).isFile()) { // e.g. its job was deleted
                     recentlyPublished.remove(e.getKey());
                     continue;
                 }
