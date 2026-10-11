@@ -55,6 +55,7 @@ import hudson.model.queue.FoldableAction;
 import hudson.model.queue.QueueTaskFuture;
 import java.util.ArrayList;
 import java.util.Calendar;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
@@ -306,6 +307,28 @@ class SharedQueueTest {
         }
         assertEquals(1, cloudy.loadStatistics.computeSnapshot().getQueueLength(), "this controller provisions for its own item");
         Queue.getInstance().clear();
+    }
+
+    @Test
+    void itemReservedByItsControllerWaitsForTheAgentItStarts() throws Exception {
+        long grace = SharedQueue.ORIGIN_GRACE_MILLIS;
+        SharedQueue.ORIGIN_GRACE_MILLIS = 500;
+        try {
+            FreeStyleProject p = r.createFreeStyleProject("reserved");
+            ClusterQueue.Record rec = publishElsewhere("reserved", 0, "erin");
+            // the other controller is starting a cloud agent for it
+            STORE.write(SharedQueue.Reservations.key(rec.id()), ("other-controller " + System.currentTimeMillis()).getBytes(StandardCharsets.UTF_8),
+                    PersistenceStore.ANY);
+            Thread.sleep(3_000);
+            assertNull(p.getLastBuild(), "past the head start, but reserved");
+            SharedQueue.Reservations.release(rec.id()); // its agent never came, say
+            for (int i = 0; i < 100 && p.getLastBuild() == null; i++) {
+                Thread.sleep(100);
+            }
+            assertNotNull(p.getLastBuild(), "started here once no longer reserved");
+        } finally {
+            SharedQueue.ORIGIN_GRACE_MILLIS = grace;
+        }
     }
 
     @Test

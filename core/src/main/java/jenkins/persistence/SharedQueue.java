@@ -26,6 +26,7 @@ package jenkins.persistence;
 
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import hudson.Extension;
 import hudson.init.InitMilestone;
 import hudson.init.Initializer;
@@ -58,11 +59,13 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
+import java.util.Collection;
 import java.util.GregorianCalendar;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
@@ -76,6 +79,7 @@ import jenkins.model.Jenkins;
 import jenkins.model.queue.QueueIdStrategy;
 import jenkins.model.queue.QueueStartGate;
 import jenkins.security.HMACConfidentialKey;
+import jenkins.util.SystemProperties;
 import jenkins.util.Timer;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
@@ -551,6 +555,9 @@ public final class SharedQueue {
                 }
                 Timer.get().submit(() -> releaseExclusive(job, claimHolder(id)));
             }
+            if (li.isCancelled() && shared(li.task)) {
+                Reservations.release(li.getId());
+            }
             if (!li.isCancelled() || PersistenceStores.isApplyingRemoteChange() || !shared(li.task)) {
                 return;
             }
@@ -760,6 +767,83 @@ public final class SharedQueue {
         }
     }
 
+    /**
+     * Items whose controller is starting cloud agents for them (Target 9). With the shared queue, the controller an item
+     * was scheduled on provisions for it (it alone counts it as demand), but starting an agent can take longer than the
+     * origin's head start; without a reservation, another controller with a free executor would take the item, and the
+     * agent started for it would have nothing to do. A reservation is a store entry, {@code queue/reserved/<id>}, holding
+     * the controller's origin; others wait for it while that controller is alive, for at most {@link #RESERVATION_MILLIS}.
+     */
+    @Restricted(NoExternalUse.class)
+    @Extension
+    public static final class Reservations extends hudson.slaves.CloudProvisioningListener {
+
+        static String key(long id) {
+            return "queue/reserved/" + id;
+        }
+
+        /** The origin of the controller holding a current reservation of an item, or null. */
+        @CheckForNull
+        static String holder(long id) throws IOException {
+            PersistenceStore store = PersistenceStores.get();
+            PersistenceStore.Entry e = store == null ? null : store.read(key(id));
+            if (e == null) {
+                return null;
+            }
+            String[] parts = new String(e.content(), StandardCharsets.UTF_8).split(" ", 2);
+            if (parts.length < 2 || System.currentTimeMillis() - Long.parseLong(parts[1].trim()) > RESERVATION_MILLIS) {
+                return null;
+            }
+            return parts[0];
+        }
+
+        static void release(long id) {
+            PersistenceStore store = PersistenceStores.get();
+            if (store != null) {
+                try {
+                    store.delete(key(id), PersistenceStore.ANY);
+                } catch (IOException | RuntimeException e) {
+                    LOGGER.log(Level.FINE, e, () -> "Could not release the reservation of queue item " + id);
+                }
+            }
+        }
+
+        @Override
+        public void onStarted(hudson.slaves.Cloud cloud, hudson.model.Label label, Collection<hudson.slaves.NodeProvisioner.PlannedNode> plannedNodes) {
+            ClusterQueue cq = queue();
+            PersistenceStore store = PersistenceStores.get();
+            if (cq == null || store == null) {
+                return;
+            }
+            int executors = plannedNodes.stream().mapToInt(p -> p.numExecutors).sum();
+            String me = origin();
+            for (Queue.BuildableItem bi : Queue.getInstance().getBuildableItems()) {
+                if (executors <= 0) {
+                    break;
+                }
+                if (!shared(bi.task) || !Objects.equals(label, bi.getAssignedLabel())) {
+                    continue;
+                }
+                try {
+                    ClusterQueue.Record r = cq.get(bi.getId());
+                    if (r == null || r.claimedBy() != null || !me.equals(r.origin()) || holder(bi.getId()) != null) {
+                        continue;
+                    }
+                    store.write(key(bi.getId()), (me + " " + System.currentTimeMillis()).getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+                    executors--;
+                    LOGGER.fine(() -> "Reserved " + bi + " while starting an agent for it on " + cloud.name);
+                } catch (IOException | RuntimeException e) {
+                    LOGGER.log(Level.FINE, e, () -> "Could not reserve " + bi);
+                }
+            }
+        }
+    }
+
+    /** How long a reservation holds at most (the agent may never come up). */
+    @SuppressFBWarnings(value = "MS_SHOULD_BE_FINAL", justification = "for the script console")
+    public static /* non-final for tests and the script console */ long RESERVATION_MILLIS =
+            SystemProperties.getLong(SharedQueue.class.getName() + ".reservationMillis", 5 * 60_000L);
+
     @Restricted(NoExternalUse.class)
     @Extension
     public static final class Gate implements QueueStartGate {
@@ -864,6 +948,15 @@ public final class SharedQueue {
                 ClusterQueue.Record r = cq.get(id);
                 // not if a request folded into it since the gate looked pinned it elsewhere (the claim checks it did not since)
                 if (r != null && r.state() == ClusterQueue.State.WAITING && (r.pinnedTo() == null || me.equals(r.pinnedTo()))) {
+                    String reservedBy = Reservations.holder(id);
+                    if (reservedBy != null && !origin().equals(reservedBy)) {
+                        Set<String> live = PersistenceStores.get().liveOrigins();
+                        if (live == null || live.contains(reservedBy)) {
+                            notClaimed.put(id, "Waiting for the agent the controller it was scheduled on is starting for it");
+                            changed = false; // looked at again at the next maintenance, not at once
+                            return;
+                        }
+                    }
                     if (!acquireExclusive(job, holder)) {
                         notClaimed.put(id, "A build is already in progress on another controller");
                         changed = false; // looked at again at the next maintenance, not at once
@@ -936,6 +1029,7 @@ public final class SharedQueue {
                 if (r != null && origin().equals(r.claimedBy())) {
                     cq.started(id, run.getNumber());
                 }
+                Reservations.release(id);
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.WARNING, "Failed to record that " + run + " started", e);
             }
