@@ -1208,7 +1208,10 @@ public final class PersistenceStores {
             long version;
             try {
                 version = store.write(key, content, expected);
+                LOGGER.fine(() -> "Wrote " + key + " over version " + expected);
             } catch (ConflictException e) {
+                Base b0 = bases.get(key);
+                LOGGER.fine(() -> "Conflict writing " + key + " over version " + expected + " (base " + (b0 == null ? "none" : b0.version()) + ")");
                 conflicts.incrementAndGet();
                 if (createOnly || "fail".equals(CONFLICTS)) {
                     throw e;
@@ -1261,8 +1264,14 @@ public final class PersistenceStores {
                     // the object in memory still has only this JVM's side until it is reloaded (queued below): a save of
                     // it meanwhile must conflict and merge again, against what it holds, rather than overwrite the
                     // merged content with its stale part (a setter saving twice, ET11 scenario 3)
-                    seen(key, theirs.version());
-                    remember(key, theirs.version(), mine);
+                    if (version != theirs.version()) {
+                        seen(key, theirs.version());
+                        remember(key, theirs.version(), mine);
+                    }
+                    // else the merge is what was stored already, and the write was a no-op keeping theirs' version
+                    // (Target 15): taking that version as seen would let the next save from this stale object pass
+                    // without a conflict, overwriting their change; keeping the version and base read before makes it
+                    // merge again
                     if (result.conflicts() > 0) {
                         LOGGER.warning(() -> key + " was changed meanwhile; merged, but " + result.conflicts()
                                 + " part(s) changed on both sides keep this controller's version");

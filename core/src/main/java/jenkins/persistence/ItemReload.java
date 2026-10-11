@@ -103,6 +103,7 @@ final class ItemReload {
         XmlFile file = item.getConfigFile();
         byte[] snapshot = PersistenceStores.snapshotOf(file);
         if (snapshot != prepared.snapshot()) {
+            LOGGER.fine(() -> item.getFullName() + " was saved here since version " + prepared.entry().version() + " was read: full reload");
             // saved here since the scratch copy was read (and perhaps merged with the store): the scratch copy is not
             // the newest content any more; the full reload reads what the store has now
             return false;
@@ -124,6 +125,7 @@ final class ItemReload {
             }
             fields.put(name, f);
         }
+        LOGGER.fine(() -> "Reloading " + item.getFullName() + " field by field from version " + prepared.entry().version() + ": changed " + changed);
         for (Map.Entry<String, Field> e : fields.entrySet()) {
             if (!Objects.equals(live.get(e.getKey()), before.get(e.getKey()))) {
                 // changed here too since the last sync: keep it; its save is pending and merges with the store

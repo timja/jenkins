@@ -125,6 +125,26 @@ class ItemReloadTest {
         assertThat(stored, containsString("<value>local</value>"));
     }
 
+    @Test
+    void twoSavesHereWhileAChangeElsewhereIsNotAppliedYet() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("twice");
+        p.setDescription("original");
+        String key = "jobs/twice/config.xml";
+        synchronized (p) { // the change made elsewhere cannot be applied meanwhile (as when its reload waits for this lock)
+            String stored = new String(STORE.read(key).content(), StandardCharsets.UTF_8);
+            other.write(key, stored.replace("<description>original</description>", "<description>elsewhere</description>")
+                    .getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+            // as ET11's B: addTrigger saves, then the script saves again
+            p.addTrigger(new hudson.triggers.TimerTrigger("H H 1 * *"));
+            p.save();
+        }
+        awaitApplied();
+        String stored = new String(STORE.read(key).content(), StandardCharsets.UTF_8);
+        assertThat(stored, containsString("<description>elsewhere</description>"));
+        assertThat(stored, containsString("H H 1 * *"));
+        assertEquals("elsewhere", p.getDescription());
+    }
+
     public static final class Prop extends JobProperty<Job<?, ?>> {
         /** While set, reading a Prop (unmarshalling it) waits for {@link #release}, having counted this down. */
         static volatile CountDownLatch reading;
