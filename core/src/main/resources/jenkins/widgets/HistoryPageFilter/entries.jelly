@@ -29,9 +29,11 @@ THE SOFTWARE.
   <j:choose>
     <j:when test="${newJobPage}">
       <st:include page="queue-items-new.jelly"/>
+      <st:include page="running-elsewhere-new.jelly"/>
     </j:when>
     <j:otherwise>
       <st:include page="queue-items.jelly"/>
+      <st:include page="running-elsewhere.jelly"/>
     </j:otherwise>
   </j:choose>
 
