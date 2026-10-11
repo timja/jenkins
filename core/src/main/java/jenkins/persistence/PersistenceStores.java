@@ -828,6 +828,14 @@ public final class PersistenceStores {
     private static final int MERGE_ATTEMPTS = 5;
     private static final int MAX_BASE_SIZE = 1024 * 1024;
     private static final AtomicLong merges = new AtomicLong();
+    /** Saves refused for a conflict which cannot be merged (Target 15). */
+    private static final AtomicLong unresolved = new AtomicLong();
+
+    /** How many saves were refused for a conflict which cannot be merged, since this controller started. */
+    @Restricted(Beta.class)
+    public static long getRefusedCount() {
+        return unresolved.get();
+    }
 
     private static void remember(String key, long version, byte[] content) {
         if (key.endsWith(".xml") && content.length <= MAX_BASE_SIZE) {
@@ -1237,8 +1245,9 @@ public final class PersistenceStores {
                     // changed on both sides, or not mergeable: the stored version stays, and the object here is reloaded
                     // from it (the save is lost, never theirs)
                     LOGGER.log(Level.WARNING, e.getMessage() + "; cannot be merged, so not saved; reloading what is stored");
+                    unresolved.incrementAndGet();
                     ItemChangeApplier.reload(key);
-                    throw e;
+                    throw e; // shown to the user, by a form: reload, then save again
                 }
                 return merged; // seen and remembered as the object in memory has it, until it is reloaded
             }
