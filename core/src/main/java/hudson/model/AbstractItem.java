@@ -195,8 +195,10 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
     }
 
     public void setDisplayName(String displayName) throws IOException {
-        this.displayName = Util.fixEmptyAndTrim(displayName);
-        save();
+        synchronized (this) { // as save() and a reload of a change made elsewhere are: neither sees half of the other
+            this.displayName = Util.fixEmptyAndTrim(displayName);
+            save();
+        }
     }
 
     @Override
@@ -227,8 +229,10 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
      * Sets the project description HTML.
      */
     public void setDescription(String description) throws IOException {
-        this.description = description;
-        save();
+        synchronized (this) { // as save() and a reload of a change made elsewhere are: neither sees half of the other
+            this.description = description;
+            save();
+        }
         ItemListener.fireOnUpdated(this);
     }
 

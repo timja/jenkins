@@ -450,6 +450,46 @@ class BuildRecordsTest {
     }
 
     @Test
+    void fileAddedLongAfterIsPublishedWhenTheBuildIsSaved() throws Exception {
+        FreeStyleProject p = project(r, "later");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p);
+        BuildRecords.recentlyPublished.clear(); // an hour later, or after a restart
+        java.nio.file.Files.writeString(new java.io.File(b.getRootDir(), "late.txt").toPath(), "added much later");
+        b.setDescription("kept");
+        wipeAndReload(r);
+        b = r.jenkins.getItemByFullName("later", FreeStyleProject.class).getBuildByNumber(1);
+        assertEquals("kept", b.getDescription());
+        assertEquals("added much later", java.nio.file.Files.readString(new java.io.File(b.getRootDir(), "late.txt").toPath()));
+    }
+
+    @Test
+    void fileAddedLongAfterIsFoundByTheScan() throws Exception {
+        FreeStyleProject p = project(r, "scanned");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p);
+        BuildRecords.recentlyPublished.clear();
+        java.nio.file.Files.writeString(new java.io.File(b.getRootDir(), "late.txt").toPath(), "found by the scan");
+        hudson.model.AsyncPeriodicWork.all().get(BuildRecords.LateFiles.class).execute(hudson.model.TaskListener.NULL);
+        wipeAndReload(r);
+        b = r.jenkins.getItemByFullName("scanned", FreeStyleProject.class).getBuildByNumber(1);
+        assertEquals("found by the scan", java.nio.file.Files.readString(new java.io.File(b.getRootDir(), "late.txt").toPath()));
+    }
+
+    @Test
+    void fileAddedToAFetchedCopyIsPublished() throws Exception {
+        FreeStyleProject p = project(r, "fetched");
+        r.buildAndAssertSuccess(p);
+        wipeAndReload(r); // as on a controller which did not run the build
+        FreeStyleBuild b = r.jenkins.getItemByFullName("fetched", FreeStyleProject.class).getBuildByNumber(1);
+        java.nio.file.Files.writeString(new java.io.File(b.getRootDir(), "late.txt").toPath(), "added to a fetched copy");
+        b.setDescription("described here");
+        wipeAndReload(r);
+        b = r.jenkins.getItemByFullName("fetched", FreeStyleProject.class).getBuildByNumber(1);
+        assertEquals("added to a fetched copy", java.nio.file.Files.readString(new java.io.File(b.getRootDir(), "late.txt").toPath()));
+        assertThat("the manifest is local, not part of the snapshot",
+                BuildRecords.Manifest.filesAdded(b.getRootDir()), org.hamcrest.Matchers.is(false));
+    }
+
+    @Test
     void deletedJobIsDroppedFromTheLateFilesSweep() throws Exception {
         FreeStyleProject p = project(r, "gone");
         r.buildAndAssertSuccess(p);

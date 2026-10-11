@@ -155,6 +155,29 @@ public final class XmlMerge {
         return out.toString();
     }
 
+    /**
+     * The top-level parts of an XML document: each child element name of the root, with the serialised elements of that
+     * name; null if it cannot be split so (unparseable, or text among the children). Used to reload only what changed
+     * ({@link ItemReload}).
+     */
+    @CheckForNull
+    static Map<String, String> parts(@NonNull byte[] xml) {
+        try {
+            Element root = parse(xml);
+            Map<String, List<Element>> children = root == null ? null : children(root);
+            if (children == null) {
+                return null;
+            }
+            Map<String, String> result = new LinkedHashMap<>();
+            for (Map.Entry<String, List<Element>> e : children.entrySet()) {
+                result.put(e.getKey(), serialise(e.getValue()));
+            }
+            return result;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     /** Child elements by name, in order; null if there is non-blank text among them. */
     @CheckForNull
     private static Map<String, List<Element>> children(Element e) {

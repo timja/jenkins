@@ -224,10 +224,89 @@ public final class PersistenceStores {
             return null;
         }
         String key = keyFor(file);
-        if (key == null || !store.owns(key) || localOnly.contains(key)) {
+        if (key == null || !store.owns(key) || localOnly.contains(key) || declaredLocal(key)) {
             return null;
         }
         return new Route(store, key);
+    }
+
+    /** Patterns of {@link LocalFiles}, once extensions are loaded; until then core's own. */
+    private static volatile List<java.nio.file.PathMatcher> localPatterns = matchers(new LocalFiles.Core().patterns());
+    /** Root {@code <class name>.xml} files by whether their class is {@link PerController}. */
+    private static final Map<String, Boolean> perControllerRoots = new ConcurrentHashMap<>();
+
+    private static List<java.nio.file.PathMatcher> matchers(java.util.Collection<String> patterns) {
+        List<java.nio.file.PathMatcher> result = new java.util.ArrayList<>();
+        for (String p : patterns) {
+            result.add(java.nio.file.FileSystems.getDefault().getPathMatcher("glob:" + p));
+        }
+        return result;
+    }
+
+    /** Loads the declared {@link LocalFiles} (Target 15), and again whenever plugins add some. */
+    @hudson.init.Initializer(after = hudson.init.InitMilestone.EXTENSIONS_AUGMENTED)
+    public static void loadLocalFiles() {
+        hudson.ExtensionList<LocalFiles> list = hudson.ExtensionList.lookup(LocalFiles.class);
+        Runnable refresh = () -> {
+            List<String> patterns = new java.util.ArrayList<>();
+            for (LocalFiles l : list) {
+                patterns.addAll(l.patterns());
+            }
+            localPatterns = matchers(patterns);
+            perControllerRoots.clear();
+        };
+        refresh.run();
+        list.addListener(new hudson.ExtensionListListener() {
+            @Override
+            public void onChange() {
+                refresh.run();
+            }
+        });
+    }
+
+    /**
+     * Whether a key is declared per controller (Target 15): by a {@link LocalFiles} pattern, or as the root file of a
+     * {@link PerController} class.
+     */
+    @Restricted(NoExternalUse.class)
+    public static boolean declaredLocal(@NonNull String key) {
+        java.nio.file.Path path = java.nio.file.Path.of(key);
+        for (java.nio.file.PathMatcher m : localPatterns) {
+            if (m.matches(path)) {
+                return true;
+            }
+        }
+        if (key.indexOf('/') < 0 && key.endsWith(".xml")) {
+            Boolean known = perControllerRoots.get(key);
+            if (known != null) {
+                return known;
+            }
+            Jenkins j = Jenkins.getInstanceOrNull();
+            if (j == null || j.getInitLevel().compareTo(hudson.init.InitMilestone.EXTENSIONS_AUGMENTED) < 0) {
+                return false; // plugin classes are not all loadable yet; decided (and cached) later
+            }
+            boolean local;
+            try {
+                local = Class.forName(key.substring(0, key.length() - 4), false, j.getPluginManager().uberClassLoader)
+                        .isAnnotationPresent(PerController.class);
+            } catch (ClassNotFoundException | LinkageError e) {
+                local = false;
+            }
+            perControllerRoots.put(key, local);
+            return local;
+        }
+        return false;
+    }
+
+    /** Keeps the file of an object of a {@link PerController} class local (Target 15); called before it is read or written. */
+    @Restricted(NoExternalUse.class)
+    public static void declare(@NonNull File file, @CheckForNull Object o) {
+        if (o != null && o.getClass().isAnnotationPresent(PerController.class)) {
+            String key = keyFor(file);
+            if (key != null && !localOnly.contains(key)) {
+                localOnly.add(key);
+            }
+        }
     }
 
     /** Keys the store owns which this controller nevertheless keeps to itself, such as its own cloud agents. */
@@ -753,6 +832,13 @@ public final class PersistenceStores {
                 snapshots.remove(key);
             }
         }
+    }
+
+    /** The object's serialisation as last saved here or reloaded (see {@link #synced}), or null if unknown. */
+    @CheckForNull
+    static byte[] snapshotOf(@NonNull XmlFile file) {
+        String key = keyFor(file.getPath());
+        return key == null ? null : snapshots.get(key);
     }
 
     /**

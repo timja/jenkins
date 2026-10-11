@@ -217,6 +217,9 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
     public void onLoad(ItemGroup<? extends Item> parent, String name)
             throws IOException {
         super.onLoad(parent, name);
+        // sub-items stored for a cluster of controllers (promotions, matrix configurations; Target 15): their plugins
+        // find them by listing their directories
+        jenkins.persistence.SubItems.materializeDirs(this);
 
         // see https://github.com/jenkinsci/jenkins/pull/10456#issuecomment-2748112449
         // This code can be deleted after several Jenkins releases,
