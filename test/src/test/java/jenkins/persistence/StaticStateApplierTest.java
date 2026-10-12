@@ -503,6 +503,24 @@ class StaticStateApplierTest {
     }
 
     @Test
+    void aUserChangedInMemoryAndNeverSavedStillGetsChangesMadeElsewhere() throws Exception {
+        User carol = User.getById("carol", true);
+        carol.setFullName("Carol");
+        carol.save();
+        Method folder = User.class.getDeclaredMethod("getUserFolderNameFor", String.class);
+        folder.setAccessible(true);
+        String key = "users/" + folder.invoke(null, "carol") + "/config.xml";
+        // changed here and never saved (as JCasC re-hashing a declared password does on each controller)
+        carol.setDescription("changed here, not saved");
+        other.write(key, text(key).replace("<fullName>Carol</fullName>", "<fullName>Carol Elsewhere</fullName>")
+                .getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        for (int i = 0; i < 300 && !"Carol Elsewhere".equals(User.getById("carol", false).getFullName()); i++) {
+            Thread.sleep(100);
+        }
+        assertEquals("Carol Elsewhere", User.getById("carol", false).getFullName(), "applied after being put off a few times");
+    }
+
+    @Test
     void nodesChangedCreatedAndDeletedElsewhere() throws Exception {
         r.createSlave("n1", "old-label", null);
         assertEquals(1, Label.get("old-label").getNodes().size());
