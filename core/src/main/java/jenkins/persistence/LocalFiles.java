@@ -86,7 +86,8 @@ public interface LocalFiles extends ExtensionPoint {
         @NonNull
         @Override
         public Collection<String> patterns() {
-            return List.of("queue.xml", "nodeMonitors.xml", "hudson.model.UpdateCenter.xml", "jenkins.install.*");
+            return List.of("queue.xml", "nodeMonitors.xml", "hudson.model.UpdateCenter.xml", "jenkins.install.*",
+                    "users/users.xml", "users/*/apiTokenStats.xml"); // the user index and each controller's own token usage
         }
     }
 }

@@ -40,12 +40,12 @@ import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.TestExtension;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 
-/** Opt-in sharing of plugins' own files in item directories (Target 15). */
+/** Opt-in sharing of plugins' own files in item and user directories (Target 15). */
 @WithJenkins
 class ItemFilesTest {
 
     static final InMemoryPersistenceStore STORE = new InMemoryPersistenceStore(
-            key -> key.startsWith("jobs/") && key.endsWith("/config.xml") && !key.contains("/builds/"));
+            key -> (key.startsWith("jobs/") || key.startsWith("users/")) && key.endsWith("/config.xml") && !key.contains("/builds/"));
     static final InMemoryBlobStore BLOBS = new InMemoryBlobStore();
 
     @BeforeEach
@@ -95,6 +95,28 @@ class ItemFilesTest {
         ItemFiles.publish(p);
         assertFalse(new String(STORE.read("jobs/p/item-files.json").content(), StandardCharsets.UTF_8).contains("my-plugin-state"),
                 "removed here: removed from the manifest");
+    }
+
+    @Test
+    void aPluginsFileInAUserDirectoryIsSharedAndTakenElsewhere(JenkinsRule r) throws Exception {
+        hudson.model.User alice = hudson.model.User.getById("alice", true);
+        alice.save();
+        java.io.File dir = alice.getUserFolder();
+        // as the avatar plugin writes its image, next to the user's config.xml
+        Path avatar = dir.toPath().resolve("avatar.png");
+        Files.write(avatar, new byte[] {(byte) 0x89, 'P', 'N', 'G', 1, 2, 3});
+        Files.writeString(dir.toPath().resolve("apiTokenStats.xml"), "<stats/>");
+        new ItemFiles.Publisher().execute(hudson.model.TaskListener.NULL);
+        String key = PersistenceStores.keyFor(dir) + "/item-files.json";
+        String manifest = new String(STORE.read(key).content(), StandardCharsets.UTF_8);
+        assertTrue(manifest.contains("avatar.png"), manifest);
+        assertFalse(manifest.contains("apiTokenStats.xml"), "each controller's own token usage is not shared");
+        assertFalse(manifest.contains("config.xml"), "what the store has already is left out");
+        // a fresh copy of the directory, as on another controller, told of the manifest written elsewhere
+        Files.delete(avatar);
+        ItemFiles.forgetForTests();
+        ItemFiles.changedElsewhere(key);
+        assertEquals(7, Files.size(avatar));
     }
 
     @TestExtension

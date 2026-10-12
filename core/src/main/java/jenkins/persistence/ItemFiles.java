@@ -59,11 +59,11 @@ import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 
 /**
- * Opt-in sharing of the other files plugins keep in item directories (Target 15), for plugins that write state next to
- * {@code config.xml} with their own file APIs: with {@code -Djenkins.persistence.ItemFiles.enabled=true}, every minute
- * each item's directory is compared with what was last shared; changed and removed files are shared (a manifest per item,
- * {@code <item>/item-files.json}, mapping paths to checksums, with the files in blob storage), and other controllers
- * write them into their own copy of the directory.
+ * Opt-in sharing of the other files plugins keep in item and user directories (Target 15), for plugins that write state
+ * next to {@code config.xml} with their own file APIs (such as the avatar plugin's {@code users/<id>/avatar.png}): with {@code -Djenkins.persistence.ItemFiles.enabled=true}, every minute
+ * each item's and user's directory is compared with what was last shared; changed and removed files are shared (a
+ * manifest per directory, {@code <item or user>/item-files.json}, mapping paths to checksums, with the files in blob
+ * storage), and other controllers write them into their own copy of the directory.
  *
  * <p>Left out: what the store holds already ({@code config.xml} and the like), builds, workspaces, sub-items, files
  * declared per controller ({@link LocalFiles}, {@link PerController}), and files larger than {@link #MAX_SIZE}. The last
@@ -130,20 +130,25 @@ public final class ItemFiles {
 
     /** Shares what changed in one item's directory since it was last shared or taken here. */
     static void publish(@NonNull Item item) throws IOException {
+        publish(item.getRootDir());
+    }
+
+    /** Shares what changed in an item's or user's directory since it was last shared or taken here. */
+    static void publish(@NonNull File dir) throws IOException {
         PersistenceStore store = PersistenceStores.get();
         BlobStore blobs = PersistenceStores.getBlobStore();
-        String itemKey = PersistenceStores.keyFor(item.getRootDir());
+        String itemKey = PersistenceStores.keyFor(dir);
         if (store == null || blobs == null || itemKey == null) {
             return;
         }
-        Map<String, String> local = scan(item.getRootDir(), itemKey, store);
+        Map<String, String> local = scan(dir, itemKey, store);
         Map<String, String> last = known.getOrDefault(itemKey, Map.of());
         if (local.equals(last)) {
             return;
         }
         for (Map.Entry<String, String> f : local.entrySet()) {
             if (!f.getValue().equals(last.get(f.getKey()))) {
-                Path p = item.getRootDir().toPath().resolve(f.getKey());
+                Path p = dir.toPath().resolve(f.getKey());
                 try (InputStream in = Files.newInputStream(p)) {
                     blobs.put(itemKey + "/" + BLOBS + "/" + f.getValue(), in, Files.size(p));
                 }
@@ -165,7 +170,7 @@ public final class ItemFiles {
             try {
                 store.write(itemKey + "/" + MANIFEST, toBytes(shared), e == null ? PersistenceStore.ABSENT : e.version());
                 known.put(itemKey, local);
-                LOGGER.fine(() -> "Shared the files of " + item.getFullName());
+                LOGGER.fine(() -> "Shared the files of " + itemKey);
                 return;
             } catch (ConflictException again) {
                 // changed elsewhere at the same moment: apply ours on top of theirs
@@ -175,14 +180,22 @@ public final class ItemFiles {
 
     /** Writes the shared files of an item into its directory here (after a change elsewhere, or at startup). */
     static void take(@NonNull Item item) throws IOException {
+        take(item.getRootDir());
+    }
+
+    /** Writes the shared files of an item's or user's directory into it here. */
+    static void take(@NonNull File dir) throws IOException {
         PersistenceStore store = PersistenceStores.get();
         BlobStore blobs = PersistenceStores.getBlobStore();
-        String itemKey = PersistenceStores.keyFor(item.getRootDir());
+        String itemKey = PersistenceStores.keyFor(dir);
         if (store == null || blobs == null || itemKey == null) {
             return;
         }
         Map<String, String> shared = parse(store.read(itemKey + "/" + MANIFEST));
-        Map<String, String> local = scan(item.getRootDir(), itemKey, store);
+        if (shared.isEmpty() && !known.containsKey(itemKey)) {
+            return; // nothing shared, nothing taken before: leave the directory as it is (or absent)
+        }
+        Map<String, String> local = scan(dir, itemKey, store);
         Map<String, String> last = known.getOrDefault(itemKey, Map.of());
         // what is in sync after this: what was taken, plus what was in sync before (not what changed here meanwhile)
         Map<String, String> synced = new TreeMap<>(last);
@@ -192,8 +205,8 @@ public final class ItemFiles {
             // wins (the next publication shares it)
             boolean unchangedHere = here == null ? !last.containsKey(f.getKey()) : here.equals(last.get(f.getKey()));
             if (!f.getValue().equals(here) && unchangedHere) {
-                Path target = item.getRootDir().toPath().resolve(f.getKey()).normalize();
-                if (!target.startsWith(item.getRootDir().toPath())) {
+                Path target = dir.toPath().resolve(f.getKey()).normalize();
+                if (!target.startsWith(dir.toPath())) {
                     continue; // never outside the item's directory
                 }
                 Files.createDirectories(target.getParent());
@@ -213,7 +226,7 @@ public final class ItemFiles {
         }
         for (String path : last.keySet()) {
             if (!shared.containsKey(path) && last.get(path).equals(local.get(path))) {
-                Files.deleteIfExists(item.getRootDir().toPath().resolve(path)); // removed elsewhere, unchanged here
+                Files.deleteIfExists(dir.toPath().resolve(path)); // removed elsewhere, unchanged here
                 synced.remove(path);
             }
         }
@@ -256,9 +269,28 @@ public final class ItemFiles {
         return names == null ? null : String.join("/", names);
     }
 
+    /** Whether a key is a user's manifest: {@code users/<folder>/item-files.json} → the user's directory. */
+    @CheckForNull
+    static File userDirOfManifest(@NonNull String key) {
+        String[] segments = key.split("/");
+        if (segments.length != 3 || !segments[0].equals("users") || !segments[2].equals(MANIFEST) || segments[1].startsWith(".")) {
+            return null;
+        }
+        return new File(new File(Jenkins.get().getRootDir(), "users"), segments[1]);
+    }
+
     /** Applies a manifest written elsewhere. */
     static void changedElsewhere(@NonNull String key) {
         if (!enabled()) {
+            return;
+        }
+        File userDir = userDirOfManifest(key);
+        if (userDir != null) {
+            try {
+                take(userDir);
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.WARNING, "Could not take the shared files of " + key, e);
+            }
             return;
         }
         String fullName = itemOfManifest(key);
@@ -294,13 +326,32 @@ public final class ItemFiles {
                 }
             }
         }
+        for (File dir : userDirs()) {
+            try {
+                take(dir);
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.WARNING, "Could not take the shared files of " + dir, e);
+            }
+        }
+    }
+
+    /** The directories of the users known here. */
+    static java.util.List<File> userDirs() {
+        java.util.List<File> dirs = new java.util.ArrayList<>();
+        for (hudson.model.User u : hudson.model.User.getAll()) {
+            File dir = u.getUserFolder();
+            if (dir != null) {
+                dirs.add(dir);
+            }
+        }
+        return dirs;
     }
 
     /** Shares what plugins changed in item directories, every minute. */
     @Extension
     public static final class Publisher extends AsyncPeriodicWork {
         public Publisher() {
-            super("Share files in item directories");
+            super("Share files in item and user directories");
         }
 
         @Override
@@ -320,6 +371,13 @@ public final class ItemFiles {
                     } catch (IOException | RuntimeException e) {
                         LOGGER.log(Level.WARNING, "Could not share the files of " + item.getFullName(), e);
                     }
+                }
+            }
+            for (File dir : userDirs()) {
+                try {
+                    publish(dir);
+                } catch (IOException | RuntimeException e) {
+                    LOGGER.log(Level.WARNING, "Could not share the files of " + dir, e);
                 }
             }
         }
