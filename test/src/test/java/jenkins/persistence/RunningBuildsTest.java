@@ -292,6 +292,34 @@ class RunningBuildsTest {
         assertEquals(new String(log, StandardCharsets.UTF_8), out.toString(StandardCharsets.UTF_8), "what was shipped, then the rest from the record");
     }
 
+    @Test
+    void followingABuildStartedElsewhereThatCompletesBeforeItIsSeenHere() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("quick");
+        r.buildAndAssertSuccess(p);
+        byte[] log;
+        try (InputStream in = p.getBuildByNumber(1).getLogInputStream()) {
+            log = in.readAllBytes();
+        }
+        // the shared queue said #2 started on another controller; its placeholder never reached here, its record does
+        Thread publisher = new Thread(() -> {
+            try {
+                Thread.sleep(1000);
+                try (InputStream snapshot = BLOBS.get("jobs/quick/builds/1/files.tgz")) {
+                    byte[] bytes = snapshot.readAllBytes();
+                    BLOBS.put("jobs/quick/builds/2/files.tgz", new ByteArrayInputStream(bytes), bytes.length);
+                }
+                other.write("jobs/quick/builds/2/build.xml", STORE.read("jobs/quick/builds/1/build.xml").content(), PersistenceStore.ABSENT);
+            } catch (Exception e) {
+                throw new AssertionError(e);
+            }
+        });
+        publisher.start();
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        assertTrue(RunningBuilds.followElsewhere(p, 2, true, out), "followed once its record arrived");
+        publisher.join();
+        assertEquals(new String(log, StandardCharsets.UTF_8), out.toString(StandardCharsets.UTF_8));
+    }
+
     @TestExtension("followingABuildElsewhereEndsWithTheRestOfItsRecord")
     public static class ShippedLog implements RunningBuilds.RemoteLog {
         static byte[] prefix;
