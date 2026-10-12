@@ -560,6 +560,12 @@ public final class ItemChangeApplier {
      * @return false if the key is not a build record
      */
     private boolean build(ChangeEvent e) throws Exception {
+        String permalinks = StoredPermalinks.buildsKeyOf(e.key());
+        if (permalinks != null) {
+            StoredPermalinks.changedElsewhere(permalinks);
+            applied.incrementAndGet();
+            return true;
+        }
         RunningBuilds.DeliveryKey delivery = RunningBuilds.DeliveryKey.parse(e.key());
         if (delivery != null) {
             if (e.kind() == ChangeEvent.Kind.WRITTEN) {
