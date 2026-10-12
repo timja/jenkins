@@ -1025,8 +1025,23 @@ public final class RunningBuilds {
     @Restricted(Beta.class)
     public static boolean followElsewhere(@NonNull Job<?, ?> job, int number, boolean follow, @NonNull java.io.OutputStream out)
             throws IOException, InterruptedException {
-        if (!isRunningElsewhere(job, number)) {
-            return false;
+        // a build another controller just started (as the shared queue told build -s) may not be known here yet: when
+        // following, wait a little for its placeholder, or for its record if it completed meanwhile
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(follow ? 15 : 0);
+        while (!isRunningElsewhere(job, number)) {
+            if (System.nanoTime() >= until) {
+                return false;
+            }
+            Run<?, ?> done = job.getBuildByNumber(number);
+            if (done != null && !done.isLogUpdated()) {
+                try (InputStream in = done.getLogInputStream()) {
+                    in.transferTo(out);
+                }
+                out.flush();
+                return true;
+            }
+            Thread.sleep(500);
+            invalidate(jobKeyOfRunning(runningKey(job)));
         }
         long offset = 0;
         while (true) {
