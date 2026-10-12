@@ -1072,8 +1072,14 @@ public final class RunningBuilds {
                     break;
                 }
             }
-            if (next < 0 && (offset == 0 || !follow)) {
+            if (next < 0 && !follow) {
                 return offset > 0; // nobody can read it
+            }
+            if (next < 0 && offset == 0 && isRunningElsewhere(job, number)) {
+                // following a build whose log has not been shipped yet (its owner ships every few seconds): wait for it
+                Thread.sleep(1000);
+                invalidate(jobKeyOfRunning(runningKey(job)));
+                continue;
             }
             if (next >= 0) {
                 offset = next;
