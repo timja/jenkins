@@ -463,15 +463,20 @@ public final class RunningBuilds {
         if (owned.containsKey(key)) {
             return true;
         }
+        // first what costs nothing: a fresh home has no copy of most builds (asked of each stored number at startup,
+        // 20,000 per job with a long history: no store calls for them, which a busy store made take minutes)
+        File local = new File(new File(job.getBuildDir(), String.valueOf(number)), "build.xml");
+        if (!local.isFile()) {
+            return true; // nothing of a previous run here
+        }
         Placeholder cached = null;
         for (Placeholder p : all(job)) {
             if (p.number == number) {
                 cached = p;
             }
         }
-        File local = new File(new File(job.getBuildDir(), String.valueOf(number)), "build.xml");
-        if (!local.isFile() || cached != null && store.getOrigin().equals(cached.origin)) {
-            return true; // nothing of a previous run here, or this very process runs it
+        if (cached != null && store.getOrigin().equals(cached.origin)) {
+            return true; // this very process runs it
         }
         if (cached == null && completedLocally(local)) {
             return true; // not running anywhere (the placeholders listed may be stale: a running build is checked below)
