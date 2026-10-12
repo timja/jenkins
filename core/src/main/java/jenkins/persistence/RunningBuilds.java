@@ -437,6 +437,16 @@ public final class RunningBuilds {
         }
     }
 
+    /** Whether a build's saved record says it completed (a record of a running build has no result yet). */
+    private static boolean completedLocally(File buildXml) {
+        try {
+            String xml = java.nio.file.Files.readString(buildXml.toPath(), java.nio.charset.StandardCharsets.UTF_8);
+            return xml.contains("<result>") && !xml.contains("<completed>false</completed>");
+        } catch (IOException | RuntimeException e) {
+            return false;
+        }
+    }
+
     /**
      * Takes over the lease of a build this controller's previous incarnation (the same name, another origin) was running,
      * before it is loaded from this home.
@@ -459,10 +469,15 @@ public final class RunningBuilds {
                 cached = p;
             }
         }
-        if (cached == null || !CONTROLLER_NAME.equals(cached.controller) || store.getOrigin().equals(cached.origin)
-                || !new File(new File(job.getBuildDir(), String.valueOf(number)), "build.xml").isFile()) {
-            return true; // not one this controller was running before a restart
+        File local = new File(new File(job.getBuildDir(), String.valueOf(number)), "build.xml");
+        if (!local.isFile() || cached != null && store.getOrigin().equals(cached.origin)) {
+            return true; // nothing of a previous run here, or this very process runs it
         }
+        if (cached == null && completedLocally(local)) {
+            return true; // not running anywhere (the placeholders listed may be stale: a running build is checked below)
+        }
+        // a build this home has, running somewhere: this controller's previous run had it, and another controller may
+        // have adopted it meanwhile (a restart takes longer than seeing a controller gone): ask the store, not the cache
         PersistenceStore.Entry entry = store.read(key);
         Placeholder p = entry == null ? null : Placeholder.fromBytes(key, number, entry.content(), entry.version());
         if (p == null || !CONTROLLER_NAME.equals(p.controller)) {
