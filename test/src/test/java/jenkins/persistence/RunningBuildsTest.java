@@ -320,6 +320,26 @@ class RunningBuildsTest {
         assertEquals(new String(log, StandardCharsets.UTF_8), out.toString(StandardCharsets.UTF_8));
     }
 
+    @Test
+    void aBuildAdoptedWhileThisControllerRestartedIsNotResumedFromThisHome() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("restarted");
+        java.io.File dir = new java.io.File(p.getBuildDir(), "4");
+        dir.mkdirs();
+        // what this controller's previous run left in its home: a build it was running
+        java.nio.file.Files.writeString(new java.io.File(dir, "build.xml").toPath(),
+                "<?xml version='1.1' encoding='UTF-8'?>\n<build><number>4</number><startTime>1700000000000</startTime></build>");
+        // ... and which another controller adopted while this one restarted
+        other.write("jobs/restarted/running/4.xml", placeholder("other-controller", "jenkins-b", 4), PersistenceStore.ABSENT);
+        assertTrue(!RunningBuilds.reclaim(p, 4), "the adopter's copy is the build: not loaded here");
+
+        // a completed build in this home, with no placeholder anywhere, is loaded as usual
+        java.io.File done = new java.io.File(p.getBuildDir(), "5");
+        done.mkdirs();
+        java.nio.file.Files.writeString(new java.io.File(done, "build.xml").toPath(),
+                "<?xml version='1.1' encoding='UTF-8'?>\n<build><number>5</number><result>SUCCESS</result></build>");
+        assertTrue(RunningBuilds.reclaim(p, 5));
+    }
+
     @TestExtension("followingABuildElsewhereEndsWithTheRestOfItsRecord")
     public static class ShippedLog implements RunningBuilds.RemoteLog {
         static byte[] prefix;
