@@ -340,6 +340,55 @@ class RunningBuildsTest {
         assertTrue(RunningBuilds.reclaim(p, 5));
     }
 
+    @Test
+    void followingABuildElsewhereWaitsForItsLogToBeShipped() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("slowship");
+        r.buildAndAssertSuccess(p);
+        byte[] log;
+        try (InputStream in = p.getBuildByNumber(1).getLogInputStream()) {
+            log = in.readAllBytes();
+        }
+        other.write("jobs/slowship/running/2.xml", placeholder("other-controller", "jenkins-a", 2), PersistenceStore.ABSENT);
+        awaitApplied();
+        LateShippedLog.log = log;
+        LateShippedLog.calls.set(0);
+        LateShippedLog.completed = () -> {
+            try (InputStream snapshot = BLOBS.get("jobs/slowship/builds/1/files.tgz")) {
+                byte[] bytes = snapshot.readAllBytes();
+                BLOBS.put("jobs/slowship/builds/2/files.tgz", new ByteArrayInputStream(bytes), bytes.length);
+                other.write("jobs/slowship/builds/2/build.xml", STORE.read("jobs/slowship/builds/1/build.xml").content(), PersistenceStore.ABSENT);
+            }
+        };
+        java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+        assertTrue(RunningBuilds.followElsewhere(p, 2, true, out), "followed although nothing was shipped at first");
+        assertEquals(new String(log, StandardCharsets.UTF_8), out.toString(StandardCharsets.UTF_8));
+    }
+
+    @TestExtension("followingABuildElsewhereWaitsForItsLogToBeShipped")
+    public static class LateShippedLog implements RunningBuilds.RemoteLog {
+        static byte[] log;
+        static final java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger();
+        static ShippedLog.Completion completed;
+
+        @Override
+        public long copy(Job<?, ?> job, int number, long offset, java.io.OutputStream out) throws java.io.IOException {
+            int n = calls.incrementAndGet();
+            if (n <= 2) {
+                return -1; // not shipped yet
+            }
+            if (offset == 0) {
+                out.write(log, 0, 10);
+                return 10;
+            }
+            try {
+                completed.run();
+            } catch (Exception e) {
+                throw new java.io.IOException(e);
+            }
+            return -1; // deleted once the build completed
+        }
+    }
+
     @TestExtension("followingABuildElsewhereEndsWithTheRestOfItsRecord")
     public static class ShippedLog implements RunningBuilds.RemoteLog {
         static byte[] prefix;
