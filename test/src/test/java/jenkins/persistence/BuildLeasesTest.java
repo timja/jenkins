@@ -353,6 +353,42 @@ class BuildLeasesTest {
     }
 
     @Test
+    void completedBuildOfDeadControllerIsClosedWithItsResultNotResumed() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("finished");
+        String key = "jobs/finished/running/1.xml";
+        // its owner recorded the result on completion, then died before publishing the record (ET17)
+        dead.write(key, placeholder("dead-controller", 1, dead.leases().acquire(key), "x.savePoint=3\nx.result=SUCCESS\n"), PersistenceStore.ABSENT);
+        live = Set.of(STORE.getOrigin());
+
+        assertEquals(1, RunningBuilds.removeStale());
+
+        assertTrue(Adopter.prepared.isEmpty(), "not offered for adoption");
+        assertTrue(Adopter.resumed.isEmpty());
+        assertNull(text(key));
+        assertThat(text("jobs/finished/builds/1/build.xml"), containsString("<result>SUCCESS</result>"));
+        assertEquals(1, p.getLastSuccessfulBuild().getNumber(), "the permalinks are updated as its owner would have");
+        assertThat(text("jobs/finished/builds/permalinks"), containsString("lastSuccessfulBuild 1"));
+    }
+
+    @Test
+    void placeholderUpdatesKeepEarlierProperties() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        FreeStyleProject p = blocking(r, "merged", started, release);
+        QueueTaskFuture<FreeStyleBuild> f = p.scheduleBuild2(0);
+        assertTrue(started.await(60, TimeUnit.SECONDS));
+        String key = "jobs/merged/running/1.xml";
+
+        RunningBuilds.update(p.getBuildByNumber(1), Map.of("savePoint", "7"));
+        RunningBuilds.update(p.getBuildByNumber(1), Map.of("other", "x"));
+        assertThat(text(key), containsString("x.savePoint=7"));
+        assertThat(text(key), containsString("x.other=x"));
+
+        release.countDown();
+        r.assertBuildStatusSuccess(f);
+    }
+
+    @Test
     void lostBuildIsStoppedAndNotPublished() throws Exception {
         CountDownLatch started = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);

@@ -34,6 +34,7 @@ import hudson.Util;
 import hudson.XmlFile;
 import hudson.model.Item;
 import hudson.model.Job;
+import hudson.model.Result;
 import hudson.model.Run;
 import hudson.model.RunMap;
 import hudson.model.Saveable;
@@ -534,6 +535,15 @@ public final class BuildRecords {
      */
     @Restricted(NoExternalUse.class)
     public static void publishLost(@NonNull Job<?, ?> job, int number, long startTime, @NonNull String reason) throws IOException {
+        publishLost(job, number, startTime, reason, Result.ABORTED);
+    }
+
+    /**
+     * As {@link #publishLost(Job, int, long, String)}, with the result the build had when it completed, for one whose
+     * controller was gone before publishing its record.
+     */
+    public static void publishLost(@NonNull Job<?, ?> job, int number, long startTime, @NonNull String reason, @NonNull Result result)
+            throws IOException {
         String builds = buildsKey(job);
         if (builds == null) {
             return;
@@ -550,7 +560,7 @@ public final class BuildRecords {
         }
         String tag = Run.XSTREAM2.getMapper().serializedClass(buildClass);
         String record = "<?xml version='1.1' encoding='UTF-8'?>\n<" + tag + ">\n  <actions/>\n  <timestamp>" + startTime + "</timestamp>\n"
-                + "  <startTime>" + startTime + "</startTime>\n  <result>ABORTED</result>\n  <duration>0</duration>\n"
+                + "  <startTime>" + startTime + "</startTime>\n  <result>" + result + "</result>\n  <duration>0</duration>\n"
                 + "  <charset>UTF-8</charset>\n  <keepLog>false</keepLog>\n  <completed>true</completed>\n</" + tag + ">";
         BlobStore blobs = PersistenceStores.getBlobStore();
         if (blobs != null) {
@@ -570,7 +580,7 @@ public final class BuildRecords {
                             LOGGER.log(Level.WARNING, "Could not read the shipped log of " + base, x);
                         }
                     }
-                    log.write((reason + "\nFinished: ABORTED\n").getBytes(StandardCharsets.UTF_8));
+                    log.write((reason + "\nFinished: " + result + "\n").getBytes(StandardCharsets.UTF_8));
                 }
                 try (OutputStream out = new GZIPOutputStream(Files.newOutputStream(snapshot))) {
                     new FilePath(dir.toFile()).tar(out, new DirScanner.Glob("**", null, false));
@@ -587,8 +597,13 @@ public final class BuildRecords {
         }
         try {
             seen(base + "/" + RECORD, store.write(base + "/" + RECORD, record.getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT));
-            LOGGER.info(() -> "Closed " + job.getFullName() + " #" + number + " as aborted: " + reason);
+            LOGGER.info(() -> "Closed " + job.getFullName() + " #" + number + " (" + result + "): " + reason);
             writtenElsewhere(job, number); // this controller's own write raises no event here
+            // published here for the controller which ran it: update the shared permalinks, as it would have
+            Run<?, ?> run = job.getBuildByNumber(number);
+            if (run != null) {
+                PeepholePermalink.completed(run);
+            }
         } catch (ConflictException e) {
             LOGGER.fine(() -> job.getFullName() + " #" + number + " was published meanwhile");
             if (blobs != null && hasBlob(blobs, base + "/" + SNAPSHOT)) {

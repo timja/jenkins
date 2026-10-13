@@ -355,6 +355,23 @@ public abstract class PeepholePermalink extends Permalink implements Predicate<R
         }
     }
 
+    /**
+     * Updates the permalinks a completed build matches, as when it completes here; also for a build whose record this
+     * controller published for another one, gone before publishing it (Target 15).
+     */
+    @Restricted(NoExternalUse.class)
+    public static void completed(@NonNull Run<?, ?> run) {
+        Job<?, ?> j = run.getParent();
+        for (PeepholePermalink pp : Util.filter(j.getPermalinks(), PeepholePermalink.class)) {
+            if (pp.apply(run)) {
+                if (pp.resolveNumber(j) < run.getNumber()) {
+                    LOGGER.fine(() -> "Updating " + pp.getId() + " permalink to completed " + run);
+                    pp.updateCache(j, run);
+                }
+            }
+        }
+    }
+
     @Extension
     public static class RunListenerImpl extends RunListener<Run<?, ?>> {
         /**
@@ -377,15 +394,7 @@ public abstract class PeepholePermalink extends Permalink implements Predicate<R
          */
         @Override
         public void onCompleted(Run<?, ?> run, @NonNull TaskListener listener) {
-            Job<?, ?> j = run.getParent();
-            for (PeepholePermalink pp : Util.filter(j.getPermalinks(), PeepholePermalink.class)) {
-                if (pp.apply(run)) {
-                    if (pp.resolveNumber(j) < run.getNumber()) {
-                        LOGGER.fine(() -> "Updating " + pp.getId() + " permalink to completed " + run);
-                        pp.updateCache(j, run);
-                    }
-                }
-            }
+            completed(run);
         }
     }
 
