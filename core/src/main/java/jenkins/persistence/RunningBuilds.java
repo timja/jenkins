@@ -148,6 +148,9 @@ public final class RunningBuilds {
     /** Placeholders per job key, kept up to date by change events; loaded from the store on first use. */
     private static final Map<String, List<Placeholder>> cache = new ConcurrentHashMap<>();
 
+    /** The placeholder property recording a completed build's result until its record is published. */
+    static final String RESULT = "result";
+
     private RunningBuilds() {}
 
     private static String hostName() {
@@ -602,7 +605,8 @@ public final class RunningBuilds {
     }
 
     /**
-     * Records properties of a running build in its placeholder, for example where its latest save point is.
+     * Records properties of a running build in its placeholder, for example where its latest save point is; those
+     * recorded before are kept unless given again.
      * Conditional on this controller still owning the build: the write is a compare-and-set on the placeholder
      * as this controller last wrote it, so it fails if another controller has adopted the build since.
      *
@@ -621,14 +625,16 @@ public final class RunningBuilds {
         if (lost.contains(key) || !owns(run)) {
             throw new ConflictException(key, p.version, PersistenceStore.ANY);
         }
-        Placeholder next = p.withOwner(p.origin, p.controller, p.epoch, properties);
+        Map<String, String> merged = new java.util.HashMap<>(p.properties);
+        merged.putAll(properties); // e.g. the latest save point and, once completed, the result
+        Placeholder next = p.withOwner(p.origin, p.controller, p.epoch, merged);
         long version;
         try {
             version = PersistenceStores.get().writeIfHeld(key, p.epoch, key, next.toBytes(), p.version);
         } catch (LeaseLostException e) {
             throw new ConflictException(key, p.version, PersistenceStore.ANY); // taken over since it was checked
         }
-        owned.put(key, new Placeholder(key, p.number, p.origin, p.controller, p.displayName, p.startTime, p.epoch, properties, version));
+        owned.put(key, new Placeholder(key, p.number, p.origin, p.controller, p.displayName, p.startTime, p.epoch, merged, version));
     }
 
     /**
@@ -893,9 +899,17 @@ public final class RunningBuilds {
                     if (now != null && (leases == null || leases.holds(p.key, epoch))) {
                         LOGGER.info(() -> "Removing placeholder of " + job.getFullName() + " #" + p.number + " left by " + p.controller + " (" + p.origin + "), which is gone");
                         try {
-                            // nothing can resume it: close it as aborted rather than let it vanish (Target 12)
-                            BuildRecords.publishLost(job, p.number, p.startTime,
-                                    "This build was running on " + p.controller + ", which is gone, and could not be resumed elsewhere; it is closed as aborted.");
+                            String completed = p.properties.get(RESULT);
+                            if (completed != null) {
+                                // it completed, but its owner was gone before publishing its record: publish it with its result
+                                BuildRecords.publishLost(job, p.number, p.startTime,
+                                        "This build completed on " + p.controller + ", which was gone before publishing its record; it is closed with its result.",
+                                        Result.fromString(completed));
+                            } else {
+                                // nothing can resume it: close it as aborted rather than let it vanish (Target 12)
+                                BuildRecords.publishLost(job, p.number, p.startTime,
+                                        "This build was running on " + p.controller + ", which is gone, and could not be resumed elsewhere; it is closed as aborted.");
+                            }
                         } catch (IOException | RuntimeException e) {
                             // keep the placeholder (and release the lease), so that the next sweep tries again (Target 14)
                             LOGGER.log(Level.WARNING, "Could not close " + job.getFullName() + " #" + p.number + " as aborted; will retry", e);
@@ -1370,6 +1384,9 @@ public final class RunningBuilds {
             } else if (local != null && !local.hasntStartedYet()) {
                 BuildRecords.forgetLocalCopy(job, number); // a stale copy (lost here before): the adopted build replaces it
             }
+            if (p != null && p.properties.containsKey(RESULT)) {
+                return Adoption.NONE; // it completed; its owner was gone before publishing its record: nothing to resume
+            }
             BuildAdopter.Adoption adoption = p == null ? null : prepare(job, p);
             if (adoption == null) {
                 return Adoption.NONE;
@@ -1606,6 +1623,26 @@ public final class RunningBuilds {
 
         /** How long a build not reclaimed after a restart waits before it is tried again. */
         static /* non-final for tests */ long RECLAIM_RETRY_SECONDS = 30;
+
+        /**
+         * Records the result in the placeholder as soon as a build completes, before its record is published: should
+         * this controller die in between, the build is then closed with that result instead of resumed elsewhere
+         * (Target 15, ET17: a resumed Pipeline that had completed never ran on).
+         */
+        @Override
+        public void onCompleted(Run<?, ?> run, @NonNull TaskListener listener) {
+            Result result = run.getResult();
+            if (result == null || PersistenceStores.isApplyingRemoteChange() || ownedPlaceholder(run) == null) {
+                return;
+            }
+            try {
+                update(run, Map.of(RESULT, result.toString()));
+            } catch (ConflictException e) {
+                LOGGER.fine(() -> run + " completed after another controller took it over");
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.WARNING, "Could not record the result of " + run + " in its placeholder", e);
+            }
+        }
 
         @Override
         public void onStarted(Run<?, ?> run, TaskListener listener) {
