@@ -389,6 +389,42 @@ class BuildLeasesTest {
     }
 
     @Test
+    void concurrentPlaceholderUpdatesAllApply() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        FreeStyleProject p = blocking(r, "concurrent", started, release);
+        QueueTaskFuture<FreeStyleBuild> f = p.scheduleBuild2(0);
+        assertTrue(started.await(60, TimeUnit.SECONDS));
+        FreeStyleBuild b = p.getBuildByNumber(1);
+        String key = "jobs/concurrent/running/1.xml";
+
+        // e.g. a Pipeline's last save point, shipped while it completes and its result is recorded
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(8);
+        try {
+            List<java.util.concurrent.Future<?>> updates = new java.util.ArrayList<>();
+            for (int i = 0; i < 40; i++) {
+                String name = "p" + i;
+                updates.add(pool.submit(() -> {
+                    RunningBuilds.update(b, Map.of(name, "v"));
+                    return null;
+                }));
+            }
+            for (java.util.concurrent.Future<?> u : updates) {
+                u.get(60, TimeUnit.SECONDS); // none conflicts with another update from here
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+        assertTrue(RunningBuilds.owns(b));
+        for (int i = 0; i < 40; i++) {
+            assertThat(text(key), containsString("x.p" + i + "=v"));
+        }
+
+        release.countDown();
+        r.assertBuildStatusSuccess(f);
+    }
+
+    @Test
     void lostBuildIsStoppedAndNotPublished() throws Exception {
         CountDownLatch started = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);

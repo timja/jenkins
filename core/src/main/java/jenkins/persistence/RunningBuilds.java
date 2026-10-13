@@ -396,6 +396,12 @@ public final class RunningBuilds {
      * or a Pipeline's execution) may be saved after its key is no longer {@link #lost}, and must never be published.
      */
     private static final Set<Run<?, ?>> discarded = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
+    /**
+     * One lock per owned build, so that its placeholder is updated by one thread at a time: two updates at once (a
+     * Pipeline's last save point, and its result as it completes) would each compare-and-set the same version, and the
+     * one failing would take the build for lost.
+     */
+    private static final Map<String, Object> updating = new ConcurrentHashMap<>();
 
     @CheckForNull
     private static String placeholderKey(@NonNull Run<?, ?> run) {
@@ -585,23 +591,28 @@ public final class RunningBuilds {
         if (key != null && lost.contains(key)) {
             throw new ConflictException(key, PersistenceStore.ANY, PersistenceStore.ANY); // no longer owned here (lost forgets it)
         }
-        Placeholder p = key == null ? null : owned.get(key);
-        if (p == null) {
+        if (key == null || !owned.containsKey(key)) {
             return;
         }
-        if (lost.contains(key) || !owns(run)) {
-            throw new ConflictException(key, p.version, PersistenceStore.ANY);
+        synchronized (updating.computeIfAbsent(key, k -> new Object())) {
+            Placeholder p = owned.get(key);
+            if (p == null) {
+                return;
+            }
+            if (lost.contains(key) || !owns(run)) {
+                throw new ConflictException(key, p.version, PersistenceStore.ANY);
+            }
+            Map<String, String> merged = new java.util.HashMap<>(p.properties);
+            merged.putAll(properties); // e.g. the latest save point and, once completed, the result
+            Placeholder next = p.withOwner(p.origin, p.controller, p.epoch, merged);
+            long version;
+            try {
+                version = PersistenceStores.get().writeIfHeld(key, p.epoch, key, next.toBytes(), p.version);
+            } catch (LeaseLostException e) {
+                throw new ConflictException(key, p.version, PersistenceStore.ANY); // taken over since it was checked
+            }
+            owned.put(key, new Placeholder(key, p.number, p.origin, p.controller, p.displayName, p.startTime, p.epoch, merged, version));
         }
-        Map<String, String> merged = new java.util.HashMap<>(p.properties);
-        merged.putAll(properties); // e.g. the latest save point and, once completed, the result
-        Placeholder next = p.withOwner(p.origin, p.controller, p.epoch, merged);
-        long version;
-        try {
-            version = PersistenceStores.get().writeIfHeld(key, p.epoch, key, next.toBytes(), p.version);
-        } catch (LeaseLostException e) {
-            throw new ConflictException(key, p.version, PersistenceStore.ANY); // taken over since it was checked
-        }
-        owned.put(key, new Placeholder(key, p.number, p.origin, p.controller, p.displayName, p.startTime, p.epoch, merged, version));
     }
 
     /**
@@ -615,6 +626,7 @@ public final class RunningBuilds {
             return;
         }
         owned.remove(key);
+        updating.remove(key);
         LOGGER.warning(() -> "Ownership of " + run + " was lost to another controller; stopping it here");
         Executor executor = run.getExecutor();
         if (executor != null && run.isLogUpdated()) { // not once completed: only fenced then
@@ -660,6 +672,7 @@ public final class RunningBuilds {
             leases.release(key, p.epoch);
         }
         owned.remove(key);
+        updating.remove(key);
         String jobKey = jobKeyOf(key);
         if (jobKey != null) {
             invalidate(jobKey);
