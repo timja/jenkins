@@ -1883,6 +1883,26 @@ public final class RunningBuilds {
             return job.hasPermission(Item.CANCEL);
         }
 
+        /** What it has printed so far, as shipped by the controller running it ({@link RemoteLog}), or null if unknown. */
+        @CheckForNull
+        public String getLog() throws IOException {
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            for (RemoteLog l : ExtensionList.lookup(RemoteLog.class)) {
+                if (l.copy(job, placeholder.number, 0, out) >= 0) {
+                    return out.toString(StandardCharsets.UTF_8);
+                }
+                out.reset();
+            }
+            return null;
+        }
+
+        /** {@link #getLog} as plain text, as a build's own {@code consoleText} is. */
+        public void doConsoleText(org.kohsuke.stapler.StaplerResponse2 rsp) throws IOException {
+            rsp.setContentType("text/plain;charset=UTF-8");
+            String log = getLog();
+            rsp.getWriter().write(log == null ? "" : log);
+        }
+
         /** Stops it: asks the controller running it to. */
         @RequirePOST
         public HttpResponse doStop() throws IOException {

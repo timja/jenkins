@@ -403,6 +403,27 @@ class RunningBuildsTest {
         }
     }
 
+    @Test
+    void theConsoleOfABuildElsewhereShowsWhatWasShipped() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("shipped");
+        other.write("jobs/shipped/running/1.xml", placeholder("other-controller", "jenkins-a", 1), PersistenceStore.ABSENT);
+        awaitApplied();
+        JenkinsRule.WebClient wc = r.createWebClient();
+        assertThat(wc.goTo("job/shipped/1/console").asNormalizedText(), containsString("hello from jenkins-a"));
+        assertEquals("hello from jenkins-a\n", wc.goTo("job/shipped/1/consoleText", "text/plain").getWebResponse().getContentAsString());
+        other.delete("jobs/shipped/running/1.xml", PersistenceStore.ANY); // the store outlives this test
+    }
+
+    @TestExtension("theConsoleOfABuildElsewhereShowsWhatWasShipped")
+    public static class FixedLog implements RunningBuilds.RemoteLog {
+        @Override
+        public long copy(Job<?, ?> job, int number, long offset, java.io.OutputStream out) throws java.io.IOException {
+            byte[] log = "hello from jenkins-a\n".getBytes(StandardCharsets.UTF_8);
+            out.write(log, (int) offset, log.length - (int) offset);
+            return log.length;
+        }
+    }
+
     @TestExtension("followingABuildElsewhereEndsWithTheRestOfItsRecord")
     public static class ShippedLog implements RunningBuilds.RemoteLog {
         static byte[] prefix;
