@@ -73,28 +73,63 @@ public final class MaterializedFiles {
             copies.remove(key);
             return;
         }
-        copies.put(key, new Copy(file, entry.content(), entry.version(), file.lastModified()));
+        // dated a little in the past: any write after this one then has another modification time, even on a file
+        // system counting in seconds (or a writer keeping times), so that a change is never taken for the copy as made
+        long dated = (System.currentTimeMillis() / 1000 - 10) * 1000;
+        if (!file.setLastModified(dated)) {
+            dated = file.lastModified();
+        }
+        copies.put(key, new Copy(file, entry.content(), entry.version(), dated));
+    }
+
+    /**
+     * Forgets the copy of a key no longer stored (deleted elsewhere), and deletes it if it is still as it was made:
+     * it would otherwise hand out configuration that no longer exists. A copy changed here since is left alone.
+     */
+    public static void deletedElsewhere(@NonNull String key) {
+        Copy c = copies.remove(key);
+        if (c == null || !c.file().isFile()) {
+            return;
+        }
+        try {
+            if (Arrays.equals(Files.readAllBytes(c.file().toPath()), c.content())) {
+                Files.delete(c.file().toPath());
+            }
+        } catch (IOException e) {
+            LOGGER.log(Level.FINE, "Could not delete the stale copy " + c.file(), e);
+        }
+    }
+
+    /** What {@link #writeBack} did. */
+    public enum Outcome {
+        /** Not changed since it was made: nothing to write. */
+        UNCHANGED,
+        /** Written to the store (merged with what was stored meanwhile, if anything). */
+        WRITTEN,
+        /** No longer stored (deleted elsewhere): nothing to write it back to. */
+        STALE,
+        /** Changed, but could not be written: the copy holds a change the store has not got; leave it as it is. */
+        FAILED
     }
 
     /**
      * Writes the local copy of a routed file back to the store if it was changed since it was made.
-     *
-     * @return whether it was written
      */
-    public static boolean writeBack(@NonNull PersistenceStores.Route route) {
+    @NonNull
+    public static Outcome writeBack(@NonNull PersistenceStores.Route route) {
         Copy c = copies.get(route.key());
-        if (c == null || !c.file().isFile() || c.file().lastModified() == c.modified()) {
-            return false;
+        if (c == null || !c.file().isFile() || c.file().lastModified() == c.modified() && c.file().length() == c.content().length) {
+            return Outcome.UNCHANGED;
         }
         try {
             byte[] mine = Files.readAllBytes(c.file().toPath());
             if (Arrays.equals(mine, c.content())) {
                 copies.put(route.key(), new Copy(c.file(), c.content(), c.version(), c.file().lastModified()));
-                return false;
+                return Outcome.UNCHANGED;
             }
             byte[] written = write(route, c, mine);
             if (written == null) {
-                return false;
+                return Outcome.STALE;
             }
             if (!Arrays.equals(written, mine)) {
                 Files.write(c.file().toPath(), written); // merged with a change made elsewhere: the copy has both
@@ -104,14 +139,14 @@ public final class MaterializedFiles {
                 materialized(route.key(), c.file(), now);
             }
             LOGGER.info(() -> "Wrote " + route.key() + " back to the store: it was changed directly on disk here");
-            return true;
+            return Outcome.WRITTEN;
         } catch (IOException | RuntimeException e) {
-            LOGGER.log(Level.WARNING, "Could not write " + c.file() + " back to the store", e);
-            return false;
+            LOGGER.log(Level.WARNING, "Could not write " + c.file() + " back to the store; trying again later", e);
+            return Outcome.FAILED;
         }
     }
 
-    /** @return what was written, or null if nothing was */
+    /** @return what was written, or null if the key is no longer stored */
     @CheckForNull
     private static byte[] write(PersistenceStores.Route route, Copy c, byte[] mine) throws IOException {
         for (int attempt = 0; attempt < 5; attempt++) {
@@ -135,7 +170,7 @@ public final class MaterializedFiles {
                 // changed again meanwhile: merge against that
             }
         }
-        return null;
+        throw new IOException(route.key() + " kept changing elsewhere while being written back");
     }
 
     /** Writes changed copies back every minute (and forgets copies of files no longer stored). */

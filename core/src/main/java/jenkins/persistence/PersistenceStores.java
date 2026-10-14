@@ -1249,7 +1249,9 @@ public final class PersistenceStores {
                     // from it (the save is lost, never theirs)
                     LOGGER.log(Level.WARNING, e.getMessage() + "; cannot be merged, so not saved; reloading what is stored");
                     unresolved.incrementAndGet();
-                    ItemChangeApplier.reload(key);
+                    // the object in memory holds the refused values: reload it now (all of it), or a later save of it
+                    // would store them after all
+                    ItemChangeApplier.reloadRefused(key);
                     throw e; // shown to the user, by a form: reload, then save again
                 }
                 return merged; // seen and remembered as the object in memory has it, until it is reloaded

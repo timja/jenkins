@@ -121,6 +121,20 @@ class RunningBuildsTest {
     }
 
     @Test
+    void aCopyStillRunningOfABuildCompletedElsewhereLoadsItsRecord() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("finished-elsewhere");
+        r.buildAndAssertSuccess(p);
+        // this home's copy says running: the build was adopted and completed elsewhere while this controller was down
+        java.nio.file.Path local = new java.io.File(p.getBuildDir(), "1/build.xml").toPath();
+        String record = java.nio.file.Files.readString(local);
+        java.nio.file.Files.writeString(local, record.replaceAll("<result>[A-Z]+</result>", ""));
+
+        assertTrue(RunningBuilds.reclaim(p, 1));
+
+        assertTrue(java.nio.file.Files.readString(local).contains("<result>SUCCESS</result>"), "the record, not the stale copy");
+    }
+
+    @Test
     void runningBuildIsRecordedUntilPublished() throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("local");
         CountDownLatch started = new CountDownLatch(1);
@@ -381,7 +395,10 @@ class RunningBuildsTest {
                 return 10;
             }
             try {
-                completed.run();
+                if (completed != null) {
+                    completed.run();
+                    completed = null; // it completes once
+                }
             } catch (Exception e) {
                 throw new java.io.IOException(e);
             }
@@ -405,7 +422,10 @@ class RunningBuildsTest {
                 return prefix.length;
             }
             try {
-                completed.run();
+                if (completed != null) {
+                    completed.run();
+                    completed = null; // it completes once
+                }
             } catch (Exception e) {
                 throw new java.io.IOException(e);
             }

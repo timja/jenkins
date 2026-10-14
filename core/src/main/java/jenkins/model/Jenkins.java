@@ -3015,10 +3015,16 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
         if (n < 0) {
             throw new IllegalArgumentException("Incorrect field \"# of executors\": " + n + ". It should be a non-negative number.");
         }
-        if (this.numExecutors != n) {
-            this.numExecutors = n;
-            updateComputers(this);
-            save();
+        boolean changed;
+        synchronized (this) { // as the other setters: a reload of the configuration never overwrites the assignment
+            changed = this.numExecutors != n;
+            if (changed) {
+                this.numExecutors = n;
+                save();
+            }
+        }
+        if (changed) {
+            updateComputers(this); // outside the lock: it takes the queue's
         }
     }
 

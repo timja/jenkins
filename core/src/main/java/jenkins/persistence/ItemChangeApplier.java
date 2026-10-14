@@ -211,6 +211,20 @@ public final class ItemChangeApplier {
 
     /** The origin of {@link #reload} events (never a controller's). */
     private static final String MERGED = "(merged here)";
+    /** The origin of reloads after a save the strict-ui policy refused: applied at once, over the refused values. */
+    private static final String REFUSED = "(refused here)";
+
+    /**
+     * Reloads the object stored at a key at once, even though it has unsaved changes: they are a save that was
+     * refused, which must not reach the store later through another save of the same object.
+     */
+    static void reloadRefused(String key) {
+        ItemChangeApplier a = instance;
+        if (a != null) {
+            a.pending.incrementAndGet();
+            a.queue.add(new ChangeEvent(ChangeEvent.Kind.WRITTEN, key, null, Long.MAX_VALUE, REFUSED));
+        }
+    }
 
     // before global configuration is loaded, which item loading (requiring SYSTEM_CONFIG_ADAPTED) follows: an item read
     // before subscribing could miss a change made in between, never delivered and newer than what was read
@@ -298,7 +312,7 @@ public final class ItemChangeApplier {
                 // nor a move: a later write of its destination does not move the item from its old name (or a second
                 // one would be loaded at the new name, the moved one left where it was)
                 boolean move = e.kind() == ChangeEvent.Kind.MOVED;
-                if (!MERGED.equals(e.origin()) && latest != null && latest > e.version() && !itemDeleted && !move) {
+                if (!MERGED.equals(e.origin()) && !REFUSED.equals(e.origin()) && latest != null && latest > e.version() && !itemDeleted && !move) {
                     failures.remove(e.key()); // overtaken by a newer change of its key, which applies the latest state
                     continue;
                 }
@@ -397,7 +411,7 @@ public final class ItemChangeApplier {
                 if (e.key().equals("config.xml")) {
                     // check and reload under one lock (Jenkins.save and reloadGlobalConfig take it), as for items below
                     synchronized (jenkins) {
-                        if (jenkins.hasUnsavedGlobalChanges() && retryLater(e)) {
+                        if (!REFUSED.equals(e.origin()) && jenkins.hasUnsavedGlobalChanges() && retryLater(e)) {
                             return;
                         }
                         if (StaticStateApplier.apply(e.key(), false)) {
@@ -443,10 +457,12 @@ public final class ItemChangeApplier {
             // the new version is read outside the lock; only what changed is copied in under it (Target 15)
             ItemReload.Prepared prepared = ItemReload.prepare(existing);
             synchronized (existing) {
-                if (PersistenceStores.hasUnsavedChanges(existing.getConfigFile(), existing) && retryLater(e)) {
+                if (!REFUSED.equals(e.origin()) && PersistenceStores.hasUnsavedChanges(existing.getConfigFile(), existing) && retryLater(e)) {
                     return; // its save is pending: it will conflict and be merged, and reloaded with both changes
                 }
-                if (prepared == null || !ItemReload.apply(existing, prepared)) {
+                // after a refused save, all of it: field by field only copies what changed in the store, which would
+                // leave the refused values (changed in memory only) where they are
+                if (REFUSED.equals(e.origin()) || prepared == null || !ItemReload.apply(existing, prepared)) {
                     PersistenceStores.reload(existing.getConfigFile(), existing, existing::load); // a display name cleared, say
                 }
                 PersistenceStores.synced(existing.getConfigFile(), existing);

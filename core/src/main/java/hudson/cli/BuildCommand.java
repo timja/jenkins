@@ -240,13 +240,26 @@ public class BuildCommand extends CLICommand {
         if (!(sync || follow)) {
             return 0;
         }
-        if (consoleOutput) {
-            jenkins.persistence.RunningBuilds.followElsewhere(job, number, true, stdout);
-        }
         Run<?, ?> done;
-        do {
-            done = jenkins.persistence.RunningBuilds.awaitRecord(job, number, 60);
-        } while (done == null);
+        try {
+            if (consoleOutput) {
+                jenkins.persistence.RunningBuilds.followElsewhere(job, number, true, stdout);
+            }
+            do {
+                done = jenkins.persistence.RunningBuilds.awaitRecord(job, number, 60);
+            } while (done == null);
+        } catch (InterruptedException e) {
+            // as for a build running here: -f leaves it running, -s stops it (if allowed)
+            if (follow) {
+                return 125;
+            }
+            if (job.hasPermission(Item.CANCEL)) {
+                jenkins.persistence.RunningBuilds.requestStop(job, number, Jenkins.getAuthentication2().getName());
+            }
+            Exception myException = new AbortException();
+            myException.initCause(e);
+            throw myException;
+        }
         stdout.println("Completed " + done.getFullDisplayName() + " : " + done.getResult());
         return done.getResult().ordinal;
     }

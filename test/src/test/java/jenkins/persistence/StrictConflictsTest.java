@@ -110,6 +110,13 @@ class StrictConflictsTest {
         assertThat(new String(STORE.read("jobs/strict/config.xml").content(), StandardCharsets.UTF_8),
                 containsString("<description>theirs</description>"));
         assertTrue(e.getStatusCode() >= 400, "an error for the user: " + e.getStatusCode());
+        // the job in memory got the refused value: it is reloaded, so that a later save (not refused: no request)
+        // does not store it after all
+        awaitApplied();
+        assertEquals("theirs", p.getDescription());
+        p.save();
+        assertThat(new String(STORE.read("jobs/strict/config.xml").content(), StandardCharsets.UTF_8),
+                containsString("<description>theirs</description>"));
     }
 
     @Test

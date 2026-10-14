@@ -167,8 +167,11 @@ public final class XmlFile {
     public File getFile() {
         PersistenceStores.Route route = route();
         if (route != null) {
-            MaterializedFiles.writeBack(route); // changed on disk since the last copy (Target 15): keep that change
-            materialize(route);
+            // changed on disk since the last copy (Target 15): keep that change; and should writing it fail, keep the
+            // copy as it is rather than replace it with the stored content
+            if (MaterializedFiles.writeBack(route) != MaterializedFiles.Outcome.FAILED) {
+                materialize(route);
+            }
         }
         return file;
     }
@@ -524,6 +527,7 @@ public final class XmlFile {
         try {
             PersistenceStore.Entry entry = route.peek();
             if (entry == null) {
+                MaterializedFiles.deletedElsewhere(route.key()); // a copy made earlier, of what is no longer stored
                 return;
             }
             if (file.isFile() && Arrays.equals(Files.readAllBytes(file.toPath()), entry.content())) {

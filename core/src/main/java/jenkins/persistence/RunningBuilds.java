@@ -532,7 +532,17 @@ public final class RunningBuilds {
                 LOGGER.info(() -> job.getFullName() + " #" + number + " was adopted by " + p.controller + " while this controller restarted; not resuming it here");
                 return false;
             }
-            return true; // completed meanwhile
+            if (completedLocally(local)) {
+                return true; // completed here before the restart
+            }
+            // no placeholder, and the copy here says running: it completed elsewhere (adopted while this controller was
+            // down): load its record, not this copy, which would resume it a second time
+            if (BuildRecords.materialize(job, local.getParentFile())) {
+                LOGGER.info(() -> job.getFullName() + " #" + number + " completed elsewhere while this controller restarted; loading its record");
+                return true;
+            }
+            LOGGER.info(() -> job.getFullName() + " #" + number + " is neither running nor recorded anywhere; not resuming it here");
+            return false;
         }
         if (store.getOrigin().equals(p.origin)) {
             return true;
@@ -1110,6 +1120,9 @@ public final class RunningBuilds {
     @Restricted(Beta.class)
     public static boolean followElsewhere(@NonNull Job<?, ?> job, int number, boolean follow, @NonNull java.io.OutputStream out)
             throws IOException, InterruptedException {
+        if (runningKey(job) == null) {
+            return false; // no builds of it run elsewhere (no store, or one not sharing its builds): "no such build"
+        }
         // a build another controller just started (as the shared queue told build -s) may not be known here yet: when
         // following, wait a little for its placeholder, or for its record if it completed meanwhile
         long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(follow ? 15 : 0);
@@ -1140,8 +1153,10 @@ public final class RunningBuilds {
             if (next < 0 && !follow) {
                 return offset > 0; // nobody can read it
             }
-            if (next < 0 && offset == 0 && isRunningElsewhere(job, number)) {
-                // following a build whose log has not been shipped yet (its owner ships every few seconds): wait for it
+            Run<?, ?> recorded = next < 0 ? job.getBuildByNumber(number) : null;
+            if (next < 0 && (recorded == null || recorded.isLogUpdated()) && isRunningElsewhere(job, number)) {
+                // following a build whose log cannot be read now (not shipped yet, or not for a moment): it still runs,
+                // so wait for it, rather than for a record that only comes when it completes
                 Thread.sleep(1000);
                 invalidate(jobKeyOfRunning(runningKey(job)));
                 continue;

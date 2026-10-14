@@ -33,9 +33,11 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.PeepholePermalink;
+import jenkins.util.Timer;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 
@@ -80,6 +82,10 @@ public final class StoredPermalinks implements PeepholePermalink.Cache {
 
     @Override
     public void put(@NonNull Job<?, ?> job, @NonNull String id, @NonNull Known target) {
+        put(job, id, target, 0);
+    }
+
+    private void put(@NonNull Job<?, ?> job, @NonNull String id, @NonNull Known target, int retry) {
         String builds = BuildRecords.buildsKey(job);
         if (builds == null) {
             next().put(job, id, target);
@@ -113,10 +119,19 @@ public final class StoredPermalinks implements PeepholePermalink.Cache {
                 }
             }
         } catch (IOException | RuntimeException x) {
-            LOGGER.log(Level.FINE, "Could not store " + id + " of " + job + "; kept here only", x);
+            LOGGER.log(Level.FINE, "Could not store " + id + " of " + job + "; kept here meanwhile", x);
         }
         caches.computeIfAbsent(builds, k -> new ConcurrentHashMap<>()).put(id, target);
+        // other controllers take the shared value for granted (they ignore the record's event for permalinks): try
+        // again, or they would keep the old target until the next build; a newer target stored since is kept (above)
+        if (retry < MAX_RETRIES) {
+            Timer.get().schedule(() -> put(job, id, target, retry + 1), 1L << Math.min(retry + 1, 6), TimeUnit.SECONDS);
+        } else {
+            LOGGER.warning(() -> "Could not store " + id + " of " + job + "; other controllers may show an older build until the next");
+        }
     }
+
+    private static final int MAX_RETRIES = 10;
 
     /** The cache of a job changed (or went) elsewhere: read it again when next needed. */
     static void changedElsewhere(@NonNull String builds) {
