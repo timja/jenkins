@@ -28,6 +28,7 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -36,11 +37,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import hudson.model.Action;
 import hudson.model.Cause;
 import hudson.model.CauseAction;
+import hudson.model.FreeStyleBuild;
 import hudson.model.FreeStyleProject;
 import hudson.model.ParametersAction;
 import hudson.model.PasswordParameterValue;
 import hudson.model.Queue;
 import hudson.model.StringParameterValue;
+import hudson.model.queue.QueueTaskFuture;
 import java.util.Calendar;
 import java.util.List;
 import java.util.Objects;
@@ -64,9 +67,74 @@ class SharedQueueTest {
             key -> key.startsWith("jobs/") && (key.endsWith("/config.xml") || key.endsWith("/nextBuildNumber")) && !key.contains("/builds/")) {
         @Override
         public ClusterQueue queue() {
-            return clusterQueue();
+            return slowFor(clusterQueue());
         }
     };
+
+    /** While set, publishing an item of job "slow" waits for it: a store answering slowly. */
+    static volatile java.util.concurrent.CountDownLatch slowPublish;
+
+    private static ClusterQueue slowFor(ClusterQueue cq) {
+        return new ClusterQueue() {
+            @Override
+            public long nextId() throws java.io.IOException {
+                return cq.nextId();
+            }
+
+            @Override
+            public Record publish(Record item) throws java.io.IOException {
+                java.util.concurrent.CountDownLatch l = slowPublish;
+                if (l != null && item.task().equals("slow")) {
+                    try {
+                        l.await();
+                    } catch (InterruptedException e) {
+                        throw new java.io.InterruptedIOException();
+                    }
+                }
+                return cq.publish(item);
+            }
+
+            @Override
+            public void update(long id, String actions, long dueAt) throws java.io.IOException {
+                cq.update(id, actions, dueAt);
+            }
+
+            @Override
+            public boolean update(long id, String expectedActions, String actions, long dueAt) throws java.io.IOException {
+                return cq.update(id, expectedActions, actions, dueAt);
+            }
+
+            @Override
+            public boolean claim(long id) throws java.io.IOException {
+                return cq.claim(id);
+            }
+
+            @Override
+            public void started(long id, int buildNumber) throws java.io.IOException {
+                cq.started(id, buildNumber);
+            }
+
+            @Override
+            public boolean cancel(long id) throws java.io.IOException {
+                return cq.cancel(id);
+            }
+
+            @Override
+            public Record get(long id) throws java.io.IOException {
+                return cq.get(id);
+            }
+
+            @Override
+            public List<Record> pending() throws java.io.IOException {
+                return cq.pending();
+            }
+
+            @Override
+            public AutoCloseable subscribe(java.util.function.Consumer<Record> listener) {
+                return cq.subscribe(listener);
+            }
+        };
+    }
 
     private JenkinsRule r;
     private ClusterQueue other;
@@ -172,6 +240,10 @@ class SharedQueueTest {
         p.scheduleBuild2(60, new CauseAction(new Cause.UserIdCause("dave")));
 
         assertEquals(1, Queue.getInstance().getItems().length, "one item");
+        // shared off the queue lock, by the outbox
+        for (int i = 0; i < 100 && !causes(STORE.clusterQueue().get(rec.id())).contains("dave"); i++) {
+            Thread.sleep(100);
+        }
         ClusterQueue.Record now = STORE.clusterQueue().get(rec.id());
         assertThat(causes(now), containsString("carol"));
         assertThat(causes(now), containsString("dave"));
@@ -210,6 +282,36 @@ class SharedQueueTest {
         assertThat(json, containsString("\"executable\":{"));
         assertThat(json, containsString("\"number\":7"));
         assertThat(json, containsString("\"cancelled\":false"));
+    }
+
+    @Test
+    void aStoreSlowToPublishDoesNotHoldUpTheQueue() throws Exception {
+        FreeStyleProject slow = r.createFreeStyleProject("slow");
+        FreeStyleProject quick = r.createFreeStyleProject("quick");
+        slowPublish = new java.util.concurrent.CountDownLatch(1);
+        try {
+            long before = System.nanoTime();
+            QueueTaskFuture<FreeStyleBuild> s = slow.scheduleBuild2(0);
+            assertTrue(System.nanoTime() - before < java.util.concurrent.TimeUnit.SECONDS.toNanos(2), "scheduling does not wait for the store");
+            r.assertBuildStatusSuccess(quick.scheduleBuild2(0)); // the queue goes on meanwhile
+            assertNull(slow.getLastBuild(), "not started before it is shared");
+            slowPublish.countDown();
+            r.assertBuildStatusSuccess(s);
+        } finally {
+            slowPublish.countDown();
+            slowPublish = null;
+        }
+    }
+
+    @Test
+    void foldsMadeAtOnceAreBothKept() throws Exception {
+        ClusterQueue.Record rec = publishElsewhere("folds", 60_000, "eve");
+        ClusterQueue cq = STORE.clusterQueue();
+        String read = cq.get(rec.id()).actions();
+        // two controllers merged their causes into what they both read: the second must merge again
+        assertTrue(cq.update(rec.id(), read, read.replace("eve", "first"), rec.dueAt()));
+        assertFalse(cq.update(rec.id(), read, read.replace("eve", "second"), rec.dueAt()));
+        other.cancel(rec.id()); // the store outlives this test
     }
 
     @Test

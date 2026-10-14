@@ -221,6 +221,24 @@ public class InMemoryPersistenceStore implements PersistenceStore {
             }
 
             @Override
+            public boolean update(long id, @NonNull String expectedActions, @NonNull String actions, long dueAt) {
+                Record next;
+                synchronized (root) {
+                    Record r = queueRecords.get(id);
+                    if (r == null || r.state() != State.WAITING || !r.actions().equals(expectedActions)) {
+                        return false;
+                    }
+                    next = with(r, r.state(), r.claimedBy(), r.buildNumber(), actions, Math.min(r.dueAt(), dueAt));
+                    if (next.equals(r)) {
+                        return true;
+                    }
+                    queueRecords.put(id, next);
+                }
+                fire(next);
+                return true;
+            }
+
+            @Override
             public boolean claim(long id) {
                 Record next;
                 synchronized (root) {
