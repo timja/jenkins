@@ -1235,6 +1235,15 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
         if (deleted) {
             if (known != null) {
                 AllUsers.remove(known.id);
+                UserDetailsCache.get().invalidate(idStrategy().keyFor(known.id)); // nor sign in on what was cached
+            }
+            File dir = new File(getUsersDirectory(), dirName);
+            if (!dirName.equals(".") && !dirName.equals("..") && getUsersDirectory().equals(dir.getParentFile())) {
+                try {
+                    Util.deleteRecursive(dir); // its local copy too: nothing here brings it back
+                } catch (IOException e) {
+                    LOGGER.log(Level.WARNING, "Could not delete the local copy of user " + dirName + ", deleted elsewhere", e);
+                }
             }
         } else if (known != null) {
             known.load();

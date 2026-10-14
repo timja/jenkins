@@ -25,12 +25,17 @@
 package jenkins.persistence;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import hudson.model.Label;
 import hudson.model.Node;
 import hudson.model.User;
+import hudson.security.HudsonPrivateSecurityRealm;
+import java.io.File;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -41,6 +46,7 @@ import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.TestExtension;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
 
 /**
  * Static state changed by another controller (simulated by a store view with another origin) is applied without a restart.
@@ -115,14 +121,33 @@ class StaticStateApplierTest {
         other.delete(aliceKey, PersistenceStore.ANY);
         awaitApplied();
         assertNull(User.getById("alice", false), "deleted elsewhere");
+        assertFalse(new File(r.jenkins.getRootDir(), aliceKey).exists(), "and its local copy");
+    }
+
+    @Test
+    void aUserDeletedElsewhereCannotSignInHere() throws Exception {
+        HudsonPrivateSecurityRealm realm = new HudsonPrivateSecurityRealm(false, false, null);
+        r.jenkins.setSecurityRealm(realm);
+        realm.createAccount("carol", "carol-password-1");
+        assertNotNull(realm.loadUserByUsername2("carol")); // cached here
+        String carolKey = STORE.children("users").stream().filter(d -> d.startsWith("carol_")).map(d -> "users/" + d + "/config.xml").findFirst().orElseThrow();
+
+        other.delete(carolKey, PersistenceStore.ANY);
+        awaitApplied();
+
+        assertThrows(UsernameNotFoundException.class, () -> realm.loadUserByUsername2("carol"));
+        JenkinsRule.WebClient wc = r.createWebClient();
+        assertThrows(Exception.class, () -> wc.login("carol", "carol-password-1"));
     }
 
     @Test
     void nodesChangedCreatedAndDeletedElsewhere() throws Exception {
         r.createSlave("n1", "old-label", null);
+        assertEquals(1, Label.get("old-label").getNodes().size());
         writeElsewhere("nodes/n1/config.xml", text("nodes/n1/config.xml").replace("old-label", "new-label"));
         Node n1 = r.jenkins.getNode("n1");
         assertEquals("new-label", n1.getLabelString());
+        assertTrue(Label.get("old-label").getNodes().isEmpty(), "the label removed elsewhere has left the node");
         assertEquals(n1, n1.toComputer().getNode(), "computer bound to the reloaded node");
 
         writeElsewhere("nodes/n2/config.xml", text("nodes/n1/config.xml").replace("<name>n1</name>", "<name>n2</name>"));
