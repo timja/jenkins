@@ -1016,6 +1016,12 @@ public final class BuildRecords {
     /** Publishes a completed build's record, then removes its running placeholder; queues a retry if either fails. */
     static void complete(@NonNull Run<?, ?> run) {
         String key = run.getParent().getFullName() + "#" + run.getNumber();
+        if (isShared(run.getParent()) && !new File(run.getRootDir(), RECORD).isFile()) {
+            // nothing to publish: keep its placeholder rather than let it vanish everywhere without a record (it is
+            // closed as aborted elsewhere once this controller is gone)
+            LOGGER.warning(() -> run + " completed without a " + RECORD + "; not publishing it, and keeping it as running");
+            return;
+        }
         try {
             publish(run);
         } catch (LeaseLostException e) {

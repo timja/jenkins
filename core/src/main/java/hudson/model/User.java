@@ -1289,11 +1289,16 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
                 if (jenkins.persistence.PersistenceStores.hasUnsavedChanges(known.getConfigFile(), known)) {
                     throw new IllegalStateException("User " + known.id + " has a save pending; applying the change later");
                 }
+                // load() takes a read failure for "no configuration" and resets the user (its password, tokens) to
+                // defaults: read it first, so that a store unavailable now fails this change, which is then retried
+                jenkins.persistence.PersistenceStores.Route route = jenkins.persistence.PersistenceStores.route(known.getConfigFile().getPath());
                 try {
+                    if (route != null && route.read() == null) {
+                        return; // deleted meanwhile: that deletion is applied in turn
+                    }
                     PersistenceStores.reload(known.getConfigFile(), known, known::load); // a description cleared, say
                 } catch (IOException e) {
-                    LOGGER.log(Level.WARNING, "Failed to read user " + dirName + ", changed elsewhere", e);
-                    known.load();
+                    throw new java.io.UncheckedIOException("Cannot read user " + known.id + " changed elsewhere; applying the change later", e);
                 }
                 jenkins.persistence.PersistenceStores.synced(known.getConfigFile(), known);
             }
@@ -1310,7 +1315,8 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
                     }
                 }
             } catch (IOException e) {
-                LOGGER.log(Level.WARNING, "Failed to load " + xml, e);
+                // retried by the applier: dropping it would leave the user missing here until it changes again
+                throw new java.io.UncheckedIOException("Failed to load " + xml + ", made elsewhere", e);
             }
         }
         UserDetailsCache.get().invalidateAll();

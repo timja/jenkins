@@ -97,12 +97,19 @@ public final class ItemChangeApplier {
     };
     /** Changes received and not yet fully processed. */
     private final AtomicLong pending = new AtomicLong();
+    /**
+     * The newest version received of each key with a change not yet applied: a change retried after a failure is
+     * dropped once a newer one of its key arrived (which applies the key's state as of then), so that it never undoes
+     * that one, as a delete retried after the key was made again would.
+     */
+    private final Map<String, Long> newest = new java.util.concurrent.ConcurrentHashMap<>();
     private Thread worker;
 
     private ItemChangeApplier(Jenkins jenkins, PersistenceStore store) {
         this.jenkins = jenkins;
         this.store = store;
         this.subscription = store.subscribe(e -> {
+            newest.merge(e.key(), e.version(), Math::max);
             pending.incrementAndGet();
             queue.add(e);
         });
@@ -130,6 +137,8 @@ public final class ItemChangeApplier {
     /** How many times a change that failed to apply has been retried, by key. */
     private final Map<String, Integer> failures = new java.util.concurrent.ConcurrentHashMap<>();
     private static final int MAX_FAILURES = 8;
+    /** After those, retries every five minutes, for an hour. */
+    private static final int LATE_RETRIES = 12;
 
     /**
      * Puts off applying a change to an object with a save pending, for a second, at most {@link #MAX_RETRIES} times.
@@ -277,19 +286,27 @@ public final class ItemChangeApplier {
                 return;
             }
             try {
+                Long latest = newest.get(e.key());
+                if (!MERGED.equals(e.origin()) && latest != null && latest > e.version()) {
+                    failures.remove(e.key()); // overtaken by a newer change of its key, which applies the latest state
+                    continue;
+                }
                 apply(e);
                 failures.remove(e.key());
+                newest.remove(e.key(), e.version());
             } catch (Exception | LinkageError x) {
-                // e.g. the store was unreachable while reading the new content: try again a few times with backoff,
-                // or this controller keeps the old version until the next change of that key (Target 14)
+                // e.g. the store was unreachable while reading the new content: try again with backoff, then every few
+                // minutes for a while, or this controller would keep the old version until the key changes again
                 int n = failures.merge(e.key(), 1, Integer::sum);
-                if (n <= MAX_FAILURES) {
-                    LOGGER.log(Level.INFO, "Failed to apply " + e + "; retrying (" + n + "/" + MAX_FAILURES + ")", x);
+                if (n <= MAX_FAILURES + LATE_RETRIES) {
+                    long delay = n <= MAX_FAILURES ? Math.min(60, 1L << n) : 300;
+                    LOGGER.log(n == MAX_FAILURES + 1 ? Level.WARNING : Level.INFO, "Failed to apply " + e + "; retrying (" + n + ") in " + delay + " s", x);
                     pending.incrementAndGet();
-                    Timer.get().schedule(() -> queue.add(e), Math.min(60, 1L << n), java.util.concurrent.TimeUnit.SECONDS);
+                    Timer.get().schedule(() -> queue.add(e), delay, java.util.concurrent.TimeUnit.SECONDS);
                 } else {
                     failures.remove(e.key());
-                    LOGGER.log(Level.WARNING, "Failed to apply " + e, x);
+                    newest.remove(e.key(), e.version());
+                    LOGGER.log(Level.WARNING, "Failed to apply " + e + "; giving up until its key changes again", x);
                 }
             } finally {
                 retire(e);
