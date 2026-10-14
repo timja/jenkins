@@ -143,6 +143,12 @@ public final class RunningBuilds {
         }
 
         /** The lease epoch of the owner when it wrote this placeholder, or 0 if the store has no leases. */
+        /** Its key in the store, which is also the key of its lease. */
+        @NonNull
+        public String getKey() {
+            return key;
+        }
+
         public long getEpoch() {
             return epoch;
         }

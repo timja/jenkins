@@ -41,6 +41,7 @@ import hudson.model.FreeStyleBuild;
 import hudson.model.FreeStyleProject;
 import hudson.model.Job;
 import hudson.model.Result;
+import hudson.model.Run;
 import hudson.model.queue.QueueTaskFuture;
 import java.io.File;
 import java.nio.charset.StandardCharsets;
@@ -161,6 +162,39 @@ class BuildLeasesTest {
         assertEquals(Result.ABORTED, b.getResult());
         assertNull(text("jobs/contested/running/1.xml"), "no placeholder of its own");
         assertNull(text("jobs/contested/builds/1/build.xml"), "not published from here");
+    }
+
+    @Test
+    void aBuildTakenOverWhilePublishingIsNotPublishedFromHere() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("fenced");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p); // published while TakeOverWhilePublishing takes it over
+        assertNull(text("jobs/fenced/builds/1/build.xml"), "the record is not written: the lease was lost");
+        assertNull(BLOBS.get("jobs/fenced/builds/1/files.tgz"), "nor its snapshot put in place");
+        assertNotNull(text("jobs/fenced/running/1.xml"), "the new owner's placeholder is left alone");
+        assertTrue(RunningBuilds.wasLost(b));
+        // the store outlives this test
+        STORE.delete("jobs/fenced/running/1.xml", PersistenceStore.ANY);
+        STORE.delete("jobs/fenced/config.xml", PersistenceStore.ANY);
+    }
+
+    /** Takes over the lease of a build of "fenced" as it is being published, after the check made before publishing. */
+    @TestExtension("aBuildTakenOverWhilePublishingIsNotPublishedFromHere")
+    public static class TakeOverWhilePublishing implements BuildRecords.Exclusion {
+        @Override
+        public java.util.Collection<String> excludes(Run<?, ?> run) {
+            if (run.getParent().getName().equals("fenced")) {
+                try {
+                    live = Set.of("new-owner"); // this controller's membership lapsed
+                    PersistenceStore owner = STORE.as("new-owner");
+                    long epoch = owner.leases().acquire("jobs/fenced/running/1.xml");
+                    owner.write("jobs/fenced/running/1.xml", placeholder("new-owner", 1, epoch, ""), PersistenceStore.ANY);
+                    live = null;
+                } catch (java.io.IOException e) {
+                    throw new AssertionError(e);
+                }
+            }
+            return List.of();
+        }
     }
 
     @Test
