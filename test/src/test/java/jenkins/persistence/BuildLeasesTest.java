@@ -297,6 +297,22 @@ class BuildLeasesTest {
     }
 
     @Test
+    void aControllerNeverTakesItselfForGone() throws Exception {
+        // e.g. its own heartbeat late under load: the store's live set lacks it for a moment; its builds stay its own
+        // (fencing handles a membership that really lapsed), or it would adopt and resume a build it is still running
+        r.createFreeStyleProject("mine");
+        String key = "jobs/mine/running/1.xml";
+        long epoch = STORE.leases().acquire(key);
+        STORE.write(key, placeholder(STORE.getOrigin(), 1, epoch, "x.savePoint=3\n"), PersistenceStore.ABSENT);
+        live = Set.of("another-controller");
+
+        assertEquals(0, RunningBuilds.removeStale());
+
+        assertTrue(Adopter.prepared.isEmpty(), Adopter.prepared::toString);
+        assertNotNull(text(key), "its placeholder is left alone");
+    }
+
+    @Test
     void buildOfDeadControllerIsAdopted() throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("orphan");
         String key = "jobs/orphan/running/1.xml";
