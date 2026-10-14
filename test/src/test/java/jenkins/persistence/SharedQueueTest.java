@@ -53,11 +53,13 @@ import hudson.model.TopLevelItem;
 import hudson.model.TopLevelItemDescriptor;
 import hudson.model.queue.FoldableAction;
 import hudson.model.queue.QueueTaskFuture;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Calendar;
-import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import jenkins.model.Jenkins;
 import org.htmlunit.HttpMethod;
@@ -345,6 +347,15 @@ class SharedQueueTest {
             assertEquals(STORE.getOrigin(), STORE.clusterQueue().get(rec.id()).claimedBy());
         } finally {
             SharedQueue.ORIGIN_GRACE_MILLIS = grace;
+        }
+    }
+
+    @Test
+    void theControllersLeftAgreeWhichOfThemProvisions() {
+        for (long id = 1; id <= 50; id++) {
+            String one = SharedQueue.provisioner(id, Set.of("a", "b", "c"));
+            assertEquals(one, SharedQueue.provisioner(id, new LinkedHashSet<>(List.of("c", "b", "a"))), "whichever asks");
+            assertTrue(Set.of("a", "b", "c").contains(one));
         }
     }
 

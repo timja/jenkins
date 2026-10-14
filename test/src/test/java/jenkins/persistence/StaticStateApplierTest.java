@@ -520,6 +520,18 @@ class StaticStateApplierTest {
     }
 
     @Test
+    void aCloudAgentOfThisControllerSurvivesItsRestart() throws Exception {
+        r.jenkins.addNode(new TestCloudAgent("pod3"));
+        PersistenceStores.keepLocal("nodes/pod3/config.xml", false); // what a restart forgets
+        r.jenkins.getNodesObject().load();
+        assertNotNull(r.jenkins.getNode("pod3"), "loaded from here, though the store never had it");
+        assertTrue(PersistenceStores.isKeptLocal("nodes/pod3/config.xml"));
+
+        r.jenkins.removeNode(r.jenkins.getNode("pod3"));
+        assertFalse(PersistenceStores.isKeptLocal("nodes/pod3/config.xml"), "a node of that name later is shared again");
+    }
+
+    @Test
     void pluginStateGoesToItsHandler() throws Exception {
         writeElsewhere("custom.plugin.xml", "<x/>");
         assertEquals(List.of("custom.plugin.xml false"), Handler.seen);

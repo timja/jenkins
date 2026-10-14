@@ -347,6 +347,8 @@ public class Nodes implements PersistenceRoot {
             });
             // no need for a full save() so we just do the minimum
             LOGGER.fine(() -> "deleting " + new File(getRootDir(), node.getNodeName()));
+            // before deleting: getConfigFile(Node) keeps a cloud agent's key local, which the deletion then undoes
+            XmlFile config = getConfigFile(node);
             deleteNodeDir(node.getNodeName());
 
             if (match.get()) {
@@ -354,7 +356,7 @@ public class Nodes implements PersistenceRoot {
                 jenkins.trimLabels(node);
             }
             NodeListener.fireOnDeleted(node);
-            SaveableListener.fireOnDeleted(node, getConfigFile(node));
+            SaveableListener.fireOnDeleted(node, config);
         }
     }
 
@@ -453,15 +455,26 @@ public class Nodes implements PersistenceRoot {
         final File[] localDirs = nodesDir.listFiles(File::isDirectory);
         // nodes may also exist only in a persistence store shared with other controllers
         final Set<File> subdirs = new TreeSet<>(localDirs == null ? List.of() : Arrays.asList(localDirs));
-        for (String name : PersistenceStores.storedItemNames(nodesDir)) {
+        final Set<String> stored = PersistenceStores.storedItemNames(nodesDir);
+        for (String name : stored) {
             subdirs.add(new File(nodesDir, name));
         }
         final Map<String, Node> newNodes = new TreeMap<>();
         {
             for (File subdir : subdirs) {
                 try {
-                    Node n = load(subdir, newNodes);
                     boolean local = localDirs != null && Arrays.asList(localDirs).contains(subdir);
+                    // only here (this controller's cloud agent, never written to the store): read it from here, which
+                    // routing to the store would not find, and keep it here if it is a cloud agent
+                    String key = PersistenceStores.keyFor(new File(subdir, "config.xml"));
+                    boolean onlyHere = local && key != null && !stored.contains(subdir.getName());
+                    if (onlyHere) {
+                        PersistenceStores.keepLocal(key, true);
+                    }
+                    Node n = load(subdir, newNodes);
+                    if (onlyHere && !(n instanceof AbstractCloudSlave)) {
+                        PersistenceStores.keepLocal(key, false); // a permanent node: shared from its next save
+                    }
                     if (n != null && !local && launchedElsewhere(n, subdir)) {
                         newNodes.remove(n.getNodeName()); // only in the store: another controller's cloud agent
                     }
