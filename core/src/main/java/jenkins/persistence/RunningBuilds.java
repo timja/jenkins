@@ -604,7 +604,8 @@ public final class RunningBuilds {
         if (key == null) {
             return;
         }
-        Placeholder p = owned.remove(key);
+        // kept until all is done: should a delete fail, the retry still knows the epoch to release the lease with
+        Placeholder p = owned.get(key);
         PersistenceStore store = PersistenceStores.get();
         store.delete(key, p == null ? PersistenceStore.ANY : p.version);
         store.delete(key.substring(0, key.length() - SUFFIX.length()) + STOP_SUFFIX, PersistenceStore.ANY);
@@ -612,6 +613,7 @@ public final class RunningBuilds {
         if (leases != null && p != null) {
             leases.release(key, p.epoch);
         }
+        owned.remove(key);
         invalidate(jobKeyOfRunning(runningKey(run.getParent())));
     }
 
@@ -696,6 +698,10 @@ public final class RunningBuilds {
             try {
                 started(run);
                 unregistered.remove(id);
+                if (!run.isLogUpdated()) {
+                    finished(run); // it completed while being recorded: no placeholder of a completed build is left
+                    continue;
+                }
                 LOGGER.info(() -> "Recorded " + run + " as running, after the store was back");
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.FINE, "Still cannot record " + run + " as running", e);
@@ -731,9 +737,6 @@ public final class RunningBuilds {
     @Restricted(Beta.class)
     public static void sweepSoon() {
         jenkins.util.Timer.get().submit(() -> {
-            if (!sweeping.compareAndSet(false, true)) {
-                return; // one sweep at a time; the periodic one follows anyway
-            }
             try (hudson.security.ACLContext ignored = hudson.security.ACL.as2(hudson.security.ACL.SYSTEM2)) {
                 int n = removeStale();
                 if (n > 0) {
@@ -741,8 +744,6 @@ public final class RunningBuilds {
                 }
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.WARNING, "Could not sweep the builds of controllers which left", e);
-            } finally {
-                sweeping.set(false);
             }
         });
     }
@@ -754,6 +755,19 @@ public final class RunningBuilds {
      */
     @Restricted(NoExternalUse.class)
     public static int removeStale() throws IOException {
+        // one sweep at a time, whichever way it was started (the periodic one, or sweepSoon): leases are reentrant for
+        // this controller, so two at once could both adopt, and resume, the same build
+        if (!sweeping.compareAndSet(false, true)) {
+            return 0; // another sweep is under way; the periodic one follows anyway
+        }
+        try {
+            return sweep();
+        } finally {
+            sweeping.set(false);
+        }
+    }
+
+    private static int sweep() throws IOException {
         PersistenceStore store = PersistenceStores.get();
         Set<String> live = store == null ? null : store.liveOrigins();
         if (live == null) {
@@ -1041,6 +1055,9 @@ public final class RunningBuilds {
                 return Adoption.NONE;
             }
             Placeholder p = Placeholder.fromBytes(key, number, entry.content(), entry.version());
+            if (p != null && store.getOrigin().equals(p.origin)) {
+                return Adoption.ADOPTED; // this controller has it already (a sweep listed it as it was): its lease stays
+            }
             BuildAdopter.Adoption adoption = p == null ? null : prepare(job, p);
             if (adoption == null) {
                 return Adoption.NONE;
@@ -1303,9 +1320,10 @@ public final class RunningBuilds {
     }
 
     /**
-     * A build running on another controller, as the REST API shows it among a job's builds (Target 14): the same
-     * properties, with the same visibility, as a {@link Run} that is building. Its own URL (and API) is answered by the
-     * controller running it.
+     * A build running on another controller, as the REST API shows it among a job's builds (Target 14): the main
+     * properties, with the same visibility, of a {@link Run} that is building. Its actions (parameters, causes, …) are
+     * known to the controller running it only: they are listed empty here, and its own URL (and API), which that
+     * controller answers, has them.
      */
     @ExportedBean
     @Restricted(Beta.class)
@@ -1326,6 +1344,12 @@ public final class RunningBuilds {
         @Exported(visibility = 2)
         public String getUrl() {
             return Jenkins.get().getRootUrlFromRequest() + job.getUrl() + p.number + "/";
+        }
+
+        /** None known here: see the build's own API, which the controller running it answers. */
+        @Exported
+        public List<hudson.model.Action> getActions() {
+            return List.of();
         }
 
         @Exported

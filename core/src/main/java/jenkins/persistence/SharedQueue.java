@@ -407,6 +407,11 @@ public final class SharedQueue {
             if (PersistenceStores.isApplyingRemoteChange() || !shared(wi.task)) {
                 return;
             }
+            if (wi.getId() >= Ids.LOCAL_RANGE) {
+                // a local id, taken while the cluster sequence was unreachable: another controller may have taken the
+                // same one, so it is never shared; it stays (and builds) here
+                return;
+            }
             // under the queue lock (schedule2): only prepared here, shared by the outbox; it does not start meanwhile
             List<Action> actions = List.copyOf(wi.getActions());
             ClusterQueue.Record record = record(wi, actions);
