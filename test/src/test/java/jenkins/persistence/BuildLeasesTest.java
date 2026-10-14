@@ -227,6 +227,29 @@ class BuildLeasesTest {
     }
 
     @Test
+    void adoptionWaitsWhileAnotherBuildOfTheJobRunsElsewhere() throws Exception {
+        r.createFreeStyleProject("serial"); // one build at a time
+        String key = "jobs/serial/running/1.xml";
+        long deadEpoch = dead.leases().acquire(key);
+        dead.write(key, placeholder("dead-controller", 1, deadEpoch, "x.savePoint=3\n"), PersistenceStore.ABSENT);
+        // a third controller started a newer build of it meanwhile
+        PersistenceStore third = STORE.as("third");
+        long exclusive = third.leases().acquire("jobs/serial/running/exclusive");
+        assertThat(exclusive, greaterThan(0L));
+        live = Set.of(STORE.getOrigin(), "third");
+
+        RunningBuilds.removeStale();
+
+        assertTrue(Adopter.resumed.isEmpty(), "not resumed while the other build runs");
+        assertNotNull(text(key), "left for a later sweep");
+        assertThat(Adopter.abandoned.get(), greaterThan(0));
+        // the store outlives this test
+        third.leases().release("jobs/serial/running/exclusive", exclusive);
+        STORE.delete(key, PersistenceStore.ANY);
+        STORE.delete("jobs/serial/config.xml", PersistenceStore.ANY);
+    }
+
+    @Test
     void buildOfDeadControllerIsAdopted() throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("orphan");
         String key = "jobs/orphan/running/1.xml";

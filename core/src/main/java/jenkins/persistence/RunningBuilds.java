@@ -373,7 +373,12 @@ public final class RunningBuilds {
                 epoch, Map.of(), PersistenceStore.ABSENT);
         long version = store.write(key, p.toBytes(), PersistenceStore.ANY);
         owned.put(key, new Placeholder(key, p.number, p.origin, p.controller, p.displayName, p.startTime, epoch, Map.of(), version));
-        invalidate(jobKeyOfRunning(runningKey(run.getParent())));
+        String jobKey = jobKeyOfRunning(runningKey(run.getParent()));
+        invalidate(jobKey);
+        // a stop requested between the placeholder's write and its registration above was not taken as ours
+        if (store.read(jobKey + "/" + PREFIX + "/" + run.getNumber() + STOP_SUFFIX) != null) {
+            stopRequested(jobKey, run.getNumber());
+        }
     }
 
     /**
@@ -774,6 +779,16 @@ public final class RunningBuilds {
             if (adoption == null) {
                 return false; // nobody can adopt it
             }
+            if (!SharedQueue.adoptExclusive(job)) {
+                // a newer build of this job (which allows one at a time) runs elsewhere: resume this one later
+                adoption.abandon();
+                BuildLeases leases = store.leases();
+                if (leases != null) {
+                    leases.release(key, epoch);
+                }
+                LOGGER.info(() -> "Not adopting " + job.getFullName() + " #" + number + " yet: another build of it runs elsewhere");
+                return true; // nothing to remove: a later sweep adopts it
+            }
             Placeholder mine = p.withOwner(store.getOrigin(), CONTROLLER_NAME, epoch, p.properties);
             long version;
             try {
@@ -800,7 +815,6 @@ public final class RunningBuilds {
             } catch (IOException | RuntimeException e) {
                 resumeFailed(store, job, p, version, e);
             }
-            SharedQueue.adoptedExclusive(job);
             String jobKey = jobKeyOfRunning(runningKey(job));
             if (store.read(jobKey + "/" + PREFIX + "/" + number + STOP_SUFFIX) != null) {
                 stopRequested(jobKey, number); // asked to stop while its owner was gone
