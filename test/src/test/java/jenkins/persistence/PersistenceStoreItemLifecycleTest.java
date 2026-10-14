@@ -25,6 +25,7 @@
 package jenkins.persistence;
 
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -36,7 +37,11 @@ import hudson.model.FreeStyleProject;
 import hudson.model.Items;
 import java.io.File;
 import java.io.IOException;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import org.htmlunit.HttpMethod;
+import org.htmlunit.WebRequest;
+import org.htmlunit.WebResponse;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
@@ -85,6 +90,18 @@ class PersistenceStoreItemLifecycleTest {
         assertThrows(ConflictException.class, () -> p.renameTo("theirs"));
         assertEquals("mine", p.getName());
         assertThat(STORE.versions(), hasKey("jobs/mine/config.xml"));
+    }
+
+    @Test
+    void renameThroughTheUiOntoAStoredItemSaysTheNameIsInUse() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("ui-mine");
+        // made on another controller after this one checked the name
+        STORE.write("jobs/ui-theirs/config.xml", "<?xml version='1.1' encoding='UTF-8'?><project/>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+        JenkinsRule.WebClient wc = r.createWebClient().withThrowExceptionOnFailingStatusCode(false);
+        WebResponse rsp = wc.getPage(wc.addCrumb(new WebRequest(new URL(r.getURL(), "job/ui-mine/confirmRename?newName=ui-theirs"), HttpMethod.POST))).getWebResponse();
+        assertEquals(400, rsp.getStatusCode());
+        assertThat(rsp.getContentAsString(), containsString(hudson.model.Messages.AbstractItem_NewNameInUse("ui-theirs")));
+        assertEquals("ui-mine", p.getName());
     }
 
     @Test
