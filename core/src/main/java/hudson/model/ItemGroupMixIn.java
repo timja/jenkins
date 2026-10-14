@@ -43,6 +43,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.xml.transform.TransformerException;
@@ -112,17 +113,25 @@ public abstract class ItemGroupMixIn {
         }
 
         List<File> subdirs = new ArrayList<>(Arrays.asList(modulesDir.listFiles(File::isDirectory)));
+        // items which so far exist only in a persistence store
+        Set<String> stored;
         try {
-            // items which so far exist only in a persistence store
-            for (String name : PersistenceStores.storedItemNames(modulesDir)) {
-                File subdir = new File(modulesDir, name);
-                if (!subdirs.contains(subdir)) {
-                    Util.createDirectories(subdir.toPath());
-                    subdirs.add(subdir);
-                }
-            }
+            stored = PersistenceStores.storedItemNames(modulesDir);
         } catch (IOException e) {
             Logger.getLogger(ItemGroupMixIn.class.getName()).log(Level.WARNING, "could not list stored items of " + modulesDir, e);
+            stored = Set.of();
+        }
+        for (String name : stored) {
+            File subdir = new File(modulesDir, name);
+            if (!subdirs.contains(subdir)) {
+                try {
+                    Util.createDirectories(subdir.toPath());
+                    subdirs.add(subdir);
+                } catch (IOException e) {
+                    // one item which cannot be made here does not keep the others from loading
+                    Logger.getLogger(ItemGroupMixIn.class.getName()).log(Level.WARNING, "could not make a directory for stored item " + subdir, e);
+                }
+            }
         }
         CopyOnWriteMap.Tree<K, V> configurations = new CopyOnWriteMap.Tree<>();
         for (File subdir : subdirs) {
