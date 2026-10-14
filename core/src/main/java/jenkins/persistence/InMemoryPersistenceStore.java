@@ -232,19 +232,40 @@ public class InMemoryPersistenceStore implements PersistenceStore {
     public long write(@NonNull String key, @NonNull byte[] content, long expectedVersion) throws ConflictException {
         long version;
         synchronized (root) {
-            Entry current = entries.get(key);
-            long actual = current == null ? ABSENT : current.version();
-            if (expectedVersion != ANY && expectedVersion != actual) {
-                throw new ConflictException(key, expectedVersion, actual);
-            }
-            if (current != null && Arrays.equals(current.content(), content)) {
-                return actual;
-            }
-            version = ++root.clock;
-            entries.put(key, new Entry(content.clone(), version));
-            outbox.add(new ChangeEvent(ChangeEvent.Kind.WRITTEN, key, null, version, origin));
+            version = commitWrite(key, content, expectedVersion);
         }
         deliver();
+        return version;
+    }
+
+    /** The lease check and the write in one step, as a store doing both in one transaction would. */
+    @Override
+    public long writeIfHeld(@NonNull String leaseKey, long epoch, @NonNull String key, @NonNull byte[] content, long expectedVersion)
+            throws java.io.IOException {
+        long version;
+        synchronized (root) {
+            if (!leases().holds(leaseKey, epoch)) {
+                throw new LeaseLostException(leaseKey, epoch);
+            }
+            version = commitWrite(key, content, expectedVersion);
+        }
+        deliver();
+        return version;
+    }
+
+    /** Under the data lock: writes, and queues the change for delivery. */
+    private long commitWrite(String key, byte[] content, long expectedVersion) throws ConflictException {
+        Entry current = entries.get(key);
+        long actual = current == null ? ABSENT : current.version();
+        if (expectedVersion != ANY && expectedVersion != actual) {
+            throw new ConflictException(key, expectedVersion, actual);
+        }
+        if (current != null && Arrays.equals(current.content(), content)) {
+            return actual;
+        }
+        long version = ++root.clock;
+        entries.put(key, new Entry(content.clone(), version));
+        outbox.add(new ChangeEvent(ChangeEvent.Kind.WRITTEN, key, null, version, origin));
         return version;
     }
 

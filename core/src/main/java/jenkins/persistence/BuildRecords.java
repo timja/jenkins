@@ -219,6 +219,11 @@ public final class BuildRecords {
             LOGGER.warning(() -> "Not publishing " + run + ": no " + record);
             return;
         }
+        // held while it ran here (none when publishing a build for another controller): what makes the publication its
+        // owner's, checked as the snapshot goes into place and as the record is written
+        RunningBuilds.Placeholder lease = PersistenceStores.get().leases() == null ? null : RunningBuilds.ownedPlaceholder(run);
+        // uploaded under a name of its own first, which a controller that lost the build cannot put over the owner's
+        String upload = lease == null ? SNAPSHOT : SNAPSHOT + "." + lease.getEpoch();
         BlobStore blobs = PersistenceStores.getBlobStore();
         if (blobs != null) {
             List<String> excludes = new ArrayList<>(DEFAULT_EXCLUDES);
@@ -233,24 +238,41 @@ public final class BuildRecords {
                     throw (IOException) new InterruptedIOException().initCause(e);
                 }
                 try (InputStream in = Files.newInputStream(snapshot)) {
-                    blobs.put(base + "/" + SNAPSHOT, in, Files.size(snapshot));
+                    blobs.put(base + "/" + upload, in, Files.size(snapshot));
                 }
             } finally {
                 Files.deleteIfExists(snapshot);
             }
+            if (lease != null) {
+                // the upload may take long; the lease is checked now, so only a moment remains for it to be lost in
+                if (!PersistenceStores.get().leases().holds(lease.getKey(), lease.getEpoch())) {
+                    blobs.delete(base + "/" + upload);
+                    throw new LeaseLostException(lease.getKey(), lease.getEpoch());
+                }
+                blobs.move(base + "/" + upload, base + "/" + SNAPSHOT);
+            }
         }
         byte[] published = Files.readAllBytes(record);
-        seen(base + "/" + RECORD, PersistenceStores.get().write(base + "/" + RECORD, published, PersistenceStore.ANY));
+        publishRecord(lease, base + "/" + RECORD, published);
         // a save made while publishing found no record yet, so republish left it to this: include it
         for (int i = 0; i < 10; i++) {
             byte[] now = Files.readAllBytes(record);
             if (Arrays.equals(now, published)) {
                 break;
             }
-            seen(base + "/" + RECORD, PersistenceStores.get().write(base + "/" + RECORD, now, PersistenceStore.ANY));
+            publishRecord(lease, base + "/" + RECORD, now);
             published = now;
         }
         LOGGER.fine(() -> "Published " + run);
+    }
+
+    /** Writes a build record, while holding the build's lease if it has one (the store checks it with the write). */
+    private static void publishRecord(@CheckForNull RunningBuilds.Placeholder lease, String key, byte[] content) throws IOException {
+        if (lease == null) {
+            seen(key, PersistenceStores.get().write(key, content, PersistenceStore.ANY));
+        } else {
+            seen(key, PersistenceStores.get().writeIfHeld(lease.getKey(), lease.getEpoch(), key, content, PersistenceStore.ANY));
+        }
     }
 
     /**
@@ -663,6 +685,12 @@ public final class BuildRecords {
             }
             try {
                 publish(run);
+            } catch (LeaseLostException e) {
+                // taken over while it was being published: the new owner publishes it; nothing of it is left from here
+                LOGGER.warning(() -> "Not publishing " + run + ": " + e.getMessage());
+                RunningBuilds.lost(run);
+                RunningBuilds.discard(run);
+                return;
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.WARNING, "Failed to publish " + run, e);
             }
