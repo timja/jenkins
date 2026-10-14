@@ -57,12 +57,14 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Stream;
@@ -287,17 +289,32 @@ public final class BuildRecords {
         }
     }
 
-    /** Builds deleted here, by key, so that a publication still in progress does not bring them back. */
-    private static final Set<String> deleted = java.util.Collections.newSetFromMap(new java.util.LinkedHashMap<>() {
-        @Override
-        protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) {
-            return size() > 10_000;
-        }
-    });
+    /**
+     * Builds deleted here, by key, with when, so that a publication still in progress does not bring them back. Kept for
+     * {@link #DELETED_MILLIS} rather than up to a count: however many builds are deleted meanwhile (a discarder sweeping
+     * a big job), a publication stalled in its upload still finds its build's marker.
+     */
+    private static final LinkedHashMap<String, Long> deleted = new LinkedHashMap<>();
+
+    static final long DELETED_MILLIS = TimeUnit.HOURS.toMillis(1);
 
     private static boolean isDeleted(String base) {
         synchronized (deleted) {
-            return deleted.contains(base);
+            return deleted.containsKey(base);
+        }
+    }
+
+    private static void markDeleted(String base) {
+        long now = System.currentTimeMillis();
+        synchronized (deleted) {
+            deleted.remove(base);
+            deleted.put(base, now);
+            for (var it = deleted.values().iterator(); it.hasNext(); ) {
+                if (it.next() >= now - DELETED_MILLIS) {
+                    break; // in the order marked: the rest are newer
+                }
+                it.remove();
+            }
         }
     }
 
@@ -349,9 +366,7 @@ public final class BuildRecords {
             return;
         }
         String base = builds + "/" + run.getNumber();
-        synchronized (deleted) {
-            deleted.add(base);
-        }
+        markDeleted(base);
         PersistenceStores.get().delete(base + "/" + RECORD, PersistenceStore.ANY);
         seen(base + "/" + RECORD, PersistenceStore.ABSENT);
         BlobStore blobs = PersistenceStores.getBlobStore();
