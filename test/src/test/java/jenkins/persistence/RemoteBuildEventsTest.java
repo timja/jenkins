@@ -59,7 +59,7 @@ class RemoteBuildEventsTest {
             key -> key.startsWith("jobs/") && (key.endsWith("/config.xml") || key.endsWith("/nextBuildNumber")) && !key.contains("/builds/")) {
         @Override
         public boolean storesBuildRecords(String jobKey) {
-            return true;
+            return !jobKey.equals("jobs/unshared");
         }
     };
     static final InMemoryBlobStore BLOBS = new InMemoryBlobStore();
@@ -157,6 +157,19 @@ class RemoteBuildEventsTest {
         assertEquals(1, p.getLastSuccessfulBuild().getNumber());
         assertEquals(1, p.getLastBuild().getNumber());
         assertEquals(deletesBefore, RemoteDeletes.count.get(), "RunListener.onDeleted is not fired for a remote deletion");
+    }
+
+    @Test
+    void eventsForBuildsNotSharedChangeNothing() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("unshared");
+        r.buildAndAssertSuccess(p);
+        // a record under a job whose builds the store does not share, written and deleted elsewhere
+        other.write("jobs/unshared/builds/1/build.xml", Files.readAllBytes(new File(p.getBuildDir(), "1/build.xml").toPath()), PersistenceStore.ANY);
+        other.delete("jobs/unshared/builds/1/build.xml", PersistenceStore.ANY);
+        awaitApplied();
+
+        assertEquals(List.of(1), numbers(p));
+        assertTrue(new File(p.getBuildDir(), "1/build.xml").isFile(), "the local build is untouched");
     }
 
     @Test
