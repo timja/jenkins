@@ -550,6 +550,12 @@ public final class BuildRecords {
         }
     }
 
+    /** Whether a job deleted elsewhere has been made again since. */
+    private static boolean recreated(Job<?, ?> job) throws IOException {
+        String builds = buildsKey(job);
+        return builds != null && PersistenceStores.get().read(builds.substring(0, builds.length() - "builds".length()) + "config.xml") != null;
+    }
+
     @Restricted(NoExternalUse.class)
     @Extension
     public static final class ItemDeleted extends ItemListener {
@@ -557,10 +563,15 @@ public final class BuildRecords {
         @Override
         public void onDeleted(Item item) {
             // folders delete their children one by one, so each job gets here
-            if (!(item instanceof Job<?, ?> job) || PersistenceStores.isApplyingRemoteChange()) {
+            if (!(item instanceof Job<?, ?> job)) {
                 return;
             }
             try {
+                if (PersistenceStores.isApplyingRemoteChange() && recreated(job)) {
+                    return; // made again since, under the same name: its builds are the new job's
+                }
+                // also when the deletion was made elsewhere: a build that completed here before this controller
+                // applied it published a record after that controller had cleaned up (idempotent)
                 deleteAll(job);
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.WARNING, "Failed to delete stored builds of " + job.getFullName(), e);
