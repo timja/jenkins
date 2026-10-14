@@ -28,6 +28,7 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -42,14 +43,25 @@ import hudson.model.FreeStyleBuild;
 import hudson.model.FreeStyleProject;
 import hudson.model.Result;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
+import org.apache.tools.tar.TarConstants;
+import org.apache.tools.tar.TarEntry;
+import org.apache.tools.tar.TarInputStream;
+import org.apache.tools.tar.TarOutputStream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.TestBuilder;
 import org.jvnet.hudson.test.TestExtension;
@@ -136,6 +148,62 @@ class BuildRecordsTest {
         assertEquals(2, p.getLastSuccessfulBuild().getNumber());
         r.assertBuildStatusSuccess(p.scheduleBuild2(0));
         assertEquals(3, p.getLastBuild().getNumber());
+    }
+
+    @Test
+    void linksAreLeftOutOfSnapshots(@TempDir Path outside) throws Exception {
+        Path secret = Files.writeString(outside.resolve("secret.txt"), "outside the build");
+        Files.createDirectories(outside.resolve("dir"));
+        Files.writeString(outside.resolve("dir/f.txt"), "outside the build too");
+        FreeStyleProject p = r.createFreeStyleProject("links");
+        p.getBuildersList().add(new TestBuilder() {
+            @Override
+            public boolean perform(AbstractBuild<?, ?> build, Launcher launcher, BuildListener listener) throws IOException {
+                Path root = build.getRootDir().toPath();
+                Files.writeString(root.resolve("own.txt"), "the build's own");
+                Files.createSymbolicLink(root.resolve("link.txt"), secret);
+                Files.createSymbolicLink(root.resolve("linkdir"), outside.resolve("dir"));
+                return true;
+            }
+        });
+        r.buildAndAssertSuccess(p);
+
+        List<String> names = new ArrayList<>();
+        try (TarInputStream tar = new TarInputStream(new GZIPInputStream(BLOBS.get("jobs/links/builds/1/files.tgz")))) {
+            for (TarEntry e = tar.getNextEntry(); e != null; e = tar.getNextEntry()) {
+                names.add(e.getName());
+                assertFalse(e.isSymbolicLink(), e.getName());
+                if (!e.isDirectory()) {
+                    assertThat(new String(tar.readAllBytes(), StandardCharsets.UTF_8), not(containsString("outside the build")));
+                }
+            }
+        }
+        assertThat(names, hasItem("own.txt"));
+
+        wipeAndReload(r);
+        File dir = r.jenkins.getItemByFullName("links", FreeStyleProject.class).getBuildByNumber(1).getRootDir();
+        assertEquals("the build's own", Files.readString(new File(dir, "own.txt").toPath()));
+        assertFalse(Files.exists(dir.toPath().resolve("link.txt"), LinkOption.NOFOLLOW_LINKS));
+        assertFalse(Files.exists(dir.toPath().resolve("linkdir"), LinkOption.NOFOLLOW_LINKS));
+    }
+
+    @Test
+    void linksInAStoredSnapshotAreNotMaterialized(@TempDir Path outside) throws Exception {
+        FreeStyleProject p = project(r, "planted");
+        r.buildAndAssertSuccess(p);
+        // a snapshot with a link in it, as no publisher here makes
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (TarOutputStream tar = new TarOutputStream(new GZIPOutputStream(bytes))) {
+            TarEntry link = new TarEntry("log", TarConstants.LF_SYMLINK);
+            link.setLinkName(outside.resolve("elsewhere").toString());
+            tar.putNextEntry(link);
+            tar.closeEntry();
+        }
+        BLOBS.put("jobs/planted/builds/1/files.tgz", new ByteArrayInputStream(bytes.toByteArray()), bytes.size());
+
+        wipeAndReload(r);
+        File dir = r.jenkins.getItemByFullName("planted", FreeStyleProject.class).getBuildByNumber(1).getRootDir();
+        assertFalse(Files.isSymbolicLink(dir.toPath().resolve("log")));
     }
 
     @Test
