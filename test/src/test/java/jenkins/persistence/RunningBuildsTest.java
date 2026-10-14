@@ -169,13 +169,15 @@ class RunningBuildsTest {
         // its links answer here too (no owner routing in core): the build, running there
         assertThat(wc.goTo("job/remote/2/").asNormalizedText(), containsString("Running on controller jenkins-a"));
         assertThat(wc.goTo("job/remote/2/console").asNormalizedText(), containsString("This build runs on controller jenkins-a"));
-        String api = wc.goTo("job/remote/api/json?tree=lastBuild[number,building,result,url],builds[number,building],allBuilds[number]", "application/json")
+        String api = wc.goTo("job/remote/api/json?tree=lastBuild[number,building],builds[number],buildsElsewhere[number,building,result,url]", "application/json")
                 .getWebResponse().getContentAsString();
-        assertThat("lastBuild is the build running elsewhere", api, containsString("\"lastBuild\":{\"_class\":\"jenkins.persistence.RunningBuilds$RemoteBuild\",\"building\":true,"
-                + "\"number\":2,\"result\":null,\"url\":\"" + r.getURL() + "job/remote/2/\"}"));
-        assertThat("builds lists it first", api, containsString("\"builds\":[{\"_class\":\"jenkins.persistence.RunningBuilds$RemoteBuild\",\"building\":true,\"number\":2},"
-                + "{\"_class\":\"hudson.model.FreeStyleBuild\",\"building\":false,\"number\":1}]"));
-        assertThat(api, containsString("\"allBuilds\":[{\"_class\":\"jenkins.persistence.RunningBuilds$RemoteBuild\",\"number\":2},{\"_class\":\"hudson.model.FreeStyleBuild\",\"number\":1}]"));
+        assertThat("builds and lastBuild are this controller's, typed as ever", api,
+                containsString("\"builds\":[{\"_class\":\"hudson.model.FreeStyleBuild\",\"number\":1}]"));
+        assertThat(api, containsString("\"lastBuild\":{\"_class\":\"hudson.model.FreeStyleBuild\",\"building\":false,\"number\":1}"));
+        assertThat("the build running elsewhere has a property of its own", api, containsString("\"buildsElsewhere\":[{"
+                + "\"building\":true,\"number\":2,\"result\":null,\"url\":\"" + r.getURL() + "job/remote/2/\"}]"));
+        assertThat("the schema keeps the build types", wc.goTo("job/remote/api/schema", "application/xml").getWebResponse().getContentAsString(),
+                containsString("name=\"lastBuild\" type=\"hudson.model.Run\""));
 
         // the other controller completes it: record first, then the placeholder goes
         try (InputStream snapshot = BLOBS.get("jobs/remote/builds/1/files.tgz")) {
