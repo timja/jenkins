@@ -62,6 +62,8 @@ public interface PersistenceStore {
     /**
      * Whether this store serves the given key.
      * Must be cheap and must not change over the lifetime of the store.
+     * Below an item's directory it must depend only on the path relative to that directory, not on where the item is,
+     * so that moving or renaming an item ({@link #move}) never changes which of its files the store serves.
      */
     boolean owns(@NonNull String key);
 

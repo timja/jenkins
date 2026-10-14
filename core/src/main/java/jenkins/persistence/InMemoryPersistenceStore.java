@@ -114,7 +114,7 @@ public class InMemoryPersistenceStore implements PersistenceStore {
     public synchronized void move(@NonNull String fromPrefix, @NonNull String toPrefix) throws ConflictException {
         for (String key : entries.keySet()) {
             if (key.equals(toPrefix) || key.startsWith(toPrefix + "/")) {
-                throw new ConflictException(toPrefix, ABSENT, entries.get(key).version());
+                throw new ConflictException(key, ABSENT, entries.get(key).version());
             }
         }
         Map<String, Entry> moved = new TreeMap<>();

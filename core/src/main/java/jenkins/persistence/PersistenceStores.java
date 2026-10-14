@@ -31,6 +31,7 @@ import hudson.init.InitMilestone;
 import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
@@ -222,8 +223,20 @@ public final class PersistenceStores {
         if (fromKey == null || toKey == null || fromKey.equals(toKey)) {
             return;
         }
+        List<String> known = versions.keySet().stream().filter(k -> k.equals(fromKey) || k.startsWith(fromKey + "/")).toList();
         store.move(fromKey, toKey);
-        versions.keySet().removeIf(k -> k.equals(fromKey) || k.startsWith(fromKey + "/"));
+        versions.keySet().removeAll(known);
+        // the moved entries have new versions: learn them, so that the moved item's next save is still checked for
+        // conflicts instead of overwriting whatever another controller wrote
+        for (String k : known) {
+            String moved = toKey + k.substring(fromKey.length());
+            try {
+                PersistenceStore.Entry e = store.read(moved);
+                seen(moved, e == null ? PersistenceStore.ABSENT : e.version());
+            } catch (IOException e) {
+                LOGGER.log(Level.FINE, "Could not read the version of " + moved + " after moving it", e);
+            }
+        }
     }
 
     /**
