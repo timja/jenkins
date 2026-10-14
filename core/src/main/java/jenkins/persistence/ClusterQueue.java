@@ -82,6 +82,22 @@ public interface ClusterQueue {
     void update(long id, @NonNull String actions, long dueAt) throws IOException;
 
     /**
+     * Updates the actions and due time of a waiting item if its actions are still {@code expectedActions}: a fold
+     * merges its causes into what it read, and two folds at once must not lose one another's. Stores should compare
+     * and update atomically; this default compares, then updates.
+     *
+     * @return false if the item is not waiting, or its actions changed meanwhile (read it again and merge again)
+     */
+    default boolean update(long id, @NonNull String expectedActions, @NonNull String actions, long dueAt) throws IOException {
+        Record r = get(id);
+        if (r == null || r.state() != State.WAITING || !r.actions().equals(expectedActions)) {
+            return false;
+        }
+        update(id, actions, dueAt);
+        return true;
+    }
+
+    /**
      * Claims a waiting item for this controller.
      *
      * @return true if this controller now has it, false if it was claimed, started or cancelled elsewhere

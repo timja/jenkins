@@ -46,6 +46,8 @@ import hudson.model.queue.QueueListener;
 import hudson.model.queue.ScheduleResult;
 import hudson.security.ACL;
 import hudson.security.ACLContext;
+import hudson.util.DaemonThreadFactory;
+import hudson.util.NamingThreadFactory;
 import hudson.util.Secret;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -59,8 +61,12 @@ import java.util.Calendar;
 import java.util.GregorianCalendar;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
@@ -226,6 +232,61 @@ public final class SharedQueue {
         return item instanceof Queue.LeftItem ? null : item;
     }
 
+    // ------------------------------------------------------------------ what is decided under the queue lock
+
+    /*
+     * The queue lock is held while items are scheduled and while the queue is maintained (QueueStartGate), so nothing
+     * here talks to the store with it held: a slow store would stop the whole queue. Publishing goes through an outbox,
+     * the gate decides from the records this controller knows (fed by the mirror), and claims are made off the lock.
+     */
+
+    /** The records of items in this controller's queue, as last read or delivered. */
+    static final Map<Long, ClusterQueue.Record> known = new ConcurrentHashMap<>();
+    /** Local items being shared (published, or folded into an item from elsewhere): they do not start meanwhile. */
+    static final Set<Long> sharing = ConcurrentHashMap.newKeySet();
+    /** Items with a claim under way. */
+    private static final Set<Long> claiming = ConcurrentHashMap.newKeySet();
+
+    /** A few threads: items are shared independently, so one waiting on a slow write does not hold up the others. */
+    private static final ExecutorService outbox = Executors.newFixedThreadPool(4, new NamingThreadFactory(new DaemonThreadFactory(), "Shared queue outbox"));
+    private static final ExecutorService claims = Executors.newFixedThreadPool(4, new NamingThreadFactory(new DaemonThreadFactory(), "Shared queue claims"));
+
+    /** Records a record, unless it is older than the one known (records only move on: waiting, claimed, started). */
+    static void know(@NonNull ClusterQueue.Record r) {
+        known.merge(r.id(), r, (old, now) -> rank(now) >= rank(old) ? now : old);
+    }
+
+    private static int rank(ClusterQueue.Record r) {
+        return switch (r.state()) {
+            case WAITING -> 0;
+            case CLAIMED -> 1;
+            case STARTED, CANCELLED -> 2;
+        };
+    }
+
+    /** Live origins as last read, refreshed off the lock; null if unknown (taken as everyone alive). */
+    private static volatile Set<String> live;
+    private static volatile long liveAt;
+    private static final java.util.concurrent.atomic.AtomicBoolean liveRefreshing = new java.util.concurrent.atomic.AtomicBoolean();
+
+    /** Whether an origin was alive when last asked; asks again, off the lock, when that is a few seconds old. */
+    private static boolean seemsAlive(String origin) {
+        if (System.currentTimeMillis() - liveAt > 2_000 && liveRefreshing.compareAndSet(false, true)) {
+            claims.submit(() -> {
+                try {
+                    live = PersistenceStores.get().liveOrigins();
+                    liveAt = System.currentTimeMillis();
+                } catch (IOException | RuntimeException e) {
+                    LOGGER.log(Level.FINE, "Cannot read which controllers are alive", e);
+                } finally {
+                    liveRefreshing.set(false);
+                }
+            });
+        }
+        Set<String> l = live;
+        return l == null || l.contains(origin);
+    }
+
     /** Why a shared item does not start here. */
     static final class Blocked extends CauseOfBlockage {
         private final String text;
@@ -260,23 +321,47 @@ public final class SharedQueue {
             if (PersistenceStores.isApplyingRemoteChange() || !shared(wi.task)) {
                 return;
             }
-            ClusterQueue cq = queue();
-            List<Action> actions = wi.getActions();
+            // under the queue lock (schedule2): only prepared here, shared by the outbox; it does not start meanwhile
+            List<Action> actions = List.copyOf(wi.getActions());
+            ClusterQueue.Record record = new ClusterQueue.Record(wi.getId(), ((Job<?, ?>) wi.task).getFullName(),
+                    dedupKey(wi.task, actions), toXml(actions), dueOf(wi), ClusterQueue.State.WAITING, origin(), pinnedTo(actions), null, 0);
+            sharing.add(wi.getId());
+            outbox.submit(() -> share(wi, record, actions));
+        }
+
+        private static void share(Queue.WaitingItem wi, ClusterQueue.Record record, List<Action> actions) {
             try {
-                ClusterQueue.Record stored = cq.publish(new ClusterQueue.Record(wi.getId(), ((Job<?, ?>) wi.task).getFullName(),
-                        dedupKey(wi.task, actions), toXml(actions), dueOf(wi), ClusterQueue.State.WAITING, origin(), pinnedTo(actions), null, 0));
+                ClusterQueue cq = queue();
+                ClusterQueue.Record stored = cq.publish(record);
+                know(stored);
                 if (stored.id() != wi.getId()) {
-                    // the same job and parameters were already waiting (scheduled elsewhere at the same time): fold into that item
+                    // the same job and parameters were already waiting (scheduled elsewhere at the same time): fold into
+                    // that item, then drop this one, which has not started (the gate held it)
                     LOGGER.fine(() -> wi + " folds into queue item " + stored.id() + " from " + stored.origin());
-                    cq.update(stored.id(), toXml(mergeCauses(fromXml(stored.actions()), actions)), Math.min(stored.dueAt(), dueOf(wi)));
-                    Timer.get().submit(() -> {
-                        dropLocal(wi.getId());
-                        Mirror.mirror(stored.id());
-                    });
+                    fold(cq, stored.id(), actions, dueOf(wi));
+                    PersistenceStores.applyingRemoteChange(() -> Queue.getInstance().cancel(wi));
+                    Mirror.mirror(stored.id());
                 }
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.WARNING, "Failed to share " + wi + "; it stays local", e);
+            } finally {
+                sharing.remove(wi.getId());
+                Queue.getInstance().scheduleMaintenance();
             }
+        }
+
+        /** Merges a request's causes into a waiting item, compare-and-set: one fold elsewhere at the same time is kept. */
+        private static void fold(ClusterQueue cq, long id, List<Action> actions, long due) throws IOException {
+            for (int attempt = 0; attempt < 20; attempt++) {
+                ClusterQueue.Record now = cq.get(id);
+                if (now == null || now.state() != ClusterQueue.State.WAITING) {
+                    return; // started (or cancelled) meanwhile, as a request folded a moment later would have found
+                }
+                if (cq.update(id, now.actions(), toXml(mergeCauses(fromXml(now.actions()), actions)), Math.min(now.dueAt(), due))) {
+                    return;
+                }
+            }
+            LOGGER.warning(() -> "Queue item " + id + " kept changing; a request folded into it may lack its cause");
         }
 
         @Override
@@ -284,15 +369,21 @@ public final class SharedQueue {
             if (PersistenceStores.isApplyingRemoteChange() || !shared(item.task)) {
                 return;
             }
-            try {
-                queue().update(item.getId(), toXml(item.getActions()), dueOf(item));
-            } catch (IOException | RuntimeException e) {
-                LOGGER.log(Level.WARNING, "Failed to share changes to " + item, e);
-            }
+            long id = item.getId();
+            String actions = toXml(item.getActions());
+            long due = dueOf(item);
+            outbox.submit(() -> {
+                try {
+                    queue().update(id, actions, due);
+                } catch (IOException | RuntimeException e) {
+                    LOGGER.log(Level.WARNING, "Failed to share changes to queue item " + id, e);
+                }
+            });
         }
 
         @Override
         public void onLeft(Queue.LeftItem li) {
+            known.remove(li.getId());
             if (!li.isCancelled() || PersistenceStores.isApplyingRemoteChange() || !shared(li.task)) {
                 return;
             }
@@ -327,36 +418,54 @@ public final class SharedQueue {
             if (!shared(item.task)) {
                 return null;
             }
-            ClusterQueue cq = queue();
+            // under the queue lock: from what is known only; the store is asked off the lock (claim below)
+            long id = item.getId();
+            if (sharing.contains(id)) {
+                return new Blocked("Being shared with the other controllers");
+            }
+            ClusterQueue.Record r = known.get(id);
+            if (r == null) {
+                return null; // never shared (e.g. publishing failed)
+            }
+            String me = origin();
+            if (me.equals(r.claimedBy())) {
+                return null;
+            }
+            if (r.state() != ClusterQueue.State.WAITING) {
+                Timer.get().submit(() -> dropLocal(id));
+                return new Blocked("Starting on another controller");
+            }
+            if (r.pinnedTo() != null && !me.equals(r.pinnedTo())) {
+                return new Blocked("Waiting for the controller that scheduled it (it waits for the result)");
+            }
+            if (!me.equals(r.origin()) && System.currentTimeMillis() < r.dueAt() + ORIGIN_GRACE_MILLIS && seemsAlive(r.origin())) {
+                // the controller it was requested on goes first (e.g. it may hold the agents the build needs)
+                return new Blocked("Waiting for the controller it was scheduled on");
+            }
+            if (claiming.add(id)) {
+                claims.submit(() -> claim(id));
+            }
+            return new Blocked("Being claimed for this controller");
+        }
+
+        /** Off the lock: claims an item for this controller, then has the queue look at it again. */
+        private static void claim(long id) {
             try {
-                ClusterQueue.Record r = cq.get(item.getId());
-                if (r == null) {
-                    return null; // never shared (e.g. publishing failed)
+                ClusterQueue cq = queue();
+                ClusterQueue.Record r = cq.get(id);
+                if (r != null && r.state() == ClusterQueue.State.WAITING && cq.claim(id)) {
+                    LOGGER.fine(() -> "Claimed queue item " + id);
                 }
-                String me = origin();
-                if (me.equals(r.claimedBy())) {
-                    return null;
-                }
-                if (r.pinnedTo() != null && !me.equals(r.pinnedTo())) {
-                    return new Blocked("Waiting for the controller that scheduled it (it waits for the result)");
-                }
-                if (!me.equals(r.origin()) && System.currentTimeMillis() < r.dueAt() + ORIGIN_GRACE_MILLIS) {
-                    // the controller it was requested on goes first (e.g. it may hold the agents the build needs)
-                    Set<String> live = PersistenceStores.get().liveOrigins();
-                    if (live == null || live.contains(r.origin())) {
-                        return new Blocked("Waiting for the controller it was scheduled on");
-                    }
-                }
-                if (cq.claim(item.getId())) {
-                    LOGGER.fine(() -> "Claimed " + item);
-                    return null;
+                ClusterQueue.Record now = cq.get(id);
+                if (now != null) {
+                    know(now);
                 }
             } catch (IOException | RuntimeException e) {
-                LOGGER.log(Level.WARNING, "Cannot claim " + item + "; not starting it for now", e);
-                return new Blocked("The shared queue is unavailable");
+                LOGGER.log(Level.WARNING, "Cannot claim queue item " + id + "; not starting it for now", e);
+            } finally {
+                claiming.remove(id);
+                Queue.getInstance().scheduleMaintenance();
             }
-            Timer.get().submit(() -> dropLocal(item.getId()));
-            return new Blocked("Starting on another controller");
         }
     }
 
@@ -400,12 +509,36 @@ public final class SharedQueue {
             ClusterQueue cq = queue();
             if (cq != null) {
                 try {
-                    return cq.nextId();
+                    return nextId(cq);
                 } catch (IOException | RuntimeException e) {
                     LOGGER.log(Level.WARNING, "Cannot get a cluster-wide queue id; using a local one", e);
                 }
             }
             return LOCAL.generateIdFor(project, actions);
+        }
+
+        /** Ids taken from the cluster sequence ahead of need, off the queue lock (unused ones are skipped numbers). */
+        private static final BlockingQueue<Long> spare = new LinkedBlockingQueue<>();
+        private static final int SPARE = 16;
+        private static final java.util.concurrent.atomic.AtomicBoolean filling = new java.util.concurrent.atomic.AtomicBoolean();
+
+        /** An id from the pool (refilled in the background), or from the store if the pool ran dry. */
+        private static long nextId(ClusterQueue cq) throws IOException {
+            Long id = spare.poll();
+            if (spare.size() < SPARE / 2 && filling.compareAndSet(false, true)) {
+                claims.submit(() -> {
+                    try {
+                        while (spare.size() < SPARE) {
+                            spare.add(cq.nextId());
+                        }
+                    } catch (IOException | RuntimeException e) {
+                        LOGGER.log(Level.FINE, "Cannot take queue ids ahead", e);
+                    } finally {
+                        filling.set(false);
+                    }
+                });
+            }
+            return id != null ? id : cq.nextId();
         }
 
         @Override
@@ -493,6 +626,9 @@ public final class SharedQueue {
 
         private static void apply(ClusterQueue.Record r) {
             String me = origin();
+            if (localItem(r.id()) != null) {
+                know(r); // for the gate, which decides from what is known
+            }
             switch (r.state()) {
                 case WAITING -> {
                     if (localItem(r.id()) != null) {
@@ -543,6 +679,7 @@ public final class SharedQueue {
                 return;
             }
             int quietPeriod = (int) Math.max(0, (r.dueAt() - System.currentTimeMillis() + 999) / 1000);
+            know(r);
             Ids.MIRRORED.set(r.id());
             try {
                 ScheduleResult result = PersistenceStores.applyingRemoteChange(
