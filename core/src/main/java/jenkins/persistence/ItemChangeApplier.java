@@ -295,6 +295,9 @@ public final class ItemChangeApplier {
         if (job == null) {
             return true; // not loaded (yet); its builds are listed from the store when it is
         }
+        if (!BuildRecords.isShared(job)) {
+            return true; // the store does not share this job's builds: nothing here changes
+        }
         if (e.kind() == ChangeEvent.Kind.DELETED) {
             BuildRecords.deletedElsewhere(job, record.number());
         } else {
