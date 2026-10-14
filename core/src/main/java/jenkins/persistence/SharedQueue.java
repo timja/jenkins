@@ -612,14 +612,22 @@ public final class SharedQueue {
     }
 
     /**
-     * Takes over the exclusive lease of a job after adopting one of its builds (the previous holder is gone).
+     * Takes over the exclusive lease of a job before adopting one of its builds (the previous holder is gone).
+     *
+     * @return false if another controller holds it (it started a newer build meanwhile): the build must not resume now
      */
     @Restricted(NoExternalUse.class)
-    public static void adoptedExclusive(@NonNull Job<?, ?> job) {
+    public static boolean adoptExclusive(@NonNull Job<?, ?> job) throws IOException {
+        return acquireExclusive(job);
+    }
+
+    /** Whether a claim that failed with an exception went through after all. */
+    private static boolean claimedHere(ClusterQueue cq, long id) {
         try {
-            acquireExclusive(job);
+            ClusterQueue.Record r = cq.get(id);
+            return r != null && origin().equals(r.claimedBy());
         } catch (IOException | RuntimeException e) {
-            LOGGER.log(Level.WARNING, "Failed to take over the exclusive lease of " + job.getFullName(), e);
+            return false;
         }
     }
 
@@ -717,16 +725,6 @@ public final class SharedQueue {
 
     /** Why items could not be claimed here (yet), by id, for the gate to say. */
     private static final Map<Long, String> notClaimed = new ConcurrentHashMap<>();
-
-    /** Whether a claim that failed with an exception went through after all. */
-    private static boolean claimedHere(ClusterQueue cq, long id) {
-        try {
-            ClusterQueue.Record r = cq.get(id);
-            return r != null && origin().equals(r.claimedBy());
-        } catch (IOException | RuntimeException e) {
-            return false;
-        }
-    }
 
     @Restricted(NoExternalUse.class)
     @Extension

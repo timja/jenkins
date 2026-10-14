@@ -120,6 +120,19 @@ class ClusterCoordinationTest {
     }
 
     @Test
+    void stopRequestedBeforeTheBuildIsRegisteredStopsIt() throws Exception {
+        // requested once another controller saw the placeholder, before this one had registered the build as its own
+        other.write("jobs/early/running/1.stop", bytes("controller=jenkins-b\nby=alice\n"), PersistenceStore.ANY);
+        awaitApplied();
+        CountDownLatch started = new CountDownLatch(1);
+        FreeStyleProject p = blocking(r, "early", started, new CountDownLatch(1));
+
+        FreeStyleBuild b = p.scheduleBuild2(0).get(60, TimeUnit.SECONDS);
+        assertEquals(Result.ABORTED, b.getResult());
+        assertThat(b.getLog(), containsString("Stopped from jenkins-b by alice"));
+    }
+
+    @Test
     void stopOfABuildRunningHereIsImmediate() throws Exception {
         CountDownLatch started = new CountDownLatch(1);
         FreeStyleProject p = blocking(r, "local", started, new CountDownLatch(1));
