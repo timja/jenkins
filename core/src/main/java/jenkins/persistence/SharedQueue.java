@@ -45,6 +45,7 @@ import hudson.model.listeners.RunListener;
 import hudson.model.queue.CauseOfBlockage;
 import hudson.model.queue.FoldableAction;
 import hudson.model.queue.QueueListener;
+import hudson.model.queue.SubTask;
 import hudson.security.ACL;
 import hudson.security.ACLContext;
 import hudson.util.DaemonThreadFactory;
@@ -67,6 +68,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -821,7 +823,14 @@ public final class SharedQueue {
                 if (executors <= 0) {
                     break;
                 }
-                if (!shared(bi.task) || !Objects.equals(label, bi.getAssignedLabel())) {
+                // demand is counted per part of the task (as LoadStatistics does): any part needing this label
+                int needing = 0;
+                for (SubTask st : bi.task.getSubTasks()) {
+                    if (Objects.equals(label, bi.getAssignedLabelFor(st))) {
+                        needing++;
+                    }
+                }
+                if (!shared(bi.task) || needing == 0) {
                     continue;
                 }
                 try {
@@ -830,7 +839,7 @@ public final class SharedQueue {
                         continue;
                     }
                     store.write(key(bi.getId()), (me + " " + System.currentTimeMillis()).getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
-                    executors--;
+                    executors -= needing;
                     LOGGER.fine(() -> "Reserved " + bi + " while starting an agent for it on " + cloud.name);
                 } catch (IOException | RuntimeException e) {
                     LOGGER.log(Level.FINE, e, () -> "Could not reserve " + bi);
@@ -843,6 +852,21 @@ public final class SharedQueue {
     @SuppressFBWarnings(value = "MS_SHOULD_BE_FINAL", justification = "for the script console")
     public static /* non-final for tests and the script console */ long RESERVATION_MILLIS =
             SystemProperties.getLong(SharedQueue.class.getName() + ".reservationMillis", 5 * 60_000L);
+
+    /** The live controller which provisions for an item whose controller is gone: highest hash of item and controller. */
+    @CheckForNull
+    static String provisioner(long id, @NonNull Set<String> live) {
+        String chosen = null;
+        int best = 0;
+        for (String o : new TreeSet<>(live)) {
+            int h = (o + "#" + id).hashCode();
+            if (chosen == null || h > best) {
+                chosen = o;
+                best = h;
+            }
+        }
+        return chosen;
+    }
 
     @Restricted(NoExternalUse.class)
     @Extension
@@ -878,7 +902,15 @@ public final class SharedQueue {
                     answer = true;
                 } else {
                     Set<String> live = PersistenceStores.get().liveOrigins();
-                    answer = live != null && !live.contains(r.origin());
+                    if (live == null) {
+                        // membership unknown: as the gate decides, its controller goes first, any other after a while
+                        answer = now > r.dueAt() + ORIGIN_GRACE_MILLIS;
+                    } else if (live.contains(r.origin())) {
+                        answer = false;
+                    } else {
+                        // its controller is gone: one of the others provisions, the same one whichever of them asks
+                        answer = me.equals(provisioner(r.id(), live));
+                    }
                 }
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.FINE, e, () -> "Cannot tell who provisions for " + item);
