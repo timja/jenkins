@@ -37,21 +37,27 @@ import hudson.model.Saveable;
 import hudson.model.listeners.RunListener;
 import hudson.model.listeners.SaveableListener;
 import hudson.util.DirScanner;
+import hudson.util.FileVisitor;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InterruptedIOException;
 import java.io.OutputStream;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.stream.Stream;
 import java.util.zip.GZIPOutputStream;
 import jenkins.util.ThrowingCallable;
 import org.kohsuke.accmod.Restricted;
@@ -78,6 +84,8 @@ import org.kohsuke.accmod.restrictions.NoExternalUse;
 public final class BuildRecords {
 
     private static final Logger LOGGER = Logger.getLogger(BuildRecords.class.getName());
+    /** Stores warned about, once each. */
+    private static final Set<String> WARNED = ConcurrentHashMap.newKeySet();
 
     static final String RECORD = "build.xml";
     static final String SNAPSHOT = "files.tgz";
@@ -116,6 +124,13 @@ public final class BuildRecords {
         }
         String jobKey = PersistenceStores.keyFor(job.getRootDir());
         if (jobKey == null || !store.storesBuildRecords(jobKey)) {
+            return null;
+        }
+        if (!store.owns(jobKey + "/nextBuildNumber")) {
+            // controllers numbering builds each on their own would publish the same numbers over each other's
+            if (WARNED.add(store.getClass().getName())) {
+                LOGGER.warning(() -> store.getClass().getName() + " stores build records but not build numbers; builds are not shared");
+            }
             return null;
         }
         return jobKey + "/builds";
@@ -179,7 +194,7 @@ public final class BuildRecords {
             Path snapshot = Files.createTempFile("build-snapshot", ".tgz");
             try {
                 try (OutputStream out = new GZIPOutputStream(Files.newOutputStream(snapshot))) {
-                    new FilePath(dir).tar(out, new DirScanner.Glob("**", String.join(",", excludes), false));
+                    new FilePath(dir).tar(out, new OwnFiles(new DirScanner.Glob("**", String.join(",", excludes), false, LinkOption.NOFOLLOW_LINKS)));
                 } catch (InterruptedException e) {
                     throw (IOException) new InterruptedIOException().initCause(e);
                 }
@@ -190,7 +205,17 @@ public final class BuildRecords {
                 Files.deleteIfExists(snapshot);
             }
         }
-        PersistenceStores.get().write(base + "/" + RECORD, Files.readAllBytes(record), PersistenceStore.ANY);
+        byte[] published = Files.readAllBytes(record);
+        PersistenceStores.get().write(base + "/" + RECORD, published, PersistenceStore.ANY);
+        // a save made while publishing found no record yet, so republish left it to this: include it
+        for (int i = 0; i < 10; i++) {
+            byte[] now = Files.readAllBytes(record);
+            if (Arrays.equals(now, published)) {
+                break;
+            }
+            PersistenceStores.get().write(base + "/" + RECORD, now, PersistenceStore.ANY);
+            published = now;
+        }
         LOGGER.fine(() -> "Published " + run);
     }
 
@@ -253,6 +278,7 @@ public final class BuildRecords {
             try (InputStream in = blobs.get(base + "/" + SNAPSHOT)) {
                 if (in != null) {
                     new FilePath(dir).untarFrom(in, FilePath.TarCompression.GZIP);
+                    removeLinks(dir.toPath());
                 }
             } catch (InterruptedException e) {
                 throw (IOException) new InterruptedIOException().initCause(e);
@@ -261,9 +287,65 @@ public final class BuildRecords {
         // last, as on the publishing side: a local build.xml means the directory is complete
         Path tmp = Files.createTempFile(dir.toPath(), RECORD, ".tmp");
         Files.write(tmp, record.content());
-        Files.move(tmp, new File(dir, RECORD).toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        try {
+            Files.move(tmp, new File(dir, RECORD).toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        } catch (AtomicMoveNotSupportedException e) {
+            Files.move(tmp, new File(dir, RECORD).toPath(), StandardCopyOption.REPLACE_EXISTING); // as AtomicFileWriter does
+        }
         LOGGER.fine(() -> "Materialized " + job.getFullName() + " #" + dir.getName());
         return true;
+    }
+
+    /**
+     * Scans a build directory for its own files only: symbolic links, and anything outside the directory, are left
+     * out, so that a snapshot never carries what a link points to elsewhere on this controller, nor a link to recreate
+     * on another one.
+     */
+    static final class OwnFiles extends DirScanner {
+        private static final long serialVersionUID = 1L;
+        private final DirScanner scanner;
+
+        OwnFiles(DirScanner scanner) {
+            this.scanner = scanner;
+        }
+
+        @Override
+        public void scan(File dir, FileVisitor visitor) throws IOException {
+            Path root = dir.toPath().toRealPath();
+            scanner.scan(dir, new FileVisitor() {
+                @Override
+                public void visit(File f, String relativePath) throws IOException {
+                    Path path = f.toPath();
+                    if (!Files.isSymbolicLink(path) && path.toRealPath().startsWith(root)) {
+                        visitor.visit(f, relativePath);
+                    } else {
+                        LOGGER.fine(() -> "Leaving " + f + " out of the build snapshot: a link, or outside " + root);
+                    }
+                }
+
+                @Override
+                public boolean understandsSymlink() {
+                    return true;
+                }
+
+                @Override
+                public void visitSymlink(File link, String target, String relativePath) {
+                    LOGGER.fine(() -> "Leaving link " + link + " out of the build snapshot");
+                }
+            });
+        }
+    }
+
+    /** Deletes any symbolic links below a directory just materialized: a build's files are never links. */
+    static void removeLinks(Path dir) throws IOException {
+        List<Path> links;
+        try (Stream<Path> paths = Files.walk(dir)) {
+            links = paths.filter(Files::isSymbolicLink).toList();
+        }
+        for (Path link : links) {
+            LOGGER.warning(() -> "Removing link " + link + " from a materialized build snapshot");
+            Files.delete(link);
+        }
     }
 
     /**
