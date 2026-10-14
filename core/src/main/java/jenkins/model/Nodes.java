@@ -364,7 +364,10 @@ public class Nodes implements PersistenceRoot {
             return;
         }
         if (old != null) {
-            jenkins.updateComputerList(); // rebind the computer to the new node object
+            Queue.withLock(() -> {
+                jenkins.updateComputerList(); // rebind the computer to the new node object
+                jenkins.trimLabels(old, loaded); // as a local replacement does: a label removed elsewhere leaves it now
+            });
             NodeListener.fireOnUpdated(old, loaded);
         } else {
             NodeListener.fireOnCreated(loaded);
