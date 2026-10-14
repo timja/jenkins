@@ -34,9 +34,12 @@ import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
 
 /**
- * Marks periodic work (a {@link hudson.model.PeriodicWork}) which must run once per cluster of controllers sharing state,
- * not once per controller, for example because it acts on shared data such as builds of every job.
- * Each run is subject to {@link PeriodicWorkCoordinator}. Work without it runs on every controller, as usual.
+ * Marks periodic work (a {@link hudson.model.PeriodicWork}) which should run on one controller of a cluster sharing
+ * state, not on each, for example because it acts on shared data such as builds of every job.
+ * Each scheduled run is subject to {@link PeriodicWorkCoordinator}: with one installed, at most one controller attempts
+ * each period, and a period may be skipped (a refusal, a failing coordinator, a controller dying after claiming it).
+ * Without one, every controller runs it, as usual. Such work should therefore be idempotent and tolerate a missed period;
+ * it is not run exactly once.
  *
  * @since TODO
  */

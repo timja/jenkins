@@ -29,7 +29,10 @@ import static org.hamcrest.Matchers.greaterThan;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import hudson.model.FingerprintCleanupThread;
 import hudson.model.PeriodicWork;
+import java.io.File;
+import java.nio.file.Files;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -53,6 +56,18 @@ class PeriodicWorkCoordinatorTest {
         Coordinator.allow = true;
         Thread.sleep(2_000);
         assertThat(Singleton.runs.get(), greaterThan(0));
+    }
+
+    @Test
+    void cleanupAskedForRunsWhateverTheCoordinatorSays(JenkinsRule r) throws Exception {
+        Coordinator.allow = false;
+        File log = new File(r.jenkins.getRootDir(), "logs/tasks/Fingerprint cleanup.log");
+        Files.deleteIfExists(log.toPath());
+        FingerprintCleanupThread.invoke(); // as POST /fingerprintCleanup does
+        for (int i = 0; i < 100 && !log.isFile(); i++) {
+            Thread.sleep(100);
+        }
+        assertTrue(log.isFile(), "the cleanup ran");
     }
 
     @ClusterSingleton
