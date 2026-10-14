@@ -26,10 +26,12 @@ package jenkins.persistence;
 
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
@@ -55,6 +57,10 @@ public class InMemoryPersistenceStore implements PersistenceStore {
     private final String origin;
     private final Map<String, Entry> entries;
     private final List<Consumer<ChangeEvent>> listeners;
+    /** Changes made but not yet delivered, in the order they were made: added to under the data lock. */
+    private final Queue<ChangeEvent> outbox;
+    /** Held while delivering, so that changes are delivered one at a time, in order, but not under the data lock. */
+    private final Object delivering;
     /** Versions come from one counter, so a key that is deleted and recreated never repeats a version. */
     private long clock;
 
@@ -67,6 +73,8 @@ public class InMemoryPersistenceStore implements PersistenceStore {
         this.origin = UUID.randomUUID().toString();
         this.entries = new TreeMap<>();
         this.listeners = new CopyOnWriteArrayList<>();
+        this.outbox = new ArrayDeque<>();
+        this.delivering = new Object();
     }
 
     private InMemoryPersistenceStore(InMemoryPersistenceStore root, String origin) {
@@ -75,6 +83,8 @@ public class InMemoryPersistenceStore implements PersistenceStore {
         this.origin = origin;
         this.entries = root.entries;
         this.listeners = root.listeners;
+        this.outbox = root.outbox;
+        this.delivering = root.delivering;
     }
 
     /**
@@ -97,10 +107,23 @@ public class InMemoryPersistenceStore implements PersistenceStore {
         return () -> listeners.remove(listener);
     }
 
-    private void fire(List<ChangeEvent> events) {
-        for (ChangeEvent e : events) {
-            for (Consumer<ChangeEvent> l : listeners) {
-                l.accept(e);
+    /**
+     * Delivers the changes made so far in the order they were made, as {@link #subscribe} promises: two threads
+     * committing one after the other must not have their changes delivered the other way round.
+     */
+    private void deliver() {
+        synchronized (delivering) {
+            while (true) {
+                ChangeEvent e;
+                synchronized (root) {
+                    e = outbox.poll();
+                }
+                if (e == null) {
+                    return;
+                }
+                for (Consumer<ChangeEvent> l : listeners) {
+                    l.accept(e);
+                }
             }
         }
     }
@@ -133,8 +156,9 @@ public class InMemoryPersistenceStore implements PersistenceStore {
             }
             version = ++root.clock;
             entries.put(key, new Entry(content.clone(), version));
+            outbox.add(new ChangeEvent(ChangeEvent.Kind.WRITTEN, key, null, version, origin));
         }
-        fire(List.of(new ChangeEvent(ChangeEvent.Kind.WRITTEN, key, null, version, origin)));
+        deliver();
         return version;
     }
 
@@ -151,8 +175,9 @@ public class InMemoryPersistenceStore implements PersistenceStore {
             }
             entries.remove(key);
             version = ++root.clock;
+            outbox.add(new ChangeEvent(ChangeEvent.Kind.DELETED, key, null, version, origin));
         }
-        fire(List.of(new ChangeEvent(ChangeEvent.Kind.DELETED, key, null, version, origin)));
+        deliver();
     }
 
     @Override
@@ -198,8 +223,9 @@ public class InMemoryPersistenceStore implements PersistenceStore {
                 moved.add(new Moved(key, old.version(), newKey, version));
                 events.add(new ChangeEvent(ChangeEvent.Kind.MOVED, newKey, key, version, origin));
             }
+            outbox.addAll(events);
         }
-        fire(events);
+        deliver();
         return moved;
     }
 
