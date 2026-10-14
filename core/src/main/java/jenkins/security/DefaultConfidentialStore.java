@@ -16,6 +16,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
+import java.nio.file.LinkOption;
 import java.security.GeneralSecurityException;
 import java.security.SecureRandom;
 import java.util.logging.Logger;
@@ -210,7 +211,15 @@ public class DefaultConfidentialStore extends ConfidentialStore {
             return;
         }
         for (File f : files) {
+            if (!Files.isRegularFile(f.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+                continue; // directories (e.g. filepath-filters.d) and links are not keys
+            }
             byte[] encrypted = Files.readAllBytes(f.toPath());
+            if (!cs.isKey(encrypted)) {
+                // secrets/ holds other files too (e.g. the setup wizard's initial password, in plain text): they stay here
+                LOGGER.fine(() -> f.getName() + " is not a confidential key; not sharing it");
+                continue;
+            }
             String storeKey = SHARED_PREFIX + f.getName();
             PersistenceStore.Entry shared = store.read(storeKey);
             if (shared == null) {
@@ -255,6 +264,19 @@ public class DefaultConfidentialStore extends ConfidentialStore {
             } else {
                 throw x;
             }
+        }
+    }
+
+    /** Whether a file's content is a key this store wrote: encrypted with the master key, with the trailer. */
+    private boolean isKey(byte[] content) {
+        try {
+            Cipher sym = Secret.getCipher("AES");
+            sym.init(Cipher.DECRYPT_MODE, masterKey);
+            try (CipherInputStream cis = new CipherInputStream(new ByteArrayInputStream(content), sym)) {
+                return verifyMagic(cis.readAllBytes()) != null;
+            }
+        } catch (GeneralSecurityException | IOException e) {
+            return false;
         }
     }
 

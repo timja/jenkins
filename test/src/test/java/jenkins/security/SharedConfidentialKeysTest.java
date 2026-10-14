@@ -27,14 +27,18 @@ package jenkins.security;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.File;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import jenkins.persistence.ConflictException;
 import jenkins.persistence.InMemoryPersistenceStore;
 import jenkins.persistence.PersistenceStore;
 import jenkins.persistence.PersistenceStoreProvider;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.TestExtension;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
@@ -45,7 +49,25 @@ import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 @WithJenkins
 class SharedConfidentialKeysTest {
 
-    static final InMemoryPersistenceStore STORE = new InMemoryPersistenceStore(key -> false);
+    /** The key whose first read finds it absent while another controller creates it, and that controller's value. */
+    static volatile String racing;
+    static volatile byte[] theirs;
+
+    static final InMemoryPersistenceStore STORE = new InMemoryPersistenceStore(key -> false) {
+        @Override
+        public Entry read(String key) {
+            Entry e = super.read(key);
+            if (e == null && key.equals(racing)) {
+                racing = null;
+                try {
+                    as("other-controller").write(key, theirs, PersistenceStore.ABSENT); // just after this read
+                } catch (ConflictException x) {
+                    throw new AssertionError(x);
+                }
+            }
+            return e;
+        }
+    };
 
     private static File localFile(JenkinsRule r, String id) {
         return new File(r.jenkins.getRootDir(), "secrets/" + id);
@@ -84,6 +106,34 @@ class SharedConfidentialKeysTest {
         STORE.delete("secrets/test.shared.k5", PersistenceStore.ANY); // e.g. created before the store was available
         DefaultConfidentialStore.reconcile();
         assertArrayEquals(Files.readAllBytes(localFile(r, "test.shared.k5").toPath()), STORE.read("secrets/test.shared.k5").content());
+    }
+
+    @Test
+    void keyCreatedElsewhereBetweenReadingAndWritingWins(JenkinsRule r) throws Exception {
+        CryptoConfidentialKey reference = new CryptoConfidentialKey("test.shared.k6");
+        byte[] expected = reference.encrypt().doFinal("hello".getBytes());
+        theirs = STORE.read("secrets/test.shared.k6").content(); // the other controller's value: the same as k6
+        racing = "secrets/test.shared.k7";
+        CryptoConfidentialKey k7 = new CryptoConfidentialKey("test.shared.k7");
+        assertArrayEquals(expected, k7.encrypt().doFinal("hello".getBytes()), "the value created first, elsewhere");
+        assertArrayEquals(theirs, Files.readAllBytes(localFile(r, "test.shared.k7").toPath()), "kept locally");
+    }
+
+    @Test
+    void onlyKeysAreShared(JenkinsRule r, @TempDir Path elsewhere) throws Exception {
+        Files.writeString(localFile(r, "initialAdminPassword").toPath(), "letmein"); // plain text, as the setup wizard writes
+        Files.createDirectories(localFile(r, "some.d").toPath());
+        Path target = Files.writeString(elsewhere.resolve("file"), "outside");
+        Files.createSymbolicLink(localFile(r, "linked").toPath(), target);
+        new HexStringConfidentialKey("test.shared.k8", 32).get();
+        STORE.delete("secrets/test.shared.k8", PersistenceStore.ANY);
+
+        DefaultConfidentialStore.reconcile();
+
+        assertNull(STORE.read("secrets/initialAdminPassword"));
+        assertNull(STORE.read("secrets/some.d"));
+        assertNull(STORE.read("secrets/linked"));
+        assertNotNull(STORE.read("secrets/test.shared.k8"), "a key still is");
     }
 
     @TestExtension
