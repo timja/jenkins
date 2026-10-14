@@ -25,16 +25,20 @@
 package jenkins.triggers;
 
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
 import hudson.model.FreeStyleProject;
+import hudson.triggers.SCMTrigger;
 import hudson.triggers.TimerTrigger;
 import hudson.triggers.Trigger;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.TestExtension;
@@ -60,6 +64,42 @@ class TriggerCoordinatorTest {
         assertNotNull(mine.getLastBuild(), "trigger allowed here ran");
         assertNull(theirs.getLastBuild(), "trigger left to another controller did not run");
         assertThat(Coordinator.asked, containsAll("mine", "theirs"));
+    }
+
+    @Test
+    void synchronousPollingIsAskedAboutTheMinuteItWasStartedFor(JenkinsRule r) throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("polled");
+        p.addTrigger(new SCMTrigger("* * * * *"));
+        p.getTrigger(SCMTrigger.class).start(p, true);
+        FreeStyleProject timed = r.createFreeStyleProject("timed");
+        timed.addTrigger(new TimerTrigger("* * * * *"));
+        timed.getTrigger(TimerTrigger.class).start(timed, true);
+        r.jenkins.getDescriptorByType(SCMTrigger.DescriptorImpl.class).synchronousPolling = true;
+
+        Calendar cal = Calendar.getInstance();
+        cal.set(2026, Calendar.OCTOBER, 14, 12, 34, 0);
+        Trigger.checkTriggers(cal);
+        assertEquals(34, cal.get(Calendar.MINUTE), "a coordinator moving its tick does not move the scheduler's");
+        cal.add(Calendar.MINUTE, 1); // as Trigger.Cron does once checkTriggers returns, while the polling still runs
+
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (!MinuteRecorder.minutes.containsKey("polled") && System.currentTimeMillis() < deadline) {
+            Thread.sleep(50);
+        }
+        assertEquals(34, MinuteRecorder.minutes.get("polled"));
+        assertEquals(34, MinuteRecorder.minutes.get("timed"));
+    }
+
+    @TestExtension("synchronousPollingIsAskedAboutTheMinuteItWasStartedFor")
+    public static class MinuteRecorder implements TriggerCoordinator {
+        static final Map<String, Integer> minutes = new ConcurrentHashMap<>();
+
+        @Override
+        public boolean shouldRun(TriggeredItem item, Trigger<?> trigger, Calendar tick) {
+            minutes.put(item.getName(), tick.get(Calendar.MINUTE));
+            tick.add(Calendar.HOUR, 5); // a careless coordinator
+            return false;
+        }
     }
 
     private static org.hamcrest.Matcher<Iterable<? extends String>> containsAll(String... names) {
