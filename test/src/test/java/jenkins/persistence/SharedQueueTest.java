@@ -57,6 +57,7 @@ import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.atomic.AtomicReference;
 import jenkins.model.Jenkins;
 import org.htmlunit.HttpMethod;
 import org.htmlunit.WebRequest;
@@ -367,17 +368,21 @@ class SharedQueueTest {
             for (int round = 1; round <= 5; round++) {
                 // the other controller publishes the job at the same moment as it is scheduled here
                 long id = other.nextId();
+                AtomicReference<Throwable> failed = new AtomicReference<>();
                 Thread elsewhere = new Thread(() -> {
                     try {
                         other.publish(new ClusterQueue.Record(id, "race", "race", SharedQueue.toXml(List.of(new CauseAction(new Cause.UserIdCause("there")))),
                                 System.currentTimeMillis() + 1_000, ClusterQueue.State.WAITING, "other-controller", null, null, 0));
-                    } catch (Exception e) {
-                        throw new AssertionError(e);
+                    } catch (Throwable t) {
+                        failed.set(t);
                     }
                 });
                 elsewhere.start();
                 p.scheduleBuild2(1, new CauseAction(new Cause.UserIdCause("here")));
                 elsewhere.join();
+                if (failed.get() != null) {
+                    throw new AssertionError("publishing elsewhere failed, so the race was not exercised", failed.get());
+                }
                 for (int i = 0; i < 150 && (p.getBuilds().size() < round || p.isBuilding() || !Queue.getInstance().isEmpty()); i++) {
                     Thread.sleep(100);
                 }
