@@ -104,6 +104,8 @@ public final class BuildRecords {
 
     static final String RECORD = "build.xml";
     static final String SNAPSHOT = "files.tgz";
+    /** The stand-in snapshot of a build closed as lost: its own key, so that it never replaces a real snapshot. */
+    static final String LOST_SNAPSHOT = "lost.tgz";
 
     /**
      * Never part of a snapshot: the record itself, artifacts (use an external {@link jenkins.model.ArtifactManager}),
@@ -263,6 +265,8 @@ public final class BuildRecords {
         RunningBuilds.Placeholder lease = PersistenceStores.get().leases() == null ? null : RunningBuilds.ownedPlaceholder(run);
         // uploaded under a name of its own first, which a controller that lost the build cannot put over the owner's
         String upload = lease == null ? SNAPSHOT : SNAPSHOT + "." + lease.getEpoch();
+        // before the snapshot: a file added while it is made and uploaded then differs from this, and is published later
+        String signature = signature(dir);
         BlobStore blobs = PersistenceStores.getBlobStore();
         if (blobs != null) {
             List<String> excludes = new ArrayList<>(DEFAULT_EXCLUDES);
@@ -296,15 +300,27 @@ public final class BuildRecords {
             LOGGER.fine(() -> "Not publishing " + run + ": deleted while being published");
             return;
         }
+        PersistenceStore store = PersistenceStores.get();
         try {
             byte[] published = Files.readAllBytes(record);
-            byte[] content = published;
-            if (filesChanged) {
-                content = (new String(content, StandardCharsets.UTF_8) + "\n<!-- files updated " + System.currentTimeMillis() + " -->")
-                        .getBytes(StandardCharsets.UTF_8);
+            PersistenceStore.Entry stored = filesChanged ? store.read(base + "/" + RECORD) : null;
+            if (stored != null) {
+                // only the files changed: mark the stored record (telling other controllers to fetch the snapshot again),
+                // rather than writing this controller's copy over an edit made elsewhere since
+                byte[] marked = (new String(stored.content(), StandardCharsets.UTF_8).replaceAll("\n<!-- files updated \\d+ -->$", "")
+                        + "\n<!-- files updated " + System.currentTimeMillis() + " -->").getBytes(StandardCharsets.UTF_8);
+                try {
+                    store.write(base + "/" + RECORD, marked, stored.version());
+                } catch (ConflictException e) {
+                    LOGGER.fine(() -> run + " changed meanwhile; its files are published with the next sweep");
+                    return;
+                }
+                recentlyPublished.put(base, new Published(new java.lang.ref.WeakReference<>(run), signature, System.currentTimeMillis()));
+                LOGGER.fine(() -> "Published files added to " + run);
+                return;
             }
-            publishRecord(lease, base + "/" + RECORD, content);
-            recentlyPublished.put(base, new Published(new java.lang.ref.WeakReference<>(run), signature(dir), System.currentTimeMillis()));
+            publishRecord(lease, base + "/" + RECORD, published);
+            recentlyPublished.put(base, new Published(new java.lang.ref.WeakReference<>(run), signature, System.currentTimeMillis()));
             // a save made while publishing found no record yet, so republish left it to this: include it
             for (int i = 0; i < 10; i++) {
                 byte[] now = Files.readAllBytes(record);
@@ -435,7 +451,7 @@ public final class BuildRecords {
                 + "  <startTime>" + startTime + "</startTime>\n  <result>ABORTED</result>\n  <duration>0</duration>\n"
                 + "  <charset>UTF-8</charset>\n  <keepLog>false</keepLog>\n  <completed>true</completed>\n</" + tag + ">";
         BlobStore blobs = PersistenceStores.getBlobStore();
-        if (blobs != null && !hasBlob(blobs, base + "/" + SNAPSHOT)) {
+        if (blobs != null) {
             Path dir = Files.createTempDirectory("lost-build");
             Path snapshot = Files.createTempFile("lost-build", ".tgz");
             try {
@@ -446,7 +462,7 @@ public final class BuildRecords {
                     throw (IOException) new InterruptedIOException().initCause(e);
                 }
                 try (InputStream in = Files.newInputStream(snapshot)) {
-                    blobs.put(base + "/" + SNAPSHOT, in, Files.size(snapshot));
+                    blobs.put(base + "/" + LOST_SNAPSHOT, in, Files.size(snapshot));
                 }
             } finally {
                 Files.deleteIfExists(snapshot);
@@ -459,14 +475,9 @@ public final class BuildRecords {
             writtenElsewhere(job, number); // this controller's own write raises no event here
         } catch (ConflictException e) {
             LOGGER.fine(() -> job.getFullName() + " #" + number + " was published meanwhile");
-        }
-    }
-
-    private static boolean hasBlob(BlobStore blobs, String key) {
-        try (InputStream in = blobs.get(key)) {
-            return in != null;
-        } catch (IOException e) {
-            return false;
+            if (blobs != null) {
+                blobs.delete(base + "/" + LOST_SNAPSHOT); // its owner's real record and snapshot stand
+            }
         }
     }
 
@@ -739,6 +750,9 @@ public final class BuildRecords {
         InputStream snapshot = null;
         if (blobs != null) {
             snapshot = blobs.get(base + "/" + SNAPSHOT);
+            if (snapshot == null) {
+                snapshot = blobs.get(base + "/" + LOST_SNAPSHOT); // closed as lost: only the stand-in
+            }
             if (snapshot == null) {
                 // a record is stored only once its snapshot is: the snapshot is moving (a rename in progress), so the
                 // build is left unmaterialized rather than taken as complete without its files; it is retrieved again

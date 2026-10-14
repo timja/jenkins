@@ -1,5 +1,7 @@
 <?jelly escape-by-default='true'?>
-<!-- builds of this job running on other controllers of a cluster (cloud-native Jenkins) -->
+<!-- builds of this job running on other controllers of a cluster (cloud-native Jenkins). Their links name a build this
+     controller does not have: they are answered by the controller running it, through the owner routing a cluster
+     installs (such as the cluster plugin's); without that they find nothing until the build completes. -->
 <j:jelly xmlns:j="jelly:core" xmlns:l="/lib/layout" xmlns:i="jelly:fmt">
   <j:forEach var="p" items="${it.runningElsewhere}">
     <j:set var="link" value="${it.widget.baseUrl}/${p.number}/" />

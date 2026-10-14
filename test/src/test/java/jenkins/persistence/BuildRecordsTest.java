@@ -435,6 +435,21 @@ class BuildRecordsTest {
     }
 
     @Test
+    void lateFilesKeepAnEditMadeElsewhere() throws Exception {
+        FreeStyleProject p = project(r, "edited-late");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p);
+        String key = "jobs/edited-late/builds/1/build.xml";
+        // another controller edits the completed build (its description), and this one has not applied that yet
+        // (written as this controller, so that it is never applied here)
+        STORE.write(key, record(key).replace("<keepLog>", "<description>set elsewhere</description><keepLog>")
+                .getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        Files.writeString(new File(b.getRootDir(), "late.txt").toPath(), "added later");
+        hudson.model.AsyncPeriodicWork.all().get(BuildRecords.LateFiles.class).execute(hudson.model.TaskListener.NULL);
+        assertThat(record(key), containsString("set elsewhere"));
+        assertThat(record(key), containsString("files updated"));
+    }
+
+    @Test
     void deletedJobIsDroppedFromTheLateFilesSweep() throws Exception {
         FreeStyleProject p = project(r, "gone");
         r.buildAndAssertSuccess(p);
@@ -450,6 +465,7 @@ class BuildRecordsTest {
         r.buildAndAssertSuccess(p);
         BuildRecords.publishLost(p, 2, System.currentTimeMillis(), "It was running on a controller which is gone.");
         assertNotNull(record("jobs/lost/builds/2/build.xml"));
+        assertNull(BLOBS.get("jobs/lost/builds/2/files.tgz"), "the stand-in has a key of its own");
         assertEquals(hudson.model.Result.ABORTED, p.getBuildByNumber(2).getResult(), "the publishing controller lists it too");
         wipeAndReload(r);
         FreeStyleBuild lost = r.jenkins.getItemByFullName("lost", FreeStyleProject.class).getBuildByNumber(2);
