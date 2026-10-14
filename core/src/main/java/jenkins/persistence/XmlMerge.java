@@ -55,7 +55,8 @@ import org.w3c.dom.Node;
  *
  * <p>The unit of merging is a direct child of the root element, by name (all children of one name together, so lists
  * merge as wholes): a unit only one side changed takes that side's version; a unit both changed takes mine and counts as a
- * conflict. The root's attributes are one more unit.
+ * conflict, unless it is a single element with the same attributes on every side whose children are all distinctly
+ * named: those children are then merged the same way, recursively. The root's attributes are one more unit.
  */
 @Restricted(NoExternalUse.class)
 public final class XmlMerge {
@@ -255,7 +256,8 @@ public final class XmlMerge {
         if (s.startsWith("<?xml")) {
             int end = s.indexOf("?>");
             if (end > 0) {
-                return s.substring(0, end + 2);
+                // the merge is written in UTF-8, whatever mine said
+                return s.substring(0, end + 2).replaceFirst("encoding\\s*=\\s*(['\"])[^'\"]*\\1", "encoding='UTF-8'");
             }
         }
         return "<?xml version='1.1' encoding='UTF-8'?>";

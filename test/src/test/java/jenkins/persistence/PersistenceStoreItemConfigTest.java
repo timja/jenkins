@@ -125,6 +125,7 @@ class PersistenceStoreItemConfigTest {
         assertThat(STORE.versions(), hasKey("jobs/d/config.xml"));
         p.delete();
         assertThat(STORE.versions(), not(hasKey("jobs/d/config.xml")));
+        assertFalse(PersistenceStores.hasSnapshot("jobs/d/config.xml"), "nothing kept of it in memory either");
         assertNotNull(r.jenkins);
     }
 
