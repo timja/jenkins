@@ -152,6 +152,17 @@ class SharedQueueTest {
         assertTrue(SharedQueue.Mirror.isIdle());
     }
 
+    /** The shared record of an item, once the outbox (which shares off the queue lock) has shared it as expected. */
+    private static ClusterQueue.Record awaitShared(long id, java.util.function.Predicate<ClusterQueue.Record> as) throws Exception {
+        ClusterQueue.Record rec = STORE.clusterQueue().get(id);
+        for (int i = 0; i < 500 && (rec == null || !as.test(rec)); i++) {
+            Thread.sleep(10);
+            rec = STORE.clusterQueue().get(id);
+        }
+        assertNotNull(rec, "shared");
+        return rec;
+    }
+
     /** Publishes an item as the other controller would. */
     private ClusterQueue.Record publishElsewhere(String job, long dueInMillis, String user) throws Exception {
         List<Action> actions = List.of(new CauseAction(new Cause.UserIdCause(user)));
@@ -179,7 +190,7 @@ class SharedQueueTest {
         FreeStyleProject p = r.createFreeStyleProject("local");
         r.buildAndAssertSuccess(p);
         long id = p.getLastBuild().getQueueId();
-        ClusterQueue.Record rec = STORE.clusterQueue().get(id);
+        ClusterQueue.Record rec = awaitShared(id, x -> x.state() == ClusterQueue.State.STARTED);
         assertNotNull(rec);
         assertEquals("local", rec.task());
         assertEquals(ClusterQueue.State.STARTED, rec.state());
@@ -254,7 +265,7 @@ class SharedQueueTest {
         FreeStyleProject p = r.createFreeStyleProject("ours");
         p.scheduleBuild2(60, new CauseAction(new Cause.UserIdCause("grace")));
         Queue.Item local = Queue.getInstance().getItems()[0];
-        ClusterQueue.Record rec = STORE.clusterQueue().get(local.getId());
+        ClusterQueue.Record rec = awaitShared(local.getId(), x -> true);
         // another controller folds a request into it
         List<Action> merged = List.of(new CauseAction(new Cause.UserIdCause("grace"), new Cause.UserIdCause("heidi")));
         other.update(rec.id(), SharedQueue.toXml(merged), rec.dueAt());
