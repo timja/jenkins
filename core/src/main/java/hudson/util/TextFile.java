@@ -44,6 +44,7 @@ import java.util.logging.Logger;
 import java.util.stream.Stream;
 import jenkins.persistence.PersistenceStore;
 import jenkins.persistence.PersistenceStores;
+import jenkins.persistence.StoredBuildNumberAssigner;
 
 /**
  * Represents a text file.
@@ -122,7 +123,9 @@ public class TextFile {
         Util.createDirectories(Util.fileToPath(file.getParentFile()));
         PersistenceStores.Route route = PersistenceStores.route(file);
         if (route != null) {
-            route.write(text.getBytes(StandardCharsets.UTF_8));
+            if (!StoredBuildNumberAssigner.writeNoLower(route, text)) {
+                route.write(text.getBytes(StandardCharsets.UTF_8));
+            }
             return;
         }
         try (AtomicFileWriter w = new AtomicFileWriter(file)) {

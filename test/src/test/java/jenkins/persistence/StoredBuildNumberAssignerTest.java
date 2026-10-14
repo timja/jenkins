@@ -128,6 +128,18 @@ class StoredBuildNumberAssignerTest {
     }
 
     @Test
+    void storedNumberIsNeverLowered() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("low");
+        r.buildAndAssertSuccess(p);
+        // other controllers went on to build 49
+        STORE.as("other").write("jobs/low/nextBuildNumber", "50\n".getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        // this controller, knowing only build 1, sets the next number lower
+        p.updateNextBuildNumber(20);
+        assertEquals("50", stored("jobs/low/nextBuildNumber"));
+        assertEquals(50, r.buildAndAssertSuccess(p).getNumber());
+    }
+
+    @Test
     void sequenceFollowsRename() throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("before");
         r.buildAndAssertSuccess(p);

@@ -24,7 +24,9 @@
 
 package jenkins.persistence;
 
+import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Extension;
+import hudson.ExtensionList;
 import hudson.model.Job;
 import java.io.File;
 import java.io.IOException;
@@ -50,6 +52,12 @@ public final class StoredBuildNumberAssigner implements Job.BuildNumberAssigner 
     public int assignBuildNumber(Job<?, ?> job, SaveNextBuildNumber saveNextBuildNumber) throws IOException {
         PersistenceStores.Route route = PersistenceStores.route(new File(job.getRootDir(), "nextBuildNumber"));
         if (route == null) {
+            // not shared: whichever assigner would have been used without this one
+            for (Job.BuildNumberAssigner other : ExtensionList.lookup(Job.BuildNumberAssigner.class)) {
+                if (other != this) {
+                    return other.assignBuildNumber(job, saveNextBuildNumber);
+                }
+            }
             // same as Job.DefaultBuildNumberAssigner
             synchronized (job) {
                 int r = job.getNextBuildNumber();
@@ -81,5 +89,51 @@ public final class StoredBuildNumberAssigner implements Job.BuildNumberAssigner 
             }
         }
         throw new IOException("Could not assign a build number for " + job.getFullName() + " after " + MAX_ATTEMPTS + " attempts");
+    }
+
+    /**
+     * Writes a job's next build number to the store, but never lowers it: a controller whose own view lags (or a
+     * request to lower the number) would otherwise hand out again numbers other controllers used. The generic conflict
+     * policy does not apply to this key: it is a compare-and-set of the higher number.
+     *
+     * @return false if the route is not a {@code nextBuildNumber} key or the text is not a number (write it as usual)
+     */
+    @Restricted(NoExternalUse.class)
+    public static boolean writeNoLower(@NonNull PersistenceStores.Route route, @NonNull String text) throws IOException {
+        if (!route.key().endsWith("/nextBuildNumber")) {
+            return false;
+        }
+        int wanted;
+        try {
+            wanted = Integer.parseInt(text.trim());
+        } catch (NumberFormatException e) {
+            return false;
+        }
+        PersistenceStore store = route.store();
+        for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+            PersistenceStore.Entry entry = store.read(route.key());
+            Integer stored = entry == null ? null : parse(entry.content());
+            if (stored != null && stored >= wanted) {
+                PersistenceStores.seen(route.key(), entry.version());
+                return true;
+            }
+            try {
+                long version = store.write(route.key(), (wanted + "\n").getBytes(StandardCharsets.UTF_8),
+                        entry == null ? PersistenceStore.ABSENT : entry.version());
+                PersistenceStores.seen(route.key(), version);
+                return true;
+            } catch (ConflictException e) {
+                // changed meanwhile: look again
+            }
+        }
+        throw new IOException("Could not save the next build number of " + route.key() + " after " + MAX_ATTEMPTS + " attempts");
+    }
+
+    private static Integer parse(byte[] content) {
+        try {
+            return Integer.parseInt(new String(content, StandardCharsets.UTF_8).trim());
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 }
