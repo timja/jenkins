@@ -35,6 +35,7 @@ import hudson.Util;
 import hudson.model.FreeStyleProject;
 import hudson.model.Items;
 import java.io.File;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -84,6 +85,32 @@ class PersistenceStoreItemLifecycleTest {
         assertThrows(ConflictException.class, () -> p.renameTo("theirs"));
         assertEquals("mine", p.getName());
         assertThat(STORE.versions(), hasKey("jobs/mine/config.xml"));
+    }
+
+    @Test
+    void renamedItemIsStillCheckedForConflicts() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("checked-before");
+        p.renameTo("checked-after");
+        // another controller changes the renamed item
+        STORE.write("jobs/checked-after/config.xml", "<?xml version='1.1' encoding='UTF-8'?><project><description>elsewhere</description></project>"
+                .getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        PersistenceStores.CONFLICTS = "fail";
+        try {
+            assertThrows(ConflictException.class, () -> p.setDescription("here"));
+        } finally {
+            PersistenceStores.CONFLICTS = "warn";
+        }
+    }
+
+    @Test
+    void moveOntoAStaleDirectoryMovesNothing() throws Exception {
+        MockFolder f = r.createFolder("stale-f");
+        FreeStyleProject p = r.createFreeStyleProject("stale-p");
+        new File(f.getRootDir(), "jobs/stale-p").mkdirs(); // left over here
+        assertThrows(IOException.class, () -> Items.move(p, f));
+        assertThat(STORE.versions(), hasKey("jobs/stale-p/config.xml"));
+        assertThat(STORE.versions(), not(hasKey("jobs/stale-f/jobs/stale-p/config.xml")));
+        assertEquals(p, r.jenkins.getItem("stale-p"));
     }
 
     @Test

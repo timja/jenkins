@@ -610,8 +610,21 @@ public class Items {
         // TODO AbstractItem.renameTo has a more baroque implementation; factor it out into a utility method perhaps?
         File destDir = destination.getRootDirFor(item);
         FileUtils.forceMkdir(destDir.getParentFile());
+        if (destDir.exists()) {
+            // checked before the store moves anything: the directory move below would fail, leaving the two apart
+            throw new IOException(destDir + " already exists");
+        }
         PersistenceStores.move(item.getRootDir(), destDir);
-        FileUtils.moveDirectory(item.getRootDir(), destDir);
+        try {
+            FileUtils.moveDirectory(item.getRootDir(), destDir);
+        } catch (IOException e) {
+            try {
+                PersistenceStores.move(destDir, item.getRootDir()); // put the stored entries back where the item still is
+            } catch (IOException x) {
+                e.addSuppressed(x);
+            }
+            throw e;
+        }
         oldParent.remove(item);
         I newItem = destination.add(item, name);
         item.movedTo(destination, newItem, destDir);
