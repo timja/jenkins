@@ -38,6 +38,7 @@ import java.io.File;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.Collection;
 import java.util.List;
@@ -45,6 +46,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -299,6 +301,59 @@ public final class PersistenceStores {
             // the entries would be moved below themselves (or over what holds them), and could not be moved back
             throw new IllegalArgumentException("Cannot move " + fromKey + " to " + toKey);
         }
+        // the destination is claimed first, so that no other move to it (on any controller) runs between checking it
+        // and moving there: blobs, moved before the entries, cannot be atomic with that check
+        long claim = claim(store, toKey, fromKey);
+        try {
+            moveClaimed(store, fromKey, toKey);
+        } finally {
+            try {
+                store.delete(toKey + MOVING, claim);
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.WARNING, "Could not release the claim on " + toKey + "; it lapses", e);
+            }
+        }
+    }
+
+    /** Suffix of the entry a move claims its destination with, next to (not below) the destination. */
+    static final String MOVING = ".moving";
+
+    /** A claim this old was left by a move that never finished (its controller died): it may be taken over. */
+    static final long CLAIM_LAPSE_MILLIS = TimeUnit.MINUTES.toMillis(10);
+
+    /** Claims a destination for a move, with a create-only write; returns the claim's version. */
+    private static long claim(PersistenceStore store, String toKey, String fromKey) throws IOException {
+        byte[] claim = (System.currentTimeMillis() + " " + store.getOrigin() + " " + fromKey).getBytes(StandardCharsets.UTF_8);
+        for (int attempt = 0; attempt < 3; attempt++) {
+            try {
+                return store.write(toKey + MOVING, claim, PersistenceStore.ABSENT);
+            } catch (ConflictException e) {
+                PersistenceStore.Entry held = store.read(toKey + MOVING);
+                if (held == null) {
+                    continue; // released meanwhile
+                }
+                String[] parts = new String(held.content(), StandardCharsets.UTF_8).split(" ", 2);
+                long since;
+                try {
+                    since = Long.parseLong(parts[0]);
+                } catch (NumberFormatException x) {
+                    since = 0;
+                }
+                if (System.currentTimeMillis() - since < CLAIM_LAPSE_MILLIS) {
+                    throw new ConflictException(toKey, PersistenceStore.ABSENT, held.version()); // another move goes there now
+                }
+                LOGGER.warning(() -> "Taking over a lapsed claim on " + toKey + " (" + parts[parts.length - 1] + ")");
+                try {
+                    store.delete(toKey + MOVING, held.version());
+                } catch (ConflictException x) {
+                    // taken over or released by someone else meanwhile: try again
+                }
+            }
+        }
+        throw new ConflictException(toKey, PersistenceStore.ABSENT, PersistenceStore.ANY);
+    }
+
+    private static void moveClaimed(PersistenceStore store, String fromKey, String toKey) throws IOException {
         if (store.read(toKey) != null || !store.children(toKey).isEmpty()) {
             // checked before touching blobs, which would otherwise overwrite those of whatever is at the destination
             throw new ConflictException(toKey, PersistenceStore.ABSENT, PersistenceStore.ANY);

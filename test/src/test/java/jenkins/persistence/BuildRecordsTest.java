@@ -33,6 +33,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import hudson.Launcher;
@@ -249,6 +250,35 @@ class BuildRecordsTest {
 
         p = r.jenkins.getItemByFullName("after", FreeStyleProject.class);
         assertThat(p.getBuildByNumber(1).getLog(), containsString("hello from #1"));
+    }
+
+    @Test
+    void aMoveClaimsItsDestinationFirst() throws Exception {
+        FreeStyleProject p = project(r, "claimer");
+        r.buildAndAssertSuccess(p);
+        // another controller is moving something to "claimed" right now
+        STORE.as("other").write("jobs/claimed.moving", (System.currentTimeMillis() + " other jobs/x").getBytes(StandardCharsets.UTF_8),
+                PersistenceStore.ABSENT);
+        assertThrows(ConflictException.class, () -> p.renameTo("claimed"));
+        assertEquals("claimer", p.getName());
+        assertNotNull(record("jobs/claimer/builds/1/build.xml"), "nothing moved");
+        assertThat(BLOBS.keys(), hasItem("jobs/claimer/builds/1/files.tgz"));
+        STORE.delete("jobs/claimed.moving", PersistenceStore.ANY);
+
+        p.renameTo("claimed");
+        assertNotNull(record("jobs/claimed/builds/1/build.xml"));
+        assertNull(STORE.read("jobs/claimed.moving"), "the claim is released");
+    }
+
+    @Test
+    void aClaimLeftByAMoveThatNeverFinishedIsTakenOver() throws Exception {
+        FreeStyleProject p = project(r, "late-claimer");
+        r.buildAndAssertSuccess(p);
+        long old = System.currentTimeMillis() - PersistenceStores.CLAIM_LAPSE_MILLIS - 1000;
+        STORE.as("dead").write("jobs/abandoned.moving", (old + " dead jobs/x").getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+        p.renameTo("abandoned");
+        assertNotNull(record("jobs/abandoned/builds/1/build.xml"));
+        assertNull(STORE.read("jobs/abandoned.moving"));
     }
 
     @Test
