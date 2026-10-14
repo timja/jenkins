@@ -165,7 +165,7 @@ public final class PersistenceStores {
      * such as {@code JENKINS_HOME/jobs} or a folder's {@code jobs} directory.
      * Use in addition to listing the directory itself: on a fresh controller, items may exist only in the store.
      *
-     * @return names whose {@code config.xml} is served by the store; empty if no store is active
+     * @return names whose {@code config.xml} the store holds; empty if no store is active
      */
     @NonNull
     public static Set<String> storedItemNames(@NonNull File itemsDir) throws IOException {
@@ -174,7 +174,10 @@ public final class PersistenceStores {
         Set<String> names = new TreeSet<>();
         if (parent != null) {
             for (String name : store.children(parent)) {
-                if (store.owns(parent + "/" + name + "/config.xml")) {
+                String config = parent + "/" + name + "/config.xml";
+                // children() also names directories with only deeper keys left (e.g. a deleted item's sub-items): an
+                // item is there only if its configuration is
+                if (store.owns(config) && store.read(config) != null) {
                     names.add(name);
                 }
             }

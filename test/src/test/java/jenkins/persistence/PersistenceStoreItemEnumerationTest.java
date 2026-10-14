@@ -27,7 +27,9 @@ package jenkins.persistence;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import hudson.Util;
@@ -89,6 +91,17 @@ class PersistenceStoreItemEnumerationTest {
         FreeStyleProject y = r.jenkins.getItemByFullName("f/y", FreeStyleProject.class);
         assertNotNull(y);
         assertEquals("nested elsewhere", y.getDescription());
+    }
+
+    @Test
+    void keysLeftBelowAGoneItemAreNoItem() throws Exception {
+        // only a sub-item's configuration is left of folder "gone"
+        STORE.write("jobs/gone/jobs/x/config.xml", "<?xml version='1.1' encoding='UTF-8'?><project/>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+
+        r.jenkins.reload();
+
+        assertNull(r.jenkins.getItem("gone"));
+        assertFalse(new File(r.jenkins.getRootDir(), "jobs/gone").exists());
     }
 
     @TestExtension
