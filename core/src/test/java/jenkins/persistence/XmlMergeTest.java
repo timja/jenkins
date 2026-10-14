@@ -43,6 +43,18 @@ class XmlMergeTest {
     }
 
     @Test
+    void theMergeSaysTheEncodingItIsWrittenIn() {
+        String base = BASE.replace("encoding='UTF-8'", "encoding='ISO-8859-1'");
+        String mine = base.replace("<quietPeriod>5<", "<quietPeriod>9<");
+        String theirs = base.replace(">hello<", ">héllo wörld<");
+        XmlMerge.Result r = XmlMerge.merge(base.getBytes(StandardCharsets.ISO_8859_1), mine.getBytes(StandardCharsets.ISO_8859_1),
+                theirs.getBytes(StandardCharsets.ISO_8859_1));
+        assertNotNull(r);
+        assertTrue(s(r.merged()).startsWith("<?xml version='1.1' encoding='UTF-8'?>"), s(r.merged()));
+        assertTrue(s(r.merged()).contains(">héllo wörld<"), s(r.merged()));
+    }
+
+    @Test
     void sameSettingChangedOnBothSidesKeepsMineAndCounts() {
         XmlMerge.Result r = XmlMerge.merge(b(BASE), b(BASE.replace(">hello<", ">mine<")), b(BASE.replace(">hello<", ">theirs<")));
         assertNotNull(r);

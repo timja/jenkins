@@ -152,6 +152,7 @@ public final class PersistenceStores {
                     resolvedBlobStore = blobs;
                     versions.clear();
                     elements.clear();
+                    snapshots.clear();
                     resolvedFor = j;
                 }
                 return resolvedStore;
@@ -589,6 +590,7 @@ public final class PersistenceStores {
         // show for an item created there later
         RunningBuilds.invalidateBelow(fromKey);
         RunningBuilds.invalidateBelow(toKey);
+        snapshots.keySet().removeIf(k -> k.equals(fromKey) || k.startsWith(fromKey + "/"));
         // the moved entries have new versions: take them as seen where this JVM had seen the entry as it was moved, so
         // that the moved item's next save is still checked for conflicts; where it had seen an older version (changed
         // elsewhere since), keep that older one, so that the next save conflicts and merges as it would have unmoved
@@ -707,6 +709,7 @@ public final class PersistenceStores {
         }
         if (version <= PersistenceStore.ABSENT) {
             elements.remove(key);
+            snapshots.remove(key); // gone (deleted elsewhere): nothing to merge a save against
         }
         Base base = bases.get(key);
         if (base != null && base.version() != version) {
@@ -739,6 +742,11 @@ public final class PersistenceStores {
 
     /** Own serialisation of objects as last saved here or reloaded from the store, by key (Target 11). */
     private static final Map<String, byte[]> snapshots = new ConcurrentHashMap<>();
+
+    /** Whether a snapshot of a key is held, for tests. */
+    static boolean hasSnapshot(@NonNull String key) {
+        return snapshots.containsKey(key);
+    }
 
     private static byte[] serialise(@NonNull XmlFile file, @NonNull Object o) {
         return file.getXStream().toXML(o).getBytes(java.nio.charset.StandardCharsets.UTF_8);
@@ -1023,6 +1031,7 @@ public final class PersistenceStores {
         versions.clear();
         elements.clear();
         bases.clear();
+        snapshots.clear();
         conflicts.set(0);
         merges.set(0);
     }
@@ -1145,6 +1154,7 @@ public final class PersistenceStores {
             // absent is a version: a write made from an object loaded before (a late save, a new item of that name)
             // then conflicts with the key having been created again elsewhere meanwhile, rather than replacing it
             seen(key, PersistenceStore.ABSENT);
+            snapshots.remove(key);
         }
     }
 }
