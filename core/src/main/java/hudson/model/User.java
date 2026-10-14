@@ -910,6 +910,9 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
     public void delete() throws IOException {
         String idKey = idStrategy().keyFor(id);
         AllUsers.remove(id);
+        // from a persistence store too, if it holds users: deleting only the directory would leave the user there for
+        // every other controller (and for this one once restarted)
+        getConfigFile().delete();
         Util.deleteRecursive(getUserFolderFor(id));
         UserDetailsCache.get().invalidate(idKey);
     }
