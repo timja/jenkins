@@ -1374,8 +1374,8 @@ public final class RunningBuilds {
     }
 
     /**
-     * A build running on another controller, as the REST API shows it among a job's builds (Target 14): the main
-     * properties, with the same visibility, of a {@link Run} that is building. Its actions (parameters, causes, …) are
+     * A build running on another controller, as the REST API shows it in a job's {@code buildsElsewhere} (Target 14):
+     * the main properties, with the same visibility, of a {@link Run} that is building. Its actions (parameters, causes, …) are
      * known to the controller running it only: they are listed empty here, and its own URL (and API), which that
      * controller answers, has them.
      */
@@ -1483,41 +1483,15 @@ public final class RunningBuilds {
         }
     }
 
-    /**
-     * A job's builds for the REST API: this controller's, and those running on other controllers, newest first.
-     */
+    /** A job's builds running on other controllers, newest first, as the REST API shows them. */
     @Restricted(NoExternalUse.class)
-    public static List<Object> withRemote(@NonNull Job<?, ?> job, @NonNull List<? extends Run<?, ?>> local, int limit) {
-        List<Placeholder> remote = elsewhere(job);
-        if (remote.isEmpty()) {
-            return limit < 0 || local.size() <= limit ? List.copyOf(local) : List.copyOf(local.subList(0, limit));
+    @NonNull
+    public static List<RemoteBuild> remoteBuilds(@NonNull Job<?, ?> job) {
+        List<RemoteBuild> builds = new ArrayList<>();
+        for (Placeholder p : elsewhere(job)) {
+            builds.add(new RemoteBuild(job, p));
         }
-        List<Object> all = new ArrayList<>(local.size() + remote.size());
-        java.util.Iterator<? extends Run<?, ?>> l = local.iterator();
-        java.util.Iterator<Placeholder> r = remote.iterator(); // both newest first
-        Run<?, ?> nextLocal = l.hasNext() ? l.next() : null;
-        Placeholder nextRemote = r.hasNext() ? r.next() : null;
-        while ((nextLocal != null || nextRemote != null) && (limit < 0 || all.size() < limit)) {
-            if (nextRemote != null && (nextLocal == null || nextRemote.number > nextLocal.getNumber())) {
-                all.add(new RemoteBuild(job, nextRemote));
-                nextRemote = r.hasNext() ? r.next() : null;
-            } else {
-                all.add(nextLocal);
-                nextLocal = l.hasNext() ? l.next() : null;
-            }
-        }
-        return all;
-    }
-
-    /** A job's newest build for the REST API: this controller's, or one running on another controller if newer. */
-    @Restricted(NoExternalUse.class)
-    @CheckForNull
-    public static Object lastWithRemote(@NonNull Job<?, ?> job, @CheckForNull Run<?, ?> local) {
-        List<Placeholder> remote = elsewhere(job);
-        if (!remote.isEmpty() && (local == null || remote.get(0).number > local.getNumber())) {
-            return new RemoteBuild(job, remote.get(0));
-        }
-        return local;
+        return builds;
     }
 
     /** The number of the newest build of a job running on another controller, if newer than this controller's newest. */
