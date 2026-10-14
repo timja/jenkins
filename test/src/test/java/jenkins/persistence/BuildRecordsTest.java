@@ -59,6 +59,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
+import java.util.Set;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 import org.apache.tools.tar.TarConstants;
@@ -110,11 +111,18 @@ class BuildRecordsTest {
             }
             return super.write(key, content, expectedVersion);
         }
+        public Set<String> children(String parentKey) {
+            if (unlistable) {
+                throw new UncheckedIOException(new IOException("the store is unreachable"));
+            }
+            return super.children(parentKey);
+        }
     };
     static volatile Consumer<String> afterRead;
     /** Origins the store reports as alive; null means membership is not tracked. */
     static volatile Set<String> live;
     static volatile Consumer<String> beforeWrite;
+    static volatile boolean unlistable;
     static final InMemoryBlobStore BLOBS = new InMemoryBlobStore() {
         @Override
         public void move(String fromPrefix, String toPrefix) {
@@ -252,6 +260,19 @@ class BuildRecordsTest {
         wipeAndReload(r);
         File dir = r.jenkins.getItemByFullName("planted", FreeStyleProject.class).getBuildByNumber(1).getRootDir();
         assertFalse(Files.isSymbolicLink(dir.toPath().resolve("log")));
+    }
+
+    @Test
+    void anImportCanTellNoBuildsFromUnknown() throws Exception {
+        FreeStyleProject p = project(r, "listed");
+        r.buildAndAssertSuccess(p);
+        assertEquals(Set.of(1), BuildRecords.listStoredNumbers(p));
+        unlistable = true;
+        try {
+            assertThrows(UncheckedIOException.class, () -> BuildRecords.listStoredNumbers(p));
+        } finally {
+            unlistable = false;
+        }
     }
 
     @Test

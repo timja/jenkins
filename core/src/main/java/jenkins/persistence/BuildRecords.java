@@ -183,26 +183,39 @@ public final class BuildRecords {
     }
 
     /**
-     * Numbers of the builds of a job recorded in the store.
+     * Numbers of the builds of a job recorded in the store; empty if they cannot be listed (logged).
+     */
+    @Restricted(Beta.class)
+    @NonNull
+    public static Set<Integer> storedNumbers(@NonNull Job<?, ?> job) {
+        try {
+            return listStoredNumbers(job);
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "Could not list stored builds of " + job.getFullName(), e);
+            return new TreeSet<>();
+        }
+    }
+
+    /**
+     * Numbers of the builds of a job recorded in the store, for callers that must tell "none" from "unknown", such as
+     * an import deciding what to publish: publishing overwrites what is stored.
+     *
+     * @throws IOException if the store cannot list them
      */
     @Restricted(Beta.class) // e.g. importing a file-based home
     @NonNull
-    public static Set<Integer> storedNumbers(@NonNull Job<?, ?> job) {
+    public static Set<Integer> listStoredNumbers(@NonNull Job<?, ?> job) throws IOException {
         Set<Integer> numbers = new TreeSet<>();
         String builds = buildsKey(job);
         if (builds == null) {
             return numbers;
         }
-        try {
-            for (String name : PersistenceStores.get().children(builds)) {
-                try {
-                    numbers.add(Integer.parseInt(name));
-                } catch (NumberFormatException e) {
-                    // not a build
-                }
+        for (String name : PersistenceStores.get().children(builds)) {
+            try {
+                numbers.add(Integer.parseInt(name));
+            } catch (NumberFormatException e) {
+                // not a build
             }
-        } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Could not list stored builds of " + job.getFullName(), e);
         }
         return numbers;
     }
