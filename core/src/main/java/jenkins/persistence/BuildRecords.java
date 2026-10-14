@@ -245,6 +245,15 @@ public final class BuildRecords {
      *     so that it gets a new version, and other controllers fetch the new snapshot
      */
     private static void publish(@NonNull Run<?, ?> run, boolean filesChanged) throws IOException {
+        publish(run, filesChanged, false);
+    }
+
+    /**
+     * @param filesChanged its files changed since it was published: other controllers are to fetch them again
+     * @param recordChanged its record was saved here too (not only files added): this controller's record is written,
+     *     as a republish does, rather than the stored one marked
+     */
+    private static void publish(@NonNull Run<?, ?> run, boolean filesChanged, boolean recordChanged) throws IOException {
         String builds = buildsKey(run.getParent());
         if (builds == null) {
             return;
@@ -312,8 +321,8 @@ public final class BuildRecords {
         PersistenceStore store = PersistenceStores.get();
         try {
             byte[] published = Files.readAllBytes(record);
-            PersistenceStore.Entry stored = filesChanged ? store.read(base + "/" + RECORD) : null;
-            if (filesChanged && stored == null) {
+            PersistenceStore.Entry stored = filesChanged && !recordChanged ? store.read(base + "/" + RECORD) : null;
+            if (filesChanged && !recordChanged && stored == null) {
                 // deleted elsewhere, which this controller has not applied yet: not brought back for files added here
                 discardSnapshot(base);
                 recentlyPublished.remove(base);
@@ -336,7 +345,13 @@ public final class BuildRecords {
                 LOGGER.fine(() -> "Published files added to " + run);
                 return;
             }
-            publishRecord(lease, base + "/" + RECORD, published);
+            byte[] content = published;
+            if (filesChanged) {
+                // the record saved here, marked so that other controllers fetch the files too even if it did not change
+                content = (new String(content, StandardCharsets.UTF_8) + "\n<!-- files updated " + System.currentTimeMillis() + " -->")
+                        .getBytes(StandardCharsets.UTF_8);
+            }
+            publishRecord(lease, base + "/" + RECORD, content);
             recentlyPublished.put(base, new Published(new java.lang.ref.WeakReference<>(run), signature, System.currentTimeMillis()));
             Manifest.write(dir, signature);
             // a save made while publishing found no record yet, so republish left it to this: include it
@@ -1400,7 +1415,7 @@ public final class BuildRecords {
             }
             try {
                 if (Manifest.filesAdded(run.getRootDir()) && PersistenceStores.get().read(recordKeyOf(run)) != null) {
-                    publish(run, true); // files were added too (Target 15): the record alone would leave them out
+                    publish(run, true, true); // files were added too (Target 15): the record alone would leave them out
                 } else {
                     republish(run);
                 }
