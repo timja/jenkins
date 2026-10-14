@@ -27,6 +27,7 @@ package jenkins.persistence;
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import java.io.IOException;
+import java.util.List;
 import java.util.Set;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
@@ -110,9 +111,16 @@ public interface PersistenceStore {
      * and {@code jobs/a/jobs/x/config.xml}, but not {@code jobs/ab/config.xml}.
      * Moved entries get new versions.
      *
+     * @return each entry moved: its key and version before, and its key and version now
      * @throws ConflictException if {@code toPrefix} or anything below it already exists
      */
-    void move(@NonNull String fromPrefix, @NonNull String toPrefix) throws IOException;
+    @NonNull
+    List<Moved> move(@NonNull String fromPrefix, @NonNull String toPrefix) throws IOException;
+
+    /**
+     * An entry {@linkplain #move moved}: from {@code from} at {@code fromVersion} to {@code to} at {@code version}.
+     */
+    record Moved(@NonNull String from, long fromVersion, @NonNull String to, long version) {}
 
     /**
      * Stored content with its version.
