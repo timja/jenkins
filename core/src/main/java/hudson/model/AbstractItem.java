@@ -70,6 +70,7 @@ import jenkins.model.DirectlyModifiableTopLevelItemGroup;
 import jenkins.model.Jenkins;
 import jenkins.model.Loadable;
 import jenkins.model.queue.ItemDeletion;
+import jenkins.persistence.ConflictException;
 import jenkins.persistence.PersistenceStores;
 import jenkins.security.ExtendedReadRedaction;
 import jenkins.security.XStreamNotDeserializable;
@@ -262,7 +263,12 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
             throw new Failure(validationError.getMessage());
         }
 
-        renameTo(newName);
+        try {
+            renameTo(newName);
+        } catch (ConflictException e) {
+            // made elsewhere since the check above (another controller sharing the store)
+            throw new Failure(Messages.AbstractItem_NewNameInUse(newName));
+        }
         // send to the new job page
         // note we can't use getUrl() because that would pick up old name in the
         // Ancestor.getUrl()
