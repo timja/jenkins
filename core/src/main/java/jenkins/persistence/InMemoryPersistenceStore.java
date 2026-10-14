@@ -191,16 +191,21 @@ public class InMemoryPersistenceStore implements PersistenceStore {
             }
 
             @Override
-            public boolean holds(@NonNull String key, long epoch) {
+            public boolean holds(@NonNull String key, long epoch) throws java.io.IOException {
                 synchronized (root) {
-                    return origin.equals(leaseOwners.get(key)) && leaseEpochs.get(key)[0] == epoch;
+                    // a lease lapses with its holder's liveness, as BuildLeases says
+                    return held(key, epoch) && alive(origin);
                 }
+            }
+
+            private boolean held(String key, long epoch) {
+                return origin.equals(leaseOwners.get(key)) && leaseEpochs.get(key)[0] == epoch;
             }
 
             @Override
             public void release(@NonNull String key, long epoch) {
                 synchronized (root) {
-                    if (holds(key, epoch)) {
+                    if (held(key, epoch)) {
                         leaseOwners.remove(key);
                         leaseEpochs.remove(key);
                     }

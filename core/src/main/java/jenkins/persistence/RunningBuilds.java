@@ -344,7 +344,10 @@ public final class RunningBuilds {
         if (leases != null) {
             epoch = leases.acquire(key);
             if (epoch == 0) {
-                throw new IOException("Another controller holds the lease on " + key);
+                // another live controller owns this very build: it must not run here too
+                LOGGER.warning(() -> "Another controller holds the lease on " + key + "; stopping " + run + " here");
+                lost(run);
+                return;
             }
         }
         Placeholder p = new Placeholder(key, run.getNumber(), store.getOrigin(), CONTROLLER_NAME, run.getDisplayName(), run.getStartTimeInMillis(),
@@ -461,21 +464,30 @@ public final class RunningBuilds {
         Job<?, ?> job = run.getParent();
         int number = run.getNumber();
         String key = placeholderKey(run);
+        discard(job, number, key, 0);
+    }
+
+    private static void discard(Job<?, ?> job, int number, String key, int attempt) {
         Timer.get().schedule(() -> {
             try {
                 PersistenceStores.applyingRemoteChange(() -> {
                     BuildRecords.deletedElsewhere(job, number);
                     return null;
                 });
-            } catch (IOException | RuntimeException e) {
-                LOGGER.log(Level.WARNING, "Failed to discard the local copy of " + job.getFullName() + " #" + number, e);
-            } finally {
                 if (key != null) {
                     lost.remove(key);
                 }
+            } catch (IOException | RuntimeException e) {
+                // kept fenced (lost) until discarded: a later save of the local copy must not be published
+                LOGGER.log(Level.WARNING, "Failed to discard the local copy of " + job.getFullName() + " #" + number + "; retrying", e);
+                if (attempt < MAX_DISCARD_ATTEMPTS) {
+                    discard(job, number, key, attempt + 1);
+                }
             }
-        }, DISCARD_DELAY_SECONDS, TimeUnit.SECONDS);
+        }, DISCARD_DELAY_SECONDS * (1L << Math.min(attempt, 6)), TimeUnit.SECONDS);
     }
+
+    private static final int MAX_DISCARD_ATTEMPTS = 10;
 
     /** Lets a stopped build finish writing locally before its copy is discarded. */
     private static final int DISCARD_DELAY_SECONDS = 5;
@@ -525,7 +537,14 @@ public final class RunningBuilds {
                         if (epoch == 0) {
                             continue; // another controller is adopting it
                         }
-                        if (adopt(store, job, p.key, epoch)) {
+                        boolean adopted;
+                        try {
+                            adopted = adopt(store, job, p.key, epoch);
+                        } catch (IOException | RuntimeException e) {
+                            leases.release(p.key, epoch);
+                            throw e;
+                        }
+                        if (adopted) {
                             removedHere++;
                             continue;
                         }
@@ -578,7 +597,12 @@ public final class RunningBuilds {
         for (int attempt = 0; attempt < ADOPTION_ATTEMPTS; attempt++) {
             PersistenceStore.Entry entry = store.read(key);
             if (entry == null) {
-                return true; // completed meanwhile
+                // completed meanwhile: nothing to adopt, nor to keep the lease for
+                BuildLeases leases = store.leases();
+                if (leases != null) {
+                    leases.release(key, epoch);
+                }
+                return true;
             }
             Placeholder p = Placeholder.fromBytes(key, number, entry.content(), entry.version());
             BuildAdopter.Adoption adoption = p == null ? null : prepare(job, p);

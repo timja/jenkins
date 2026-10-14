@@ -146,6 +146,33 @@ class BuildLeasesTest {
     }
 
     @Test
+    void buildWhoseLeaseIsHeldElsewhereIsStopped() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("contested");
+        p.getBuildersList().add(new TestBuilder() {
+            @Override
+            public boolean perform(AbstractBuild<?, ?> build, Launcher launcher, BuildListener listener) throws InterruptedException {
+                Thread.sleep(30_000); // interrupted
+                return true;
+            }
+        });
+        // another live controller already holds the lease of #1
+        assertThat(STORE.as("live-elsewhere").leases().acquire("jobs/contested/running/1.xml"), greaterThan(0L));
+        FreeStyleBuild b = p.scheduleBuild2(0).get();
+        assertEquals(Result.ABORTED, b.getResult());
+        assertNull(text("jobs/contested/running/1.xml"), "no placeholder of its own");
+        assertNull(text("jobs/contested/builds/1/build.xml"), "not published from here");
+    }
+
+    @Test
+    void leaseLapsesWithItsHoldersLiveness() throws Exception {
+        PersistenceStore a = STORE.as("a");
+        long epoch = a.leases().acquire("jobs/x/running/1.xml");
+        assertTrue(a.leases().holds("jobs/x/running/1.xml", epoch));
+        live = Set.of("someone-else");
+        assertFalse(a.leases().holds("jobs/x/running/1.xml", epoch));
+    }
+
+    @Test
     void buildOfDeadControllerIsAdopted() throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("orphan");
         String key = "jobs/orphan/running/1.xml";
