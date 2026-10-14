@@ -43,6 +43,9 @@ import org.kohsuke.accmod.restrictions.Beta;
 public interface PeriodicWorkCoordinator extends ExtensionPoint {
 
     /**
+     * Called on the timer threads, which all periodic work and triggers share: it must return promptly (within
+     * seconds), refusing rather than waiting when it cannot decide, for example when its store is unreachable.
+     *
      * @param work cluster-singleton work due to run
      * @param period the period being run: the current time divided by its recurrence period
      * @return whether this controller should run it for this period

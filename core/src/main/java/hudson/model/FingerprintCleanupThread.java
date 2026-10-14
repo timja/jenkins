@@ -26,6 +26,8 @@ package hudson.model;
 
 import hudson.Extension;
 import hudson.ExtensionList;
+import hudson.security.ACL;
+import hudson.security.ACLContext;
 import java.util.logging.Logger;
 import jenkins.fingerprints.FileFingerprintStorage;
 import jenkins.fingerprints.FingerprintStorage;
@@ -62,7 +64,10 @@ public class FingerprintCleanupThread extends AsyncPeriodicWork {
     }
 
     public static void invoke() {
-        getInstance().run();
+        // asked for explicitly: runs here whichever controller the cluster has run the scheduled cleanup on
+        try (ACLContext ignored = ACL.as2(ACL.SYSTEM2)) {
+            getInstance().doRun();
+        }
     }
 
     private static FingerprintCleanupThread getInstance() {
