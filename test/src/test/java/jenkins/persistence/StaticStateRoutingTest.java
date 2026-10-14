@@ -27,9 +27,12 @@ package jenkins.persistence;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import hudson.Util;
 import hudson.model.User;
+import hudson.security.HudsonPrivateSecurityRealm;
 import hudson.slaves.DumbSlave;
 import java.io.File;
 import java.nio.charset.StandardCharsets;
@@ -39,6 +42,7 @@ import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.TestExtension;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
+import org.springframework.security.core.userdetails.UsernameNotFoundException;
 
 /**
  * Users, nodes and global configuration that exist only in the store (as on a fresh controller) are loaded.
@@ -74,6 +78,23 @@ class StaticStateRoutingTest {
         User again = User.getById("alice", false);
         assertNotNull(again, "loaded from the store");
         assertEquals("Alice Example", again.getFullName());
+    }
+
+    @Test
+    void deletedUsersAreDeletedFromTheStore(JenkinsRule r) throws Exception {
+        HudsonPrivateSecurityRealm realm = new HudsonPrivateSecurityRealm(false, false, null);
+        r.jenkins.setSecurityRealm(realm);
+        realm.createAccount("bob", "bob-password-1");
+        assertTrue(STORE.children("users").stream().anyMatch(n -> n.startsWith("bob_")), "stored");
+
+        User.getById("bob", false).delete();
+
+        assertTrue(STORE.children("users").stream().noneMatch(n -> n.startsWith("bob_")), "deleted from the store too");
+        // a controller starting afresh does not bring the user back
+        Util.deleteRecursive(new File(r.jenkins.getRootDir(), "users"));
+        User.reload();
+        assertNull(User.getById("bob", false));
+        assertThrows(UsernameNotFoundException.class, () -> realm.loadUserByUsername2("bob"));
     }
 
     @Test
