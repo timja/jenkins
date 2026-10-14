@@ -62,7 +62,8 @@ public interface TriggerCoordinator extends ExtensionPoint {
     static boolean allows(@NonNull TriggeredItem item, @NonNull Trigger<?> trigger, @NonNull Calendar tick) {
         for (TriggerCoordinator c : ExtensionList.lookup(TriggerCoordinator.class)) {
             try {
-                if (!c.shouldRun(item, trigger, tick)) {
+                // a copy: the scheduler's own calendar must not be moved by a coordinator
+                if (!c.shouldRun(item, trigger, (Calendar) tick.clone())) {
                     return false;
                 }
             } catch (RuntimeException e) {
