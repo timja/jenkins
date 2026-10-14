@@ -443,7 +443,7 @@ public final class PersistenceStores {
     private static void moveClaimed(PersistenceStore store, String fromKey, String toKey) throws IOException {
         List<String> existing = new ArrayList<>();
         collectKeys(store, toKey, existing);
-        Map<String, Integer> leftovers = leftoverBuildNumbers(store, existing);
+        Map<String, Leftover> leftovers = leftoverBuildNumbers(store, existing);
         if (!existing.isEmpty() && leftovers.isEmpty()) {
             // checked before touching blobs, which would otherwise overwrite those of whatever is at the destination
             PersistenceStore.Entry there = store.read(existing.get(0));
@@ -454,20 +454,35 @@ public final class PersistenceStores {
             // moved or deleted elsewhere, which this controller has not applied yet: checked before touching blobs too
             throw new ConflictException(config, PersistenceStore.ANY, PersistenceStore.ABSENT);
         }
+        // never go back to numbers an item previously at the destination used: the moved counters carry them, so that
+        // the move publishes the final numbers (and nothing needs writing once it has happened)
+        for (Map.Entry<String, Leftover> leftover : leftovers.entrySet()) {
+            raiseTo(store, fromKey + leftover.getKey().substring(toKey.length()), leftover.getValue().number());
+        }
         BlobStore blobs = getBlobStore();
         List<PersistenceStore.Moved> moved;
+        Map<String, Leftover> deleted = new TreeMap<>();
         try {
             // blobs first: moving the entries tells other controllers, which may then look for the blobs at the new
             // location. A blob move may fail partway: what it moved is moved back below
             if (blobs != null) {
                 blobs.move(fromKey, toKey);
             }
-            for (String key : leftovers.keySet()) {
-                store.delete(key, PersistenceStore.ANY);
+            for (Map.Entry<String, Leftover> leftover : leftovers.entrySet()) {
+                // only as read: a counter advanced meanwhile (the destination recreated) makes this a conflict
+                store.delete(leftover.getKey(), leftover.getValue().version());
+                deleted.put(leftover.getKey(), leftover.getValue());
             }
             moved = store.move(fromKey, toKey);
             checkItemMoved(store, fromKey, toKey, moved);
         } catch (IOException | RuntimeException e) {
+            for (Map.Entry<String, Leftover> leftover : deleted.entrySet()) {
+                try {
+                    store.write(leftover.getKey(), (leftover.getValue().number() + "\n").getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+                } catch (IOException | RuntimeException x) {
+                    e.addSuppressed(x);
+                }
+            }
             if (blobs != null) {
                 try {
                     blobs.move(toKey, fromKey);
@@ -481,14 +496,6 @@ public final class PersistenceStores {
         // show for an item created there later
         RunningBuilds.invalidateBelow(fromKey);
         RunningBuilds.invalidateBelow(toKey);
-        for (Map.Entry<String, Integer> leftover : leftovers.entrySet()) {
-            // never go back to numbers an item previously at the destination used
-            PersistenceStore.Entry now = store.read(leftover.getKey());
-            Integer movedNumber = now == null ? null : parseNumber(now.content());
-            if (movedNumber == null || movedNumber < leftover.getValue()) {
-                store.write(leftover.getKey(), (leftover.getValue() + "\n").getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
-            }
-        }
         // the moved entries have new versions: take them as seen where this JVM had seen the entry as it was moved, so
         // that the moved item's next save is still checked for conflicts; where it had seen an older version (changed
         // elsewhere since), keep that older one, so that the next save conflicts and merges as it would have unmoved
@@ -506,6 +513,9 @@ public final class PersistenceStores {
             }
         }
     }
+
+    /** A {@code nextBuildNumber} entry left behind by a deleted item. */
+    private record Leftover(int number, long version) {}
 
     /**
      * Fails a move that did not move the item's configuration: the item is no longer stored there, as it was renamed,
@@ -532,19 +542,37 @@ public final class PersistenceStores {
     /**
      * If all the given keys are {@code nextBuildNumber} entries, as left behind by deleted items, returns them.
      *
-     * @return key to number; empty if there are no keys, or something else too
+     * @return key to number and version; empty if there are no keys, or something else too
      */
-    private static Map<String, Integer> leftoverBuildNumbers(PersistenceStore store, List<String> keys) throws IOException {
-        Map<String, Integer> leftovers = new TreeMap<>();
+    private static Map<String, Leftover> leftoverBuildNumbers(PersistenceStore store, List<String> keys) throws IOException {
+        Map<String, Leftover> leftovers = new TreeMap<>();
         for (String key : keys) {
             PersistenceStore.Entry entry = key.endsWith("/nextBuildNumber") ? store.read(key) : null;
             Integer number = entry == null ? null : parseNumber(entry.content());
             if (number == null) {
                 return Map.of();
             }
-            leftovers.put(key, number);
+            leftovers.put(key, new Leftover(number, entry.version()));
         }
         return leftovers;
+    }
+
+    /** Raises a stored {@code nextBuildNumber} to at least {@code number}, by compare-and-set. */
+    private static void raiseTo(PersistenceStore store, String key, int number) throws IOException {
+        for (int attempt = 0; attempt < 100; attempt++) {
+            PersistenceStore.Entry entry = store.read(key);
+            Integer current = entry == null ? null : parseNumber(entry.content());
+            if (current != null && current >= number) {
+                return;
+            }
+            try {
+                store.write(key, (number + "\n").getBytes(StandardCharsets.UTF_8), entry == null ? PersistenceStore.ABSENT : entry.version());
+                return;
+            } catch (ConflictException e) {
+                // changed meanwhile: look again
+            }
+        }
+        throw new IOException("Could not raise " + key + " to " + number);
     }
 
     private static void collectKeys(PersistenceStore store, String prefix, List<String> keys) throws IOException {

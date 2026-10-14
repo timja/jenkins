@@ -263,6 +263,23 @@ class RemoteBuildEventsTest {
     }
 
     @Test
+    void jobDeletedElsewhereLeavesNoRecordBehind() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("gone");
+        r.buildAndAssertSuccess(p);
+        String late = record("gone", 1);
+        // the other controller deletes the job and cleans up; this controller's build #2 then completes and publishes,
+        // before it has applied the deletion
+        other.delete("jobs/gone/builds/1/build.xml", PersistenceStore.ANY);
+        awaitApplied();
+        STORE.write("jobs/gone/builds/2/build.xml", late.getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        other.delete("jobs/gone/config.xml", PersistenceStore.ANY);
+        awaitApplied();
+
+        assertNull(r.jenkins.getItem("gone"));
+        assertNull(STORE.read("jobs/gone/builds/2/build.xml"), "the late record is cleaned up here too");
+    }
+
+    @Test
     void ownChangesAreNotApplied() throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("own");
         r.buildAndAssertSuccess(p);
