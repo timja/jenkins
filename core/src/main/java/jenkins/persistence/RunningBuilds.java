@@ -1229,6 +1229,60 @@ public final class RunningBuilds {
         }
     }
 
+    /**
+     * The page of a build running on another controller, at the build's own URL here ({@code job/x/N/}), so that its
+     * links never find nothing. A cluster routing such requests to the controller running the build answers them first;
+     * without one, this shows the build as running there, until its record arrives and the build itself is shown.
+     *
+     * @return null if no build of this number runs elsewhere
+     */
+    @Restricted(NoExternalUse.class)
+    @CheckForNull
+    public static BuildElsewhere buildElsewhere(@NonNull Job<?, ?> job, int number) {
+        for (Placeholder p : elsewhere(job)) {
+            if (p.number == number) {
+                return new BuildElsewhere(job, p);
+            }
+        }
+        return null;
+    }
+
+    /** A build running on another controller, as a page: {@code index} and {@code console}. */
+    @Restricted(NoExternalUse.class)
+    public static final class BuildElsewhere {
+        private final Job<?, ?> job;
+        private final Placeholder placeholder;
+
+        BuildElsewhere(Job<?, ?> job, Placeholder placeholder) {
+            this.job = job;
+            this.placeholder = placeholder;
+        }
+
+        public Job<?, ?> getJob() {
+            return job;
+        }
+
+        public Placeholder getPlaceholder() {
+            return placeholder;
+        }
+
+        public String getDisplayName() {
+            return job.getFullDisplayName() + " " + placeholder.getDisplayName();
+        }
+
+        public boolean isStoppable() {
+            return job.hasPermission(Item.CANCEL);
+        }
+
+        /** Stops it: asks the controller running it to. */
+        @RequirePOST
+        public HttpResponse doStop() throws IOException {
+            job.checkPermission(Item.CANCEL);
+            requestStop(job, placeholder.number, Jenkins.getAuthentication2().getName());
+            return HttpResponses.redirectTo(".");
+        }
+    }
+
     @Restricted(NoExternalUse.class)
     @Extension
     public static final class ActionFactory extends TransientActionFactory<Job> {

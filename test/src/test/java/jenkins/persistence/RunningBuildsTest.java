@@ -162,6 +162,9 @@ class RunningBuildsTest {
         String history = wc.goTo("job/remote/buildHistory/ajax").getWebResponse().getContentAsString();
         assertThat("the build list shows it", history, containsString("Running on jenkins-a"));
         assertThat(history, containsString("running-elsewhere/stop?number=2"));
+        // its links answer here too (no owner routing in core): the build, running there
+        assertThat(wc.goTo("job/remote/2/").asNormalizedText(), containsString("Running on controller jenkins-a"));
+        assertThat(wc.goTo("job/remote/2/console").asNormalizedText(), containsString("This build runs on controller jenkins-a"));
 
         // the other controller completes it: record first, then the placeholder goes
         try (InputStream snapshot = BLOBS.get("jobs/remote/builds/1/files.tgz")) {
