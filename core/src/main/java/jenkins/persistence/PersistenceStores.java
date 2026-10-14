@@ -1220,6 +1220,9 @@ public final class PersistenceStores {
                 Long merged = mergeAndWrite(content, expected, strict);
                 if (merged == null && strict) {
                     unresolved.incrementAndGet();
+                    // the object in memory holds the refused values: reload it now, or a later save of it (a background
+                    // one, not refused) would store them after all
+                    ItemChangeApplier.reloadRefused(key);
                     throw new ConflictException(key, expected, -1); // shown to the user: reload, then save again
                 }
                 if (merged != null) {
