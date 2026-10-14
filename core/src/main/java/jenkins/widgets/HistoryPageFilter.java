@@ -275,6 +275,9 @@ public class HistoryPageFilter<T> {
         if (hasUpPage || (searchString != null && !searchString.isEmpty()) || widget == null || !(widget.owner instanceof Job<?, ?> job)) {
             return List.of();
         }
+        if (statuses != null && !statuses.isEmpty() && !statuses.contains(BuildStatusFilter.BUILDING.getValue())) {
+            return List.of(); // running, so only when running builds are asked for, as for this controller's own
+        }
         return RunningBuilds.elsewhere(job);
     }
 

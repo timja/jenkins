@@ -694,7 +694,7 @@ public final class RunningBuilds {
                         if (epoch == 0) {
                             continue; // another controller is adopting it
                         }
-                        boolean adopted;
+                        Adoption adopted;
                         try {
                             adopted = adopt(store, job, p.key, epoch);
                         } catch (IOException | RuntimeException e) {
@@ -703,7 +703,7 @@ public final class RunningBuilds {
                             leases.release(p.key, epoch);
                             continue;
                         }
-                        if (adopted) {
+                        if (adopted != Adoption.NONE) {
                             removedHere++;
                             continue;
                         }
@@ -897,12 +897,24 @@ public final class RunningBuilds {
     /** How many times adoption is retried when the placeholder changes under it. */
     private static final int ADOPTION_ATTEMPTS = 5;
 
+    /** What became of a build offered for adoption. */
+    enum Adoption {
+        /** Adopted: resumed here, its lease kept. */
+        ADOPTED,
+        /** Completed (or removed) meanwhile: nothing to adopt; the lease is released. */
+        GONE,
+        /** Left for a later attempt (its placeholder is kept); the lease is released. */
+        LATER,
+        /** Nothing can adopt it; the lease is still held, for the caller to close it. */
+        NONE
+    }
+
     /**
      * Offers a build whose owner is gone to the {@link BuildAdopter}s, with its lease already held.
      *
-     * @return true if it was adopted
+     * @return what became of it
      */
-    private static boolean adopt(PersistenceStore store, Job<?, ?> job, String key, long epoch) throws IOException {
+    private static Adoption adopt(PersistenceStore store, Job<?, ?> job, String key, long epoch) throws IOException {
         try {
             return offer(store, job, key, epoch);
         } finally {
@@ -914,7 +926,7 @@ public final class RunningBuilds {
         }
     }
 
-    private static boolean offer(PersistenceStore store, Job<?, ?> job, String key, long epoch) throws IOException {
+    private static Adoption offer(PersistenceStore store, Job<?, ?> job, String key, long epoch) throws IOException {
         int number = Integer.parseInt(key.substring(key.lastIndexOf('/') + 1, key.length() - SUFFIX.length()));
         for (int attempt = 0; attempt < ADOPTION_ATTEMPTS; attempt++) {
             PersistenceStore.Entry entry = store.read(key);
@@ -924,7 +936,7 @@ public final class RunningBuilds {
                 if (leases != null) {
                     leases.release(key, epoch);
                 }
-                return true;
+                return Adoption.GONE;
             }
             if (BuildRecords.isStored(job, number)) {
                 // completed: its record is published only once it has, and its owner was gone before removing this
@@ -933,7 +945,7 @@ public final class RunningBuilds {
             Placeholder p = Placeholder.fromBytes(key, number, entry.content(), entry.version());
             BuildAdopter.Adoption adoption = p == null ? null : prepare(job, p);
             if (adoption == null) {
-                return false; // nobody can adopt it
+                return Adoption.NONE;
             }
             boolean exclusive;
             try {
@@ -950,7 +962,7 @@ public final class RunningBuilds {
                     leases.release(key, epoch);
                 }
                 LOGGER.info(() -> "Not adopting " + job.getFullName() + " #" + number + " yet: another build of it runs");
-                return true; // nothing to remove: a later sweep adopts it
+                return Adoption.LATER;
             }
             Placeholder mine = p.withOwner(store.getOrigin(), CONTROLLER_NAME, epoch, p.properties);
             long version;
@@ -983,9 +995,14 @@ public final class RunningBuilds {
             if (store.read(jobKey + "/" + PREFIX + "/" + number + STOP_SUFFIX) != null) {
                 stopRequested(jobKey, number); // asked to stop while its owner was gone
             }
-            return true;
+            return Adoption.ADOPTED;
         }
-        return false;
+        // its owner kept changing it: not as gone as it seemed; a later sweep looks again
+        BuildLeases leases = store.leases();
+        if (leases != null) {
+            leases.release(key, epoch);
+        }
+        return Adoption.LATER;
     }
 
     /**
@@ -1072,11 +1089,15 @@ public final class RunningBuilds {
         if (epoch == 0) {
             return false; // not released (yet), or taken by another controller
         }
-        if (adopt(store, job, key, epoch)) {
-            return true;
-        }
-        store.leases().release(key, epoch);
-        return false;
+        // only an adoption is a takeover: a build that completed meanwhile was not taken over
+        return switch (adopt(store, job, key, epoch)) {
+            case ADOPTED -> true;
+            case GONE, LATER -> false; // its lease released already
+            case NONE -> {
+                store.leases().release(key, epoch);
+                yield false;
+            }
+        };
     }
 
     /**
@@ -1106,9 +1127,20 @@ public final class RunningBuilds {
             try {
                 return reclaim(job, buildNumber);
             } catch (IOException | RuntimeException e) {
-                LOGGER.log(Level.WARNING, "Could not reclaim " + job.getFullName() + " #" + buildNumber + " after a restart", e);
-                return true;
+                // not loaded (nor resumed) without its lease: another controller may run it; looked at again later
+                LOGGER.log(Level.WARNING, "Could not reclaim " + job.getFullName() + " #" + buildNumber + " after a restart; trying again later", e);
+                reclaimLater(job);
+                return false;
             }
+        }
+
+        /** Has the job's builds listed again, so that one not loaded because the store was unavailable is retried. */
+        private static void reclaimLater(Job<?, ?> job) {
+            Timer.get().schedule(() -> {
+                if (job instanceof LazyBuildMixIn.LazyLoadingJob<?, ?> lazy) {
+                    lazy.getLazyBuildMixIn()._getRuns().purgeCache();
+                }
+            }, 30, TimeUnit.SECONDS); // a load failing again schedules another
         }
 
         @Override
