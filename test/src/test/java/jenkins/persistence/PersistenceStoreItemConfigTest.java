@@ -32,6 +32,7 @@ import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -145,6 +146,17 @@ class PersistenceStoreItemConfigTest {
         STORE.write(key, "<project><description>elsewhere again</description></project>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
         assertThrows(IOException.class, () -> p.setDescription("rejected"));
         assertThat(new String(STORE.read(key).content(), StandardCharsets.UTF_8), containsString("elsewhere again"));
+    }
+
+    @Test
+    void createdElsewhereAfterReadingAbsentIsAConflict() throws Exception {
+        String key = "jobs/absent/config.xml";
+        PersistenceStores.Route route = PersistenceStores.route(PersistenceStores.fileFor(key));
+        assertNull(route.read());
+        // another controller creates it after we saw it absent
+        STORE.write(key, "<project/>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        PersistenceStores.CONFLICTS = "fail";
+        assertThrows(ConflictException.class, () -> route.write("<project><description>here</description></project>".getBytes(StandardCharsets.UTF_8)));
     }
 
     @TestExtension

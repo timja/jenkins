@@ -168,9 +168,11 @@ public final class PersistenceStores {
 
     /**
      * Records the version of a key as seen by this JVM, for example after applying a change made elsewhere.
+     * {@link PersistenceStore#ABSENT} is a version too: the next write then expects the key to still be absent, so that
+     * another controller creating it meanwhile is a conflict.
      */
     public static void seen(@NonNull String key, long version) {
-        if (version > 0) {
+        if (version >= 0) {
             versions.put(key, version);
         } else {
             versions.remove(key);

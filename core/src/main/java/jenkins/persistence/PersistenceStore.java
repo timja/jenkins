@@ -83,7 +83,8 @@ public interface PersistenceStore {
     long write(@NonNull String key, @NonNull byte[] content, long expectedVersion) throws IOException;
 
     /**
-     * Deletes an entry if it exists.
+     * Deletes an entry if it exists. Deleting an absent entry does nothing, whatever {@code expectedVersion} is: the
+     * caller wanted it gone, and it is.
      *
      * @param expectedVersion {@link #ANY} or the version the caller last saw
      * @throws ConflictException if {@code expectedVersion} does not match the stored version
