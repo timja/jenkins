@@ -37,6 +37,11 @@ import org.kohsuke.accmod.restrictions.Beta;
  * Each controller mirrors it into its local {@link hudson.model.Queue} (see {@link SharedQueue});
  * an item may only start on the controller which {@linkplain #claim claims} it.
  *
+ * <p>Records of items which started or were cancelled are kept only so that controllers which have not applied that
+ * yet learn it: a store should expire them some time later, at the soonest five minutes after (as long as the local
+ * queue remembers items that left), so that they do not accumulate. Waiting and claimed records must never expire: an
+ * item with no record may start anywhere.
+ *
  * @since TODO
  */
 @Restricted(Beta.class)
