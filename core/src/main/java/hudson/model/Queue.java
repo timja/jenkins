@@ -769,14 +769,14 @@ public class Queue extends ResourceController implements Saveable {
     @RequirePOST
     public HttpResponse doCancelItem(@QueryParameter long id) throws IOException, ServletException {
         Item item = getItem(id);
+        if (item != null && !hasReadPermission(item, true)) {
+            item = null; // as for a local item: whoever may not see it learns nothing of it
+        }
         if (item instanceof RemoteItem) {
             // in the queue shared with other controllers, not in this one's
             return SharedQueue.cancelRemote(id)
                     ? HttpResponses.status(HttpServletResponse.SC_NO_CONTENT)
                     : HttpResponses.error(422, "Item for id (" + id + ") is not cancellable");
-        }
-        if (item != null && !hasReadPermission(item, true)) {
-            item = null;
         }
         if (item != null) {
             if (item.hasCancelPermission()) {
@@ -806,8 +806,11 @@ public class Queue extends ResourceController implements Saveable {
             if (item == null || item instanceof LeftItem) {
                 return false;
             }
+            // exactly the shared record's actions: by class, replaceAction would keep actions dropped there and
+            // collapse several of one class (e.g. ParametersActions) into one
+            item.removeActions(Action.class);
             for (Action a : actions) {
-                item.replaceAction(a);
+                item.addAction(a);
             }
             if (item instanceof WaitingItem wi && due.before(wi.timestamp)) {
                 wi.leave(this);

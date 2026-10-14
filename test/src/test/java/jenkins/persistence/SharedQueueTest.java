@@ -28,6 +28,7 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.instanceOf;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -36,13 +37,20 @@ import hudson.model.Action;
 import hudson.model.Cause;
 import hudson.model.CauseAction;
 import hudson.model.FreeStyleProject;
+import hudson.model.ParametersAction;
+import hudson.model.PasswordParameterValue;
 import hudson.model.Queue;
+import hudson.model.StringParameterValue;
+import java.util.Calendar;
 import java.util.List;
+import java.util.Objects;
+import jenkins.model.Jenkins;
 import org.htmlunit.HttpMethod;
 import org.htmlunit.WebRequest;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
+import org.jvnet.hudson.test.MockAuthorizationStrategy;
 import org.jvnet.hudson.test.TestExtension;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 
@@ -212,8 +220,58 @@ class SharedQueueTest {
         JenkinsRule.WebClient wc = r.createWebClient();
         wc.getPage(new WebRequest(wc.createCrumbedUrl("queue/cancelItem?id=" + rec.id()), HttpMethod.POST));
 
+        // shared after the queue lock is released
+        for (int i = 0; i < 500 && STORE.clusterQueue().get(rec.id()).state() != ClusterQueue.State.CANCELLED; i++) {
+            Thread.sleep(10);
+        }
         assertEquals(ClusterQueue.State.CANCELLED, STORE.clusterQueue().get(rec.id()).state());
         assertTrue(Queue.getInstance().isEmpty());
+    }
+
+    @Test
+    void anItemOneMayNotSeeIsNotFound() throws Exception {
+        r.createFreeStyleProject("hidden");
+        r.jenkins.setSecurityRealm(r.createDummySecurityRealm());
+        r.jenkins.setAuthorizationStrategy(new MockAuthorizationStrategy().grant(Jenkins.READ).everywhere().to("bob"));
+        ClusterQueue.Record rec = publishElsewhere("hidden", 60_000, "carol");
+
+        JenkinsRule.WebClient wc = r.createWebClient().login("bob");
+        wc.setThrowExceptionOnFailingStatusCode(false);
+        int status = wc.getPage(new WebRequest(wc.createCrumbedUrl("queue/cancelItem?id=" + rec.id()), HttpMethod.POST)).getWebResponse().getStatusCode();
+        assertEquals(404, status, "as for an item of this controller's queue");
+        assertEquals(ClusterQueue.State.WAITING, STORE.clusterQueue().get(rec.id()).state());
+        other.cancel(rec.id()); // the store outlives this test
+    }
+
+    @Test
+    void dedupKeysAreUnambiguousAndKeepSensitiveValuesOut() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("keys");
+        String one = SharedQueue.dedupKey(p, List.of(new ParametersAction(new StringParameterValue("a", "x\nb=y"))));
+        String two = SharedQueue.dedupKey(p, List.of(new ParametersAction(new StringParameterValue("a", "x"), new StringParameterValue("b", "y"))));
+        assertNotEquals(one, two);
+
+        String secret = SharedQueue.dedupKey(p, List.of(new ParametersAction(new PasswordParameterValue("pw", "hunter2"))));
+        assertEquals(secret, SharedQueue.dedupKey(p, List.of(new ParametersAction(new PasswordParameterValue("pw", "hunter2")))));
+        assertNotEquals(secret, SharedQueue.dedupKey(p, List.of(new ParametersAction(new PasswordParameterValue("pw", "hunter3")))));
+        // the same value as a plain string gives another key: the sensitive one is keyed, not hashed as is
+        assertNotEquals(secret, SharedQueue.dedupKey(p, List.of(new ParametersAction(new StringParameterValue("pw", "hunter2")))));
+    }
+
+    @Test
+    void anUpdateReplacesAllTheActions() throws Exception {
+        r.createFreeStyleProject("updated");
+        ClusterQueue.Record rec = publishElsewhere("updated", 60_000, "dave");
+        Queue.Item local = Queue.getInstance().getLocalItem(rec.id());
+        local.addAction(new ParametersAction(new StringParameterValue("gone", "1")));
+
+        List<Action> shared = List.of(new CauseAction(new Cause.UserIdCause("dave")),
+                new ParametersAction(new StringParameterValue("a", "1")), new ParametersAction(new StringParameterValue("b", "2")));
+        assertTrue(Queue.getInstance().updateShared(rec.id(), Calendar.getInstance(), shared));
+
+        local = Queue.getInstance().getLocalItem(rec.id());
+        assertEquals(2, local.getActions(ParametersAction.class).size());
+        assertNull(local.getActions(ParametersAction.class).stream().map(pa -> pa.getParameter("gone")).filter(Objects::nonNull).findAny().orElse(null));
+        other.cancel(rec.id()); // the store outlives this test
     }
 
     @TestExtension

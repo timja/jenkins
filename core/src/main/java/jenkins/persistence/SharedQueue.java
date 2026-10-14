@@ -33,6 +33,7 @@ import hudson.init.Terminator;
 import hudson.model.Action;
 import hudson.model.Cause;
 import hudson.model.CauseAction;
+import hudson.model.FileParameterValue;
 import hudson.model.Job;
 import hudson.model.ParameterValue;
 import hudson.model.ParametersAction;
@@ -45,24 +46,29 @@ import hudson.model.queue.QueueListener;
 import hudson.model.queue.ScheduleResult;
 import hudson.security.ACL;
 import hudson.security.ACLContext;
+import hudson.util.Secret;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Calendar;
 import java.util.GregorianCalendar;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Set;
-import java.util.TreeSet;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
 import jenkins.model.queue.QueueIdStrategy;
 import jenkins.model.queue.QueueStartGate;
+import jenkins.security.HMACConfidentialKey;
 import jenkins.util.Timer;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
@@ -116,13 +122,17 @@ public final class SharedQueue {
         return task instanceof Job<?, ?> && !(task instanceof Queue.TransientTask) && queue() != null;
     }
 
-    /** Items with equal keys fold into one, as the local queue does by task and {@link ParametersAction}. */
+    /**
+     * Items with equal keys fold into one, as the local queue does by task and {@link ParametersAction}.
+     * Each parameter is encoded with explicit lengths (so no value can pass for several parameters); sensitive values
+     * enter it only as a keyed hash, so that queue records reveal nothing of them.
+     */
     static String dedupKey(@NonNull Queue.Task task, @NonNull List<Action> actions) {
-        TreeSet<String> parameters = new TreeSet<>();
+        List<byte[]> parameters = new ArrayList<>();
         for (Action a : actions) {
             if (a instanceof ParametersAction pa) {
                 for (ParameterValue v : pa.getParameters()) {
-                    parameters.add(v.getName() + "=" + v.getValue());
+                    parameters.add(encode(v));
                 }
             }
         }
@@ -130,12 +140,35 @@ public final class SharedQueue {
         if (parameters.isEmpty()) {
             return name;
         }
+        parameters.sort(Arrays::compare);
         try {
-            byte[] digest = MessageDigest.getInstance("SHA-256").digest(String.join("\n", parameters).getBytes(StandardCharsets.UTF_8));
-            return name + "#" + HexFormat.of().formatHex(digest);
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            for (byte[] p : parameters) {
+                digest.update(ByteBuffer.allocate(4).putInt(p.length).array());
+                digest.update(p);
+            }
+            return name + "#" + HexFormat.of().formatHex(digest.digest());
         } catch (NoSuchAlgorithmException e) {
             throw new AssertionError(e);
         }
+    }
+
+    /** Keys the hash of sensitive parameter values; shared by the controllers once runtime keys are. */
+    private static final HMACConfidentialKey SENSITIVE = new HMACConfidentialKey(SharedQueue.class, "sensitiveParameters");
+
+    private static byte[] encode(ParameterValue v) {
+        Object value = v.getValue();
+        String text = value instanceof Secret secret ? secret.getPlainText() : String.valueOf(value);
+        if (v.isSensitive()) {
+            text = "mac:" + SENSITIVE.mac(text);
+        }
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        for (String field : new String[] {v.getName(), v.getClass().getName(), text}) {
+            byte[] b = String.valueOf(field).getBytes(StandardCharsets.UTF_8);
+            bytes.writeBytes(ByteBuffer.allocate(4).putInt(b.length).array());
+            bytes.writeBytes(b);
+        }
+        return bytes.toByteArray();
     }
 
     @CheckForNull
@@ -143,6 +176,9 @@ public final class SharedQueue {
         for (Action a : actions) {
             if (a.getClass().getName().equals(BUILD_TRIGGER_ACTION)) {
                 return origin();
+            }
+            if (a instanceof ParametersAction pa && pa.getParameters().stream().anyMatch(FileParameterValue.class::isInstance)) {
+                return origin(); // the uploaded file is only here
             }
         }
         return null;
@@ -260,11 +296,26 @@ public final class SharedQueue {
             if (!li.isCancelled() || PersistenceStores.isApplyingRemoteChange() || !shared(li.task)) {
                 return;
             }
-            try {
-                queue().cancel(li.getId());
-            } catch (IOException | RuntimeException e) {
-                LOGGER.log(Level.WARNING, "Failed to share the cancellation of " + li, e);
-            }
+            // not under the queue lock, which Queue.cancel holds here: a slow store would stop the whole queue
+            shareCancellation(li.getId(), 0);
+        }
+
+        private static void shareCancellation(long id, int attempt) {
+            Timer.get().schedule(() -> {
+                try {
+                    ClusterQueue cq = queue();
+                    if (cq != null) {
+                        cq.cancel(id);
+                    }
+                } catch (IOException | RuntimeException e) {
+                    if (attempt < 10) {
+                        LOGGER.log(Level.FINE, "Failed to share the cancellation of queue item " + id + "; retrying", e);
+                        shareCancellation(id, attempt + 1);
+                    } else {
+                        LOGGER.log(Level.WARNING, "Failed to share the cancellation of queue item " + id, e);
+                    }
+                }
+            }, attempt == 0 ? 0 : 1L << Math.min(attempt, 6), TimeUnit.SECONDS);
         }
     }
 
