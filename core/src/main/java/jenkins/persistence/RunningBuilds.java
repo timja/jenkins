@@ -884,8 +884,12 @@ public final class RunningBuilds {
             Set<String> gone = new HashSet<>();
             int removedHere = 0;
             for (Placeholder p : all(job)) {
-                // a build handed over and not taken (its taker went away, say) is adopted as one of a controller gone
-                if (unsure.contains(p.key) || (!live.contains(p.origin) && stillGone(store, p.origin, gone)) || handoverLapsed(p)) {
+                // never this controller's own: its heartbeat can be late under load, and it would adopt (and resume a
+                // second time) a build it is still running; a membership that really lapsed is fenced (checkOwnership).
+                // Except an adoption here that may have been written although its write failed: nothing runs it here;
+                // and a build handed over and not taken (its taker went away, say), adopted as one of a controller gone
+                if (unsure.contains(p.key) || (!live.contains(p.origin) && !p.origin.equals(store.getOrigin()) && stillGone(store, p.origin, gone))
+                        || handoverLapsed(p)) {
                     long epoch = 0;
                     if (leases != null) {
                         epoch = leases.acquire(p.key);
