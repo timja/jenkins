@@ -103,6 +103,21 @@ class PersistenceStoreItemLifecycleTest {
     }
 
     @Test
+    void anItemChangedElsewhereBeforeItsRenameStillConflicts() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("stale-before");
+        // another controller changes it; this one has not seen that
+        STORE.write("jobs/stale-before/config.xml", "<?xml version='1.1' encoding='UTF-8'?><project><description>elsewhere</description></project>"
+                .getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        p.renameTo("stale-after");
+        PersistenceStores.CONFLICTS = "fail";
+        try {
+            assertThrows(ConflictException.class, () -> p.setDescription("here"), "not taken as seen by the move");
+        } finally {
+            PersistenceStores.CONFLICTS = "warn";
+        }
+    }
+
+    @Test
     void moveOntoAStaleDirectoryMovesNothing() throws Exception {
         MockFolder f = r.createFolder("stale-f");
         FreeStyleProject p = r.createFreeStyleProject("stale-p");

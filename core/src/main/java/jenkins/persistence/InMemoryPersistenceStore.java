@@ -26,7 +26,9 @@ package jenkins.persistence;
 
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
@@ -111,22 +113,27 @@ public class InMemoryPersistenceStore implements PersistenceStore {
     }
 
     @Override
-    public synchronized void move(@NonNull String fromPrefix, @NonNull String toPrefix) throws ConflictException {
+    public synchronized List<Moved> move(@NonNull String fromPrefix, @NonNull String toPrefix) throws ConflictException {
         for (String key : entries.keySet()) {
             if (key.equals(toPrefix) || key.startsWith(toPrefix + "/")) {
                 throw new ConflictException(key, ABSENT, entries.get(key).version());
             }
         }
-        Map<String, Entry> moved = new TreeMap<>();
+        List<Moved> moved = new ArrayList<>();
+        Map<String, Entry> now = new TreeMap<>();
         for (var it = entries.entrySet().iterator(); it.hasNext(); ) {
             var e = it.next();
             String key = e.getKey();
             if (key.equals(fromPrefix) || key.startsWith(fromPrefix + "/")) {
-                moved.put(toPrefix + key.substring(fromPrefix.length()), new Entry(e.getValue().content(), ++clock));
+                String to = toPrefix + key.substring(fromPrefix.length());
+                long version = ++clock;
+                now.put(to, new Entry(e.getValue().content(), version));
+                moved.add(new Moved(key, e.getValue().version(), to, version));
                 it.remove();
             }
         }
-        entries.putAll(moved);
+        entries.putAll(now);
+        return moved;
     }
 
     /**

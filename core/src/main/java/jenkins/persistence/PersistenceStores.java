@@ -223,18 +223,14 @@ public final class PersistenceStores {
         if (fromKey == null || toKey == null || fromKey.equals(toKey)) {
             return;
         }
-        List<String> known = versions.keySet().stream().filter(k -> k.equals(fromKey) || k.startsWith(fromKey + "/")).toList();
-        store.move(fromKey, toKey);
-        versions.keySet().removeAll(known);
-        // the moved entries have new versions: learn them, so that the moved item's next save is still checked for
-        // conflicts instead of overwriting whatever another controller wrote
-        for (String k : known) {
-            String moved = toKey + k.substring(fromKey.length());
-            try {
-                PersistenceStore.Entry e = store.read(moved);
-                seen(moved, e == null ? PersistenceStore.ABSENT : e.version());
-            } catch (IOException e) {
-                LOGGER.log(Level.FINE, "Could not read the version of " + moved + " after moving it", e);
+        List<PersistenceStore.Moved> moved = store.move(fromKey, toKey);
+        // the moved entries have new versions: take them as seen where this JVM had seen the entry as it was moved, so
+        // that the moved item's next save is still checked for conflicts; where it had seen an older version (changed
+        // elsewhere since), keep that older one, so that the next save conflicts and merges as it would have unmoved
+        for (PersistenceStore.Moved m : moved) {
+            Long last = versions.remove(m.from());
+            if (last != null) {
+                seen(m.to(), last == m.fromVersion() ? m.version() : last);
             }
         }
     }
