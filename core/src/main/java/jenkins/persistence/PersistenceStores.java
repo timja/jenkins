@@ -26,8 +26,6 @@ package jenkins.persistence;
 
 import com.thoughtworks.xstream.XStream;
 import com.thoughtworks.xstream.io.HierarchicalStreamReader;
-import hudson.XmlFile;
-
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.ExtensionList;
@@ -594,19 +592,27 @@ public final class PersistenceStores {
         // the moved entries have new versions: take them as seen where this JVM had seen the entry as it was moved, so
         // that the moved item's next save is still checked for conflicts; where it had seen an older version (changed
         // elsewhere since), keep that older one, so that the next save conflicts and merges as it would have unmoved
+        // (and the content of what was seen, the base of that merge)
         for (PersistenceStore.Moved m : moved) {
             Long last = versions.get(m.from());
             Set<String> held = elements.remove(m.from());
             if (held != null) {
                 elements.put(m.to(), held); // the same content
             }
+            Base base = bases.remove(m.from());
             // nothing is at the old key now: a write made there from an object loaded before (a save resolving the old
             // name) conflicts with something created there elsewhere since, rather than replacing it
             seen(m.from(), PersistenceStore.ABSENT);
+            bases.remove(m.to());
             if (last != null) {
-                seen(m.to(), last == m.fromVersion() ? m.version() : last);
+                long version = last == m.fromVersion() ? m.version() : last;
+                seen(m.to(), version);
+                if (base != null && base.version() == last) {
+                    bases.put(m.to(), new Base(version, base.content()));
+                }
             }
         }
+        bases.keySet().removeIf(k -> k.equals(fromKey) || k.startsWith(fromKey + "/"));
     }
 
     /** A {@code nextBuildNumber} entry left behind by a deleted item. */
