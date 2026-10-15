@@ -49,7 +49,6 @@ import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
@@ -304,6 +303,13 @@ public final class BuildRecords {
         try {
             byte[] published = Files.readAllBytes(record);
             PersistenceStore.Entry stored = filesChanged ? store.read(base + "/" + RECORD) : null;
+            if (filesChanged && stored == null) {
+                // deleted elsewhere, which this controller has not applied yet: not brought back for files added here
+                discardSnapshot(base);
+                recentlyPublished.remove(base);
+                LOGGER.fine(() -> "Not publishing files added to " + run + ": deleted elsewhere");
+                return;
+            }
             if (stored != null) {
                 // only the files changed: mark the stored record (telling other controllers to fetch the snapshot again),
                 // rather than writing this controller's copy over an edit made elsewhere since
@@ -475,9 +481,15 @@ public final class BuildRecords {
             writtenElsewhere(job, number); // this controller's own write raises no event here
         } catch (ConflictException e) {
             LOGGER.fine(() -> job.getFullName() + " #" + number + " was published meanwhile");
-            if (blobs != null) {
+            if (blobs != null && hasBlob(blobs, base + "/" + SNAPSHOT)) {
                 blobs.delete(base + "/" + LOST_SNAPSHOT); // its owner's real record and snapshot stand
-            }
+            } // else closed by another controller at the same time: its record goes with this stand-in (the same)
+        }
+    }
+
+    private static boolean hasBlob(BlobStore blobs, String key) throws IOException {
+        try (InputStream in = blobs.get(key)) {
+            return in != null;
         }
     }
 
