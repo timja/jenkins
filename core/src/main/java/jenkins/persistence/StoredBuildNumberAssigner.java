@@ -40,7 +40,8 @@ import org.kohsuke.accmod.restrictions.NoExternalUse;
  *
  * <p>Increments with a strict compare-and-set and retries on {@link ConflictException}:
  * unlike configuration, a build number must never be overwritten.
- * If the store has no number yet, the sequence starts from this controller's current next build number.
+ * If the store has no number yet, the sequence starts from this controller's current next build number
+ * (a home that numbered builds before it used the store is seeded by importing it, not by this class).
  */
 @Restricted(NoExternalUse.class)
 @Extension(ordinal = 100)
@@ -81,6 +82,9 @@ public final class StoredBuildNumberAssigner implements Job.BuildNumberAssigner 
             }
             try {
                 long version = store.write(key, ((number + 1) + "\n").getBytes(StandardCharsets.UTF_8), expected);
+                if (entry == null) {
+                    checkStillStored(store, key, version, job);
+                }
                 PersistenceStores.seen(key, version);
                 job.fastUpdateNextBuildNumber(number + 1);
                 return number;
@@ -89,6 +93,26 @@ public final class StoredBuildNumberAssigner implements Job.BuildNumberAssigner 
             }
         }
         throw new IOException("Could not assign a build number for " + job.getFullName() + " after " + MAX_ATTEMPTS + " attempts");
+    }
+
+    /**
+     * Undoes a counter just created if the job is no longer stored there. The counter is absent too when another
+     * controller renamed (or deleted) the job and this one has not applied that yet: its sequence goes on at the new
+     * name, and numbers drawn here would be handed out there as well. The move takes the job's configuration and
+     * counter together, atomically: if it came first, the configuration is gone now; if it came after, it took this
+     * counter along and the sequence stays one.
+     */
+    private static void checkStillStored(PersistenceStore store, String key, long version, Job<?, ?> job) throws IOException {
+        String config = key.substring(0, key.length() - "nextBuildNumber".length()) + "config.xml";
+        if (!store.owns(config) || store.read(config) != null) {
+            return;
+        }
+        try {
+            store.delete(key, version);
+        } catch (ConflictException e) {
+            // changed since: no longer the counter this created
+        }
+        throw new IOException(job.getFullName() + " was renamed or deleted on another controller");
     }
 
     /**
