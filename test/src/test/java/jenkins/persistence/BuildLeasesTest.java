@@ -93,10 +93,22 @@ class BuildLeasesTest {
             }
             return super.writeIfHeld(leaseKey, epoch, key, content, expectedVersion);
         }
+
+        @Override
+        public Entry read(String key) {
+            if (key.equals(failRead)) {
+                failRead = null;
+                throw new IllegalStateException("the store is unreachable, this time");
+            }
+            return super.read(key);
+        }
     };
 
     /** A key whose next lease-fenced write fails. */
     static volatile String failWriteOf;
+
+    /** A key whose next read fails. */
+    static volatile String failRead;
     static final InMemoryBlobStore BLOBS = new InMemoryBlobStore();
 
     private JenkinsRule r;
@@ -107,6 +119,7 @@ class BuildLeasesTest {
         r = rule;
         dead = STORE.as("dead-controller");
         live = null;
+        failRead = null;
         Adopter.prepared.clear();
         Adopter.resumed.clear();
         Adopter.abandoned.set(0);
@@ -706,6 +719,82 @@ class BuildLeasesTest {
         assertThat(b.getLog(), containsString("Stopped from jenkins-b by alice"));
         assertNull(text(stop));
         forget("stopped-adopted");
+    }
+
+    @Test
+    void anAdoptionWhoseStopRequestCannotBeReadKeepsTheBuild() throws Exception {
+        String key = orphan("stop-unreadable");
+        failRead = "jobs/stop-unreadable/running/1.stop"; // read once resumed
+
+        assertEquals(1, RunningBuilds.removeStale());
+        assertEquals(1, Adopter.resumed.size());
+        assertThat(text(key), containsString("origin=" + STORE.getOrigin()));
+        live = Set.of(STORE.getOrigin(), "third-controller");
+        assertEquals(0, STORE.as("third-controller").leases().acquire(key), "the build resumed here keeps its lease");
+        SharedQueue.abandonExclusive(r.jenkins.getItemByFullName("stop-unreadable", Job.class), 1);
+        forget("stop-unreadable");
+    }
+
+    /** What this controller's previous run (another origin, the same name) left: a build it was running. */
+    private FreeStyleProject runningBeforeARestart(String name, int number) throws Exception {
+        FreeStyleProject p = r.jenkins.getItemByFullName(name, FreeStyleProject.class);
+        if (p == null) {
+            p = r.createFreeStyleProject(name);
+        }
+        File dir = new File(p.getBuildDir(), String.valueOf(number));
+        assertTrue(dir.mkdirs());
+        java.nio.file.Files.writeString(new File(dir, "build.xml").toPath(), "<?xml version='1.1' encoding='UTF-8'?>\n<build><number>" + number
+                + "</number><startTime>1700000000000</startTime></build>");
+        STORE.as("previous-run").write("jobs/" + name + "/running/" + number + ".xml", ("origin=previous-run\ncontroller=" + RunningBuilds.CONTROLLER_NAME
+                + "\ndisplayName=#" + number + "\nstartTime=1700000000000\nepoch=1\n").getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+        RunningBuilds.invalidate("jobs/" + name);
+        return p;
+    }
+
+    @Test
+    void aBuildReclaimedAfterARestartWaitsWhileAnotherBuildOfTheJobRunsElsewhere() throws Exception {
+        FreeStyleProject p = runningBeforeARestart("reclaimed-serial", 1); // one build at a time
+        String key = "jobs/reclaimed-serial/running/1.xml";
+        String exclusive = "jobs/reclaimed-serial/running/exclusive";
+        // while this controller restarted, its lease on the job lapsed, and another controller started a newer build
+        PersistenceStore third = STORE.as("third-controller");
+        long epoch = third.leases().acquire(exclusive);
+        assertThat(epoch, greaterThan(0L));
+        live = Set.of(STORE.getOrigin(), "third-controller");
+
+        assertThrows(RunningBuilds.NotYet.class, () -> RunningBuilds.reclaim(p, 1), "not resumed while the other build runs");
+        assertThat(text(key), containsString("origin=previous-run"));
+
+        third.leases().release(exclusive, epoch);
+        assertTrue(RunningBuilds.reclaim(p, 1));
+        assertThat(text(key), containsString("origin=" + STORE.getOrigin()));
+        assertEquals(0, third.leases().acquire(exclusive), "the job's lease is this controller's again, for the build");
+        SharedQueue.abandonExclusive(p, 1);
+        forget("reclaimed-serial");
+    }
+
+    @Test
+    void aBuildNotReclaimedIsTriedAgainWithoutReloadingTheOthers() throws Exception {
+        long delay = RunningBuilds.Listener.RECLAIM_RETRY_SECONDS;
+        RunningBuilds.Listener.RECLAIM_RETRY_SECONDS = 1;
+        try {
+            FreeStyleProject p = r.createFreeStyleProject("reclaimed-later");
+            p.setConcurrentBuild(true);
+            FreeStyleBuild first = r.buildAndAssertSuccess(p);
+            runningBeforeARestart("reclaimed-later", 2);
+            failRead = "jobs/reclaimed-later/running/2.xml"; // the store cannot be read as it is loaded
+            p._getRuns().recognizeNumber(2);
+            assertNull(p.getBuildByNumber(2), "not loaded without its lease");
+            for (int i = 0; i < 100 && !p._getRuns().getLoadedBuilds().containsKey(2); i++) {
+                Thread.sleep(100);
+            }
+            assertNotNull(p._getRuns().getLoadedBuilds().get(2), "loaded once reclaimed");
+            assertTrue(first == p.getBuildByNumber(1), "the other builds keep their instances (one may be running)");
+        } finally {
+            RunningBuilds.Listener.RECLAIM_RETRY_SECONDS = delay;
+        }
+        STORE.delete("jobs/reclaimed-later/running/2.xml", PersistenceStore.ANY);
+        forget("reclaimed-later");
     }
 
     @TestExtension
