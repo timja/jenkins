@@ -956,6 +956,9 @@ public final class SharedQueue {
             }
             // under the queue lock: from what is known only; the store is asked off the lock (claim below)
             long id = item.getId();
+            if (id >= Ids.LOCAL_RANGE) {
+                return null; // a local id, never shared (see Publisher.onEnterWaiting): it builds here
+            }
             if (sharing.contains(id)) {
                 return new Blocked("Being shared with the other controllers");
             }
