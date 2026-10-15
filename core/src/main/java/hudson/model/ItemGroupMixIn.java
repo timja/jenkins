@@ -41,6 +41,7 @@ import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -113,6 +114,8 @@ public abstract class ItemGroupMixIn {
         }
 
         List<File> subdirs = new ArrayList<>(Arrays.asList(modulesDir.listFiles(File::isDirectory)));
+        Set<String> listed = new HashSet<>();
+        subdirs.forEach(d -> listed.add(d.getName()));
         // items which so far exist only in a persistence store
         Set<String> stored;
         try {
@@ -123,7 +126,7 @@ public abstract class ItemGroupMixIn {
         }
         for (String name : stored) {
             File subdir = new File(modulesDir, name);
-            if (!subdirs.contains(subdir)) {
+            if (!listed.contains(name)) {
                 try {
                     Util.createDirectories(subdir.toPath());
                     subdirs.add(subdir);
