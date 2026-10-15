@@ -621,6 +621,15 @@ public final class SharedQueue {
         return acquireExclusive(job);
     }
 
+    /**
+     * Gives up the exclusive lease taken by {@link #adoptExclusive} for an adoption that did not happen after all, so that
+     * the job is not blocked everywhere by this controller, which runs none of its builds (the caller checks).
+     */
+    @Restricted(NoExternalUse.class)
+    public static void abandonExclusive(@NonNull Job<?, ?> job) {
+        releaseExclusive(job);
+    }
+
     /** Whether a claim that failed with an exception went through after all. */
     private static boolean claimedHere(ClusterQueue cq, long id) {
         try {
