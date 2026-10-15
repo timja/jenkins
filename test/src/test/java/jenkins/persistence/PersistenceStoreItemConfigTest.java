@@ -43,6 +43,9 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -157,6 +160,43 @@ class PersistenceStoreItemConfigTest {
         STORE.write(key, "<project/>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
         PersistenceStores.CONFLICTS = "fail";
         assertThrows(ConflictException.class, () -> route.write("<project><description>here</description></project>".getBytes(StandardCharsets.UTF_8)));
+    }
+
+    @Test
+    void getFileReplacesTheSnapshotWhole() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("w");
+        String key = "jobs/w/config.xml";
+        byte[] a = ("<project><description>" + "a".repeat(1 << 20) + "</description></project>").getBytes(StandardCharsets.UTF_8);
+        byte[] b = ("<project><description>" + "b".repeat(1 << 19) + "</description></project>").getBytes(StandardCharsets.UTF_8);
+        File f = Items.getConfigFile(p).getFile();
+        STORE.write(key, a, PersistenceStore.ANY);
+        Items.getConfigFile(p).getFile();
+        AtomicBoolean done = new AtomicBoolean();
+        AtomicReference<String> torn = new AtomicReference<>();
+        Thread reader = new Thread(() -> {
+            while (!done.get()) {
+                try {
+                    byte[] seen = Files.readAllBytes(f.toPath());
+                    if (!Arrays.equals(seen, a) && !Arrays.equals(seen, b)) {
+                        torn.set("read " + seen.length + " bytes");
+                    }
+                } catch (IOException e) {
+                    torn.set(e.toString());
+                }
+            }
+        });
+        reader.start();
+        try {
+            long end = System.currentTimeMillis() + 2000;
+            for (int i = 0; System.currentTimeMillis() < end && torn.get() == null; i++) {
+                STORE.write(key, i % 2 == 0 ? b : a, PersistenceStore.ANY);
+                Items.getConfigFile(p).getFile();
+            }
+        } finally {
+            done.set(true);
+            reader.join();
+        }
+        assertNull(torn.get());
     }
 
     @TestExtension

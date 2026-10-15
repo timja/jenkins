@@ -502,7 +502,14 @@ public final class XmlFile {
             }
             LOGGER.log(Level.FINE, new Throwable("caller"), () -> "Materializing " + route.key() + " to " + file);
             mkdirs();
-            Files.write(file.toPath(), entry.content());
+            // replaced at once, never truncated in place: a reader of the file sees the old copy or the new one whole
+            AtomicFileWriter w = new AtomicFileWriter(file.toPath(), StandardCharsets.ISO_8859_1);
+            try {
+                w.write(new String(entry.content(), StandardCharsets.ISO_8859_1));
+                w.commit();
+            } finally {
+                w.abort();
+            }
         } catch (IOException | InvalidPathException e) {
             LOGGER.log(Level.WARNING, "Failed to materialize " + route.key() + " to " + file, e);
         }
