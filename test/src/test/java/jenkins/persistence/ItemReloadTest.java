@@ -145,6 +145,38 @@ class ItemReloadTest {
         assertEquals("elsewhere", p.getDescription());
     }
 
+    @Test
+    void aFieldChangedHereAndElsewhereIsMergedWhenSaved() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("both");
+        p.addProperty(new Prop("x"));
+        p.addProperty(new OtherProp("y"));
+        String key = "jobs/both/config.xml";
+        p.getProperty(Prop.class).value = "local"; // changed here, not saved yet
+        String stored = new String(STORE.read(key).content(), StandardCharsets.UTF_8);
+        other.write(key, stored.replace("<value>y</value>", "<value>remote</value>").getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        // put off while the change here is not saved, then applied as far as it can be: the properties changed in both
+        // places, so they are kept as they are here
+        awaitApplied();
+        assertEquals("local", p.getProperty(Prop.class).value);
+        p.save();
+        awaitApplied();
+        String now = new String(STORE.read(key).content(), StandardCharsets.UTF_8);
+        assertThat(now, containsString("<value>local</value>"));
+        assertThat("the change made elsewhere is merged, not written over", now, containsString("<value>remote</value>"));
+        assertEquals("remote", p.getProperty(OtherProp.class).value);
+    }
+
+    public static final class OtherProp extends JobProperty<Job<?, ?>> {
+        String value;
+
+        OtherProp(String value) {
+            this.value = value;
+        }
+
+        @TestExtension
+        public static final class DescriptorImpl extends JobPropertyDescriptor {}
+    }
+
     public static final class Prop extends JobProperty<Job<?, ?>> {
         /** While set, reading a Prop (unmarshalling it) waits for {@link #release}, having counted this down. */
         static volatile CountDownLatch reading;
