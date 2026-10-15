@@ -48,12 +48,14 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.function.Consumer;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 import org.apache.tools.tar.TarConstants;
@@ -80,7 +82,18 @@ class BuildRecordsTest {
         public boolean storesBuildRecords(String jobKey) {
             return true;
         }
+
+        @Override
+        public Entry read(String key) {
+            Entry e = super.read(key);
+            Consumer<String> hook = afterRead;
+            if (hook != null) {
+                hook.accept(key);
+            }
+            return e;
+        }
     };
+    static volatile Consumer<String> afterRead;
     static final InMemoryBlobStore BLOBS = new InMemoryBlobStore();
 
     private JenkinsRule r;
@@ -235,6 +248,32 @@ class BuildRecordsTest {
 
         p = r.jenkins.getItemByFullName("deleted", FreeStyleProject.class);
         assertEquals(List.of(2), p.getBuilds().stream().map(FreeStyleBuild::getNumber).toList());
+    }
+
+    @Test
+    void buildDeletedWhileBeingRepublishedStaysDeleted() throws Exception {
+        FreeStyleProject p = project(r, "redescribed");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p);
+        b.setDescription("edited here");
+        String key = "jobs/redescribed/builds/1/build.xml";
+        assertThat(record(key), containsString("edited here"));
+        // another controller discards the build between this one reading its record and writing it again
+        afterRead = k -> {
+            if (k.equals(key)) {
+                afterRead = null;
+                try {
+                    STORE.delete(k, PersistenceStore.ANY);
+                } catch (IOException x) {
+                    throw new UncheckedIOException(x);
+                }
+            }
+        };
+        try {
+            BuildRecords.republish(b);
+        } finally {
+            afterRead = null;
+        }
+        assertNull(record(key), "not brought back by the republication");
     }
 
     @Test

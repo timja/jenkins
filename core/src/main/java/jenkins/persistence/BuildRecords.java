@@ -230,10 +230,23 @@ public final class BuildRecords {
         }
         String key = builds + "/" + run.getNumber() + "/" + RECORD;
         PersistenceStore store = PersistenceStores.get();
-        if (store.read(key) == null) {
-            return; // not published yet; publish will include this change
+        byte[] content = Files.readAllBytes(new File(run.getRootDir(), RECORD).toPath());
+        for (int attempt = 1; ; attempt++) {
+            PersistenceStore.Entry e = store.read(key);
+            if (e == null) {
+                return; // not published yet (publish will include this change), or deleted meanwhile: not brought back
+            }
+            try {
+                // only over the record read: a build deleted elsewhere since must not be written again
+                store.write(key, content, e.version());
+                break;
+            } catch (ConflictException x) {
+                if (attempt == 5) {
+                    throw x;
+                }
+                // changed or deleted since it was read: read it again
+            }
         }
-        store.write(key, Files.readAllBytes(new File(run.getRootDir(), RECORD).toPath()), PersistenceStore.ANY);
         LOGGER.fine(() -> "Republished " + run);
     }
 
