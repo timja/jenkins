@@ -350,8 +350,20 @@ public final class SharedQueue {
     private static void dropLocal(long id) {
         if (PersistenceStores.applyingRemoteChange(() -> Queue.getInstance().cancelLocal(id))) {
             LOGGER.fine(() -> "Dropped queue item " + id + ", taken or cancelled elsewhere");
+            droppedHere.add(id);
         }
     }
+
+    /**
+     * Items dropped here because they were taken or cancelled elsewhere: should the controller which took one go away
+     * before starting it, the store puts it back, under the same id, and it is mirrored again (Mirror.create).
+     */
+    private static final Set<Long> droppedHere = java.util.Collections.newSetFromMap(java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>() {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<Long, Boolean> eldest) {
+            return size() > 10_000;
+        }
+    }));
 
     // ------------------------------------------------------------------ local changes → cluster
 
@@ -734,8 +746,9 @@ public final class SharedQueue {
                         Calendar due = new GregorianCalendar();
                         due.setTimeInMillis(r.dueAt());
                         Queue.getInstance().updateShared(r.id(), due, fromXml(r.actions()));
-                    } else if (!me.equals(r.origin())) {
-                        create(r); // our own items are never recreated: absent here means they already left
+                    } else if (!me.equals(r.origin()) || droppedHere.contains(r.id())) {
+                        // our own items are recreated only if dropped: else absent here means they already left
+                        create(r);
                     }
                 }
                 case CLAIMED, STARTED -> {
@@ -768,12 +781,25 @@ public final class SharedQueue {
                 LOGGER.log(Level.WARNING, "Cannot mirror queue item " + event.id(), e);
                 return;
             }
-            if (r == null || r.state() != ClusterQueue.State.WAITING || Queue.getInstance().getLocalItem(r.id()) != null) {
-                return;
+            Queue.Item here = r == null ? null : Queue.getInstance().getLocalItem(r.id());
+            if (r == null || r.state() != ClusterQueue.State.WAITING || here != null && !(here instanceof Queue.LeftItem && droppedHere.contains(r.id()))) {
+                return; // e.g. it left here (an item put back after being dropped here is mirrored again)
             }
             Job<?, ?> job = Jenkins.get().getItemByFullName(r.task(), Job.class);
+            if (job == null) {
+                // its job may not be here yet: item changes are applied apart from queue changes
+                if (awaitingJob.size() > 10_000) {
+                    awaitingJob.clear(); // jobs which never came
+                }
+                awaitingJob.computeIfAbsent(r.task(), k -> ConcurrentHashMap.newKeySet()).add(r.id());
+                job = Jenkins.get().getItemByFullName(r.task(), Job.class); // created meanwhile?
+                if (job == null) {
+                    LOGGER.fine(() -> "Not mirroring " + r + " until its job is here");
+                    return;
+                }
+                awaitingJob.computeIfPresent(r.task(), (k, ids) -> ids.remove(r.id()) && ids.isEmpty() ? null : ids);
+            }
             if (!(job instanceof Queue.Task task)) {
-                LOGGER.fine(() -> "Not mirroring " + r + ": no such job here (yet)");
                 return;
             }
             int quietPeriod = (int) Math.max(0, (r.dueAt() - System.currentTimeMillis() + 999) / 1000);
@@ -787,6 +813,35 @@ public final class SharedQueue {
                 }
             } finally {
                 Ids.MIRRORED.remove();
+            }
+            droppedHere.remove(r.id());
+        }
+
+        /** Waiting items whose job was not here when they were mirrored, by job: they are once it comes. */
+        private static final Map<String, Set<Long>> awaitingJob = new ConcurrentHashMap<>();
+
+        @Restricted(NoExternalUse.class)
+        @Extension
+        public static final class JobArrivals extends hudson.model.listeners.ItemListener {
+            @Override
+            public void onCreated(hudson.model.Item item) {
+                arrived(item.getFullName());
+            }
+
+            @Override
+            public void onLocationChanged(hudson.model.Item item, String oldFullName, String newFullName) {
+                arrived(newFullName);
+            }
+
+            private static void arrived(String fullName) {
+                Set<Long> ids = awaitingJob.remove(fullName);
+                if (ids != null) {
+                    Timer.get().submit(() -> {
+                        try (ACLContext ctx = ACL.as2(ACL.SYSTEM2)) {
+                            ids.forEach(Mirror::mirror);
+                        }
+                    });
+                }
             }
         }
     }

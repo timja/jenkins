@@ -497,6 +497,45 @@ class SharedQueueTest {
     }
 
     @Test
+    void anItemPutBackAfterItsClaimerWentAwayIsMirroredAgain() throws Exception {
+        long grace = SharedQueue.ORIGIN_GRACE_MILLIS;
+        SharedQueue.ORIGIN_GRACE_MILLIS = 60_000;
+        try {
+            FreeStyleProject p = r.createFreeStyleProject("requeued");
+            ClusterQueue.Record rec = publishElsewhere("requeued", 0, "rita");
+            assertTrue(other.claim(rec.id()));
+            awaitMirrored();
+            for (int i = 0; i < 50 && Queue.getInstance().getItem(rec.id()) instanceof Queue.WaitingItem; i++) {
+                Thread.sleep(100);
+            }
+            assertTrue(Queue.getInstance().isEmpty(), "dropped here");
+
+            SharedQueue.ORIGIN_GRACE_MILLIS = 0;
+            STORE.requeue(rec.id()); // the other controller went away before starting it
+            awaitMirrored();
+            for (int i = 0; i < 100 && p.getLastBuild() == null; i++) {
+                Thread.sleep(100);
+            }
+            assertNotNull(p.getLastBuild(), "built here");
+            assertEquals(rec.id(), p.getLastBuild().getQueueId());
+        } finally {
+            SharedQueue.ORIGIN_GRACE_MILLIS = grace;
+        }
+    }
+
+    @Test
+    void anItemOfAJobCreatedAfterItIsMirroredOnceTheJobIsHere() throws Exception {
+        ClusterQueue.Record rec = publishElsewhere("late", 60_000, "sam");
+        assertNull(Queue.getInstance().getLocalItem(rec.id()), "no such job yet");
+        r.createFreeStyleProject("late");
+        for (int i = 0; i < 100 && Queue.getInstance().getLocalItem(rec.id()) == null; i++) {
+            Thread.sleep(100);
+        }
+        assertNotNull(Queue.getInstance().getLocalItem(rec.id()), "mirrored once the job is here");
+        other.cancel(rec.id()); // the store outlives this test
+    }
+
+    @Test
     void anItemOneMayNotSeeIsNotFound() throws Exception {
         r.createFreeStyleProject("hidden");
         r.jenkins.setSecurityRealm(r.createDummySecurityRealm());
