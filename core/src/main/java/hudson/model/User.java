@@ -1162,6 +1162,9 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
                     LOGGER.warning(() -> "ignoring " + xml + " with <id> " + user.id + " expected to be in " + expectedFolderName);
                     continue;
                 }
+                // a user stored only in the persistence store has a folder here too, as one made here would: it is
+                // where its other files go, and what lets it be deleted
+                Util.createDirectories(dir.toPath());
                 user.fixUpAfterLoad();
                 var old = byName.put(idStrategy.keyFor(user.id), user);
                 if (old != null) {

@@ -78,6 +78,8 @@ class StaticStateRoutingTest {
         User again = User.getById("alice", false);
         assertNotNull(again, "loaded from the store");
         assertEquals("Alice Example", again.getFullName());
+        assertNotNull(again.getUserFolder(), "has a folder here, as a user made here has");
+        assertTrue(again.canDelete(), "can be deleted by an administrator");
     }
 
     @Test
