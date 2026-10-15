@@ -127,6 +127,55 @@ class XmlMergeTest {
         assertTrue(s(r.merged()).contains("<a>mine</a>"));
     }
 
+    private static final String BUILDERS = """
+            <project>
+              <builders>
+                <hudson.tasks.Maven><targets>install</targets></hudson.tasks.Maven>
+              </builders>
+            </project>""";
+
+    private static String builders(String merged) {
+        return merged.substring(merged.indexOf("<builders>"), merged.indexOf("</builders>")).replaceAll("\\s+", "");
+    }
+
+    @Test
+    void buildStepsAddedElsewhereKeepTheirPlace() {
+        String mine = BUILDERS.replace(">install<", ">deploy<");
+        String theirs = BUILDERS.replace("<hudson.tasks.Maven>", "<hudson.tasks.Shell><command>make</command></hudson.tasks.Shell>\n    <hudson.tasks.Maven>");
+        XmlMerge.Result r = XmlMerge.merge(b(BUILDERS), b(mine), b(theirs));
+        assertNotNull(r);
+        assertEquals(0, r.conflicts());
+        assertEquals("<builders><hudson.tasks.Shell><command>make</command></hudson.tasks.Shell>"
+                + "<hudson.tasks.Maven><targets>deploy</targets></hudson.tasks.Maven>", builders(s(r.merged())), "the shell step runs first");
+
+        String appended = BUILDERS.replace("</hudson.tasks.Maven>", "</hudson.tasks.Maven>\n    <hudson.tasks.Ant><targets>dist</targets></hudson.tasks.Ant>");
+        r = XmlMerge.merge(b(BUILDERS), b(appended), b(theirs));
+        assertNotNull(r);
+        assertEquals(0, r.conflicts());
+        assertEquals("<builders><hudson.tasks.Shell><command>make</command></hudson.tasks.Shell>"
+                + "<hudson.tasks.Maven><targets>install</targets></hudson.tasks.Maven><hudson.tasks.Ant><targets>dist</targets></hudson.tasks.Ant>",
+                builders(s(r.merged())));
+    }
+
+    @Test
+    void buildStepsOrderedDifferentlyOnTheTwoSidesKeepMineAndCount() {
+        String base = BUILDERS.replace("</hudson.tasks.Maven>", "</hudson.tasks.Maven>\n    <hudson.tasks.Shell><command>make</command></hudson.tasks.Shell>");
+        String mine = BUILDERS.replace("<hudson.tasks.Maven>", "<hudson.tasks.Shell><command>make</command></hudson.tasks.Shell>\n    <hudson.tasks.Maven>");
+        String theirs = base.replace(">install<", ">deploy<");
+        XmlMerge.Result r = XmlMerge.merge(b(base), b(mine), b(theirs));
+        assertNotNull(r);
+        assertEquals(1, r.conflicts(), "reordered here, changed there");
+        assertEquals(builders(mine), builders(s(r.merged())));
+
+        // both added a step at the same place: which runs first is not known
+        String mine2 = BUILDERS.replace("</hudson.tasks.Maven>", "</hudson.tasks.Maven>\n    <hudson.tasks.Ant/>");
+        String theirs2 = BUILDERS.replace("</hudson.tasks.Maven>", "</hudson.tasks.Maven>\n    <hudson.tasks.Shell/>");
+        r = XmlMerge.merge(b(BUILDERS), b(mine2), b(theirs2));
+        assertNotNull(r);
+        assertEquals(1, r.conflicts());
+        assertEquals(builders(mine2), builders(s(r.merged())));
+    }
+
     @Test
     void notMergeable() {
         assertNull(XmlMerge.merge(b(BASE), b("not xml"), b(BASE)));
