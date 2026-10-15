@@ -26,6 +26,7 @@ package jenkins.persistence;
 
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import hudson.Util;
+import hudson.XmlFile;
 import hudson.init.InitMilestone;
 import hudson.init.Initializer;
 import hudson.init.Terminator;
@@ -47,6 +48,7 @@ import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicLong;
@@ -120,24 +122,52 @@ public final class ItemChangeApplier {
 
     /** How many times the application of a key's change has been put off, by key. */
     private final Map<String, Integer> retries = new java.util.concurrent.ConcurrentHashMap<>();
+    /** The latest change put off, by key: what its retry applies (it reads the store again, so it covers the others). */
+    private final Map<String, ChangeEvent> deferred = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Changes queued again by their retry (by identity: one delivered twice is equal to it). */
+    private final Set<ChangeEvent> retrying = java.util.Collections.synchronizedSet(java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()));
     private static final int MAX_RETRIES = 3;
 
     /**
      * Puts off applying a change to an object with a save pending, for a second, at most {@link #MAX_RETRIES} times.
+     * Changes to a key already put off (delivered again, or made since) wait for that one's retry: they neither apply
+     * at once nor use up the retries.
      *
      * @return false if it has been put off enough: apply it now
      */
     private boolean retryLater(ChangeEvent e) {
-        int n = retries.merge(e.key(), 1, Integer::sum);
+        String key = e.key();
+        boolean retry = retrying.remove(e);
+        if (!retry && deferred.containsKey(key)) {
+            deferred.merge(key, e, (a, b) -> b.version() > a.version() ? b : a);
+            LOGGER.fine(() -> "Putting off " + e + " with the change to it already put off");
+            return true;
+        }
+        int n = retries.merge(key, 1, Integer::sum);
         if (n > MAX_RETRIES) {
-            retries.remove(e.key());
+            applied(key);
             LOGGER.fine(() -> "Applying " + e + " although its object still has unsaved changes");
             return false;
         }
+        deferred.merge(key, e, (a, b) -> b.version() > a.version() ? b : a);
         pending.incrementAndGet();
-        Timer.get().schedule(() -> queue.add(e), 1, java.util.concurrent.TimeUnit.SECONDS);
+        Timer.get().schedule(() -> {
+            ChangeEvent latest = deferred.get(key);
+            if (latest == null) {
+                pending.decrementAndGet(); // applied meanwhile
+                return;
+            }
+            retrying.add(latest);
+            queue.add(latest);
+        }, 1, java.util.concurrent.TimeUnit.SECONDS);
         LOGGER.fine(() -> "Putting off " + e + ": its object has a save pending");
         return true;
+    }
+
+    /** Forgets what was put off of a key, its change applied. */
+    private void applied(String key) {
+        retries.remove(key);
+        deferred.remove(key);
     }
 
     /** The origin of {@link #reload} events (never a controller's). */
@@ -159,6 +189,7 @@ public final class ItemChangeApplier {
     public static synchronized void start() {
         if (instance != null && instance.worker == null) {
             ItemChangeApplier a = instance;
+            a.pending.incrementAndGet(); // the snapshots of what was loaded, taken first
             a.worker = new Thread(a::run, "Persistence store item change applier");
             a.worker.setDaemon(true);
             a.worker.start();
@@ -208,6 +239,11 @@ public final class ItemChangeApplier {
     }
 
     private void run() {
+        try {
+            snapshotLoaded();
+        } finally {
+            pending.decrementAndGet();
+        }
         while (Jenkins.getInstanceOrNull() == jenkins) {
             ChangeEvent e;
             try {
@@ -222,6 +258,27 @@ public final class ItemChangeApplier {
             } finally {
                 pending.decrementAndGet();
             }
+        }
+    }
+
+    /**
+     * Takes snapshots of the global configuration and the items loaded at startup (once load-time fixups are done), so
+     * that a change made to one in memory and not saved yet is recognised from the start, and not reloaded over
+     * ({@link PersistenceStores#hasUnsavedChanges}). It holds one serialisation per object, as the merge bases hold what
+     * the store had. Off the startup thread: this applies nothing before it is done.
+     */
+    private void snapshotLoaded() {
+        try (ACLContext ctx = ACL.as2(ACL.SYSTEM2)) {
+            synchronized (jenkins) {
+                PersistenceStores.loaded(new XmlFile(Jenkins.XSTREAM, new File(jenkins.getRootDir(), "config.xml")), jenkins);
+            }
+            for (AbstractItem item : jenkins.allItems(AbstractItem.class)) {
+                synchronized (item) {
+                    PersistenceStores.loaded(item.getConfigFile(), item);
+                }
+            }
+        } catch (RuntimeException x) {
+            LOGGER.log(Level.WARNING, "Failed to take snapshots of what was loaded", x);
         }
     }
 
@@ -280,7 +337,7 @@ public final class ItemChangeApplier {
                 } else if (StaticStateApplier.apply(e.key(), false)) {
                     applied.incrementAndGet();
                 }
-                retries.remove(e.key());
+                applied(e.key());
             }
             return;
         }
@@ -304,7 +361,7 @@ public final class ItemChangeApplier {
                 PersistenceStores.reload(existing.getConfigFile(), existing, existing::load); // a display name cleared, say
                 PersistenceStores.synced(existing.getConfigFile(), existing);
             }
-            retries.remove(e.key());
+            applied(e.key());
             ItemListener.fireOnUpdated(existing);
             applied.incrementAndGet();
             return;
@@ -323,23 +380,31 @@ public final class ItemChangeApplier {
         Util.createDirectories(dir.toPath());
         LOGGER.fine(() -> "Loading " + fullName + " created elsewhere");
         if (parent == jenkins) {
-            if (jenkins.addItemCreatedElsewhere((TopLevelItem) Items.load(jenkins, dir)) != null) {
+            TopLevelItem created = (TopLevelItem) Items.load(jenkins, dir);
+            if (jenkins.addItemCreatedElsewhere(created) != null) {
                 // created here meanwhile (stored, then added, after the check above), and changed elsewhere since: that
                 // one is brought up to date, as a changed item is, rather than replaced by the copy just loaded
                 PersistenceStores.seen(e.key(), PersistenceStore.ANY); // the version read was the copy's
                 written(e);
                 return;
             }
+            if (created instanceof AbstractItem ai) {
+                PersistenceStores.synced(ai.getConfigFile(), ai);
+            }
         } else if (parent instanceof AbstractItem folder) {
             // reloading the folder loads children which so far exist only in the store; under its lock, as items are
             // reloaded above, so that a save of the folder meanwhile does not store a mix of the two versions
             synchronized (folder) {
                 PersistenceStores.reload(folder.getConfigFile(), folder, folder::load);
+                PersistenceStores.synced(folder.getConfigFile(), folder);
             }
             Item created = jenkins.getItemByFullName(fullName);
             if (created == null) {
                 LOGGER.warning(() -> "Reloaded " + folder.getFullName() + " but " + fullName + " did not appear");
                 return;
+            }
+            if (created instanceof AbstractItem ai) {
+                PersistenceStores.synced(ai.getConfigFile(), ai);
             }
             ItemListener.fireOnCreated(created);
         } else {
