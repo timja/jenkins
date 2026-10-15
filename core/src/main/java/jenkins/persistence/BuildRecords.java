@@ -531,6 +531,24 @@ public final class BuildRecords {
             }
         }
 
+        /** The files the directory held when the manifest was written (empty if there is none). */
+        static Set<String> paths(File dir) {
+            Set<String> paths = new java.util.HashSet<>();
+            try {
+                for (String line : Files.readString(new File(dir, NAME).toPath(), StandardCharsets.UTF_8).split("\n")) {
+                    // path size modified
+                    int modified = line.lastIndexOf(' ');
+                    int size = modified < 0 ? -1 : line.lastIndexOf(' ', modified - 1);
+                    if (size > 0) {
+                        paths.add(line.substring(0, size));
+                    }
+                }
+            } catch (IOException e) {
+                // none
+            }
+            return paths;
+        }
+
         /** Whether files were added or changed since the manifest was written (false if there is none). */
         static boolean filesAdded(File dir) {
             Path manifest = new File(dir, NAME).toPath();
@@ -945,6 +963,52 @@ public final class BuildRecords {
         return true;
     }
 
+    /**
+     * Adds to a build's directory the files of its shared snapshot that it lacks, and did not remove since it was last in
+     * sync (its {@link Manifest}): files added to the build on another controller, which publishing this directory with
+     * the files added here would otherwise drop. A file in both is kept as it is here.
+     */
+    private static void addFilesAddedElsewhere(String base, File dir) throws IOException {
+        BlobStore blobs = PersistenceStores.getBlobStore();
+        if (blobs == null) {
+            return;
+        }
+        Set<String> before = Manifest.paths(dir);
+        Path root = dir.toPath().toRealPath();
+        Path shared = Files.createTempDirectory("build-snapshot");
+        try {
+            try (InputStream in = blobs.get(base + "/" + SNAPSHOT)) {
+                if (in == null) {
+                    return;
+                }
+                new FilePath(shared.toFile()).untarFrom(in, FilePath.TarCompression.GZIP);
+            } catch (InterruptedException e) {
+                throw (IOException) new InterruptedIOException().initCause(e);
+            }
+            removeLinks(shared);
+            List<Path> files;
+            try (Stream<Path> walk = Files.walk(shared)) {
+                files = walk.filter(f -> Files.isRegularFile(f, LinkOption.NOFOLLOW_LINKS)).toList();
+            }
+            for (Path f : files) {
+                String rel = shared.relativize(f).toString().replace(File.separatorChar, '/');
+                Path target = root.resolve(rel).normalize();
+                if (rel.equals(RECORD) || rel.equals(Manifest.NAME) || before.contains(rel) || !target.startsWith(root)
+                        || Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
+                    continue; // the record, removed here since, or here too (kept as it is here)
+                }
+                Files.createDirectories(target.getParent());
+                if (!target.getParent().toRealPath().startsWith(root)) {
+                    continue; // never through a link
+                }
+                Files.copy(f, target);
+                LOGGER.fine(() -> "Keeping " + rel + " of " + base + ", added elsewhere");
+            }
+        } finally {
+            Util.deleteRecursive(shared.toFile());
+        }
+    }
+
     private static void writeRecord(File dir, byte[] content) throws IOException {
         Path tmp = Files.createTempFile(dir.toPath(), RECORD, ".tmp");
         Files.write(tmp, content);
@@ -1026,7 +1090,9 @@ public final class BuildRecords {
             }
         }
         if (toPublish != null) {
-            publish(toPublish, true); // not under the lock: it uploads
+            // not under the lock: it downloads and uploads
+            addFilesAddedElsewhere(builds + "/" + number, dir);
+            publish(toPublish, true);
             runs.unload(number); // loaded again with the record as written elsewhere
         }
         PeepholePermalink.changedElsewhere(job, number, false);

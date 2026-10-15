@@ -450,6 +450,43 @@ class BuildRecordsTest {
     }
 
     @Test
+    void lateFilesAddedOnTwoControllersAreBothKept() throws Exception {
+        FreeStyleProject p = project(r, "both-late");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p);
+        String key = "jobs/both-late/builds/1/build.xml";
+        String snapshot = "jobs/both-late/builds/1/files.tgz";
+        Files.writeString(new File(b.getRootDir(), "b.txt").toPath(), "added here");
+        // meanwhile another controller added a.txt to its copy, and republished the build with it
+        Path elsewhere = Files.createTempDirectory("elsewhere");
+        try {
+            try (InputStream in = BLOBS.get(snapshot)) {
+                new hudson.FilePath(elsewhere.toFile()).untarFrom(in, hudson.FilePath.TarCompression.GZIP);
+            }
+            Files.writeString(elsewhere.resolve("a.txt"), "added elsewhere");
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (java.io.OutputStream out = new GZIPOutputStream(bytes)) {
+                new hudson.FilePath(elsewhere.toFile()).tar(out, "**");
+            }
+            BLOBS.put(snapshot, new ByteArrayInputStream(bytes.toByteArray()), bytes.size());
+        } finally {
+            Util.deleteRecursive(elsewhere.toFile());
+        }
+        STORE.as("other-controller").write(key, (record(key) + "\n<!-- files updated 1 -->").getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        for (int i = 0; i < 300 && !ItemChangeApplier.isIdle(); i++) {
+            Thread.sleep(100);
+        }
+        assertTrue(ItemChangeApplier.isIdle());
+        List<String> names = new ArrayList<>();
+        try (TarInputStream tar = new TarInputStream(new GZIPInputStream(BLOBS.get(snapshot)))) {
+            for (TarEntry e = tar.getNextEntry(); e != null; e = tar.getNextEntry()) {
+                names.add(e.getName());
+            }
+        }
+        assertThat(names, hasItem("b.txt"));
+        assertThat("the file added elsewhere is not dropped by publishing this copy", names, hasItem("a.txt"));
+    }
+
+    @Test
     void fileAddedLongAfterIsPublishedWhenTheBuildIsSaved() throws Exception {
         FreeStyleProject p = project(r, "later");
         FreeStyleBuild b = r.buildAndAssertSuccess(p);
