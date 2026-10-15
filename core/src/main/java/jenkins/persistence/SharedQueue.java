@@ -271,6 +271,8 @@ public final class SharedQueue {
     static final Map<Long, ClusterQueue.Record> known = new ConcurrentHashMap<>();
     /** Local items being shared (published, or folded into an item from elsewhere): they do not start meanwhile. */
     static final Set<Long> sharing = ConcurrentHashMap.newKeySet();
+    /** Items cancelled here while being shared, whose cancellation is shared once they are. */
+    private static final Set<Long> cancelledWhileSharing = ConcurrentHashMap.newKeySet();
     /** Items with a claim under way. */
     private static final Set<Long> claiming = ConcurrentHashMap.newKeySet();
 
@@ -344,10 +346,8 @@ public final class SharedQueue {
 
     /** Removes an item from this controller's queue because it was claimed, started or cancelled elsewhere. */
     private static void dropLocal(long id) {
-        Queue.Item item = localItem(id);
-        if (item != null) {
-            LOGGER.fine(() -> "Dropping " + item + ", taken or cancelled elsewhere");
-            PersistenceStores.applyingRemoteChange(() -> Queue.getInstance().cancel(item));
+        if (PersistenceStores.applyingRemoteChange(() -> Queue.getInstance().cancelLocal(id))) {
+            LOGGER.fine(() -> "Dropped queue item " + id + ", taken or cancelled elsewhere");
         }
     }
 
@@ -371,7 +371,8 @@ public final class SharedQueue {
         }
 
         private static void share(Queue.WaitingItem wi, ClusterQueue.Record record, List<Action> actions) {
-            try {
+            long id = wi.getId();
+            try (ACLContext ctx = ACL.as2(ACL.SYSTEM2)) { // to see the job when mirroring the item folded into
                 ClusterQueue cq = queue();
                 ClusterQueue.Record stored = cq.publish(record);
                 know(stored);
@@ -380,13 +381,17 @@ public final class SharedQueue {
                     // that item, then drop this one, which has not started (the gate held it)
                     LOGGER.fine(() -> wi + " folds into queue item " + stored.id() + " from " + stored.origin());
                     fold(cq, stored.id(), actions, dueOf(wi), record.pinnedTo());
-                    PersistenceStores.applyingRemoteChange(() -> Queue.getInstance().cancel(wi));
+                    // by id: with no quiet period, wi may be blocked or buildable by now
+                    PersistenceStores.applyingRemoteChange(() -> Queue.getInstance().cancelLocal(id));
                     Mirror.mirror(stored.id());
                 }
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.WARNING, "Failed to share " + wi + "; it stays local", e);
             } finally {
-                sharing.remove(wi.getId());
+                sharing.remove(id);
+                if (cancelledWhileSharing.remove(id)) {
+                    shareCancellation(id, 0); // published meanwhile (or not: then there is nothing to cancel)
+                }
                 Queue.getInstance().scheduleMaintenance();
             }
         }
@@ -439,6 +444,11 @@ public final class SharedQueue {
             known.remove(li.getId());
             if (!li.isCancelled() || PersistenceStores.isApplyingRemoteChange() || !shared(li.task)) {
                 return;
+            }
+            // while it is being published, the store may not have it yet: share() cancels it once it does
+            cancelledWhileSharing.add(li.getId());
+            if (sharing.contains(li.getId()) || !cancelledWhileSharing.remove(li.getId())) {
+                return; // share() cancels it, or did already
             }
             // not under the queue lock, which Queue.cancel holds here: a slow store would stop the whole queue
             shareCancellation(li.getId(), 0);

@@ -383,6 +383,81 @@ class SharedQueueTest {
     }
 
     @Test
+    void cancellingAnItemClaimedHereBeforeItStartsCancelsItEverywhere() throws Exception {
+        r.createFreeStyleProject("claimed-here");
+        ClusterQueue.Record rec = publishElsewhere("claimed-here", 60_000, "olga");
+        assertTrue(STORE.clusterQueue().claim(rec.id()), "claimed by this controller, which has not started it yet");
+        awaitMirrored();
+
+        assertTrue(Queue.getInstance().cancel(Queue.getInstance().getItem(rec.id())));
+        ClusterQueue.Record now = awaitShared(rec.id(), x -> x.state() == ClusterQueue.State.CANCELLED);
+        assertEquals(ClusterQueue.State.CANCELLED, now.state(), "else it would stay claimed, and be put back once this controller is gone");
+    }
+
+    @Test
+    void cancellingAnItemWhileItIsSharedCancelsItEverywhere() throws Exception {
+        FreeStyleProject slow = r.createFreeStyleProject("slow-cancelled");
+        slowPublish = new java.util.concurrent.CountDownLatch(1);
+        try {
+            slow.scheduleBuild2(60, new CauseAction(new Cause.UserIdCause("pat")));
+            Queue.Item item = Queue.getInstance().getItems()[0];
+            assertTrue(Queue.getInstance().cancel(item), "cancelled before the store has it");
+            Thread.sleep(1_000); // as far as the cancellation could be shared now, it is
+            slowPublish.countDown();
+            ClusterQueue.Record rec = awaitShared(item.getId(), x -> x.state() == ClusterQueue.State.CANCELLED);
+            assertEquals(ClusterQueue.State.CANCELLED, rec.state(), "else the other controllers would run it");
+        } finally {
+            slowPublish.countDown();
+            slowPublish = null;
+        }
+    }
+
+    @Test
+    void aRequestFoldedIntoAnItemFromElsewhereIsDroppedWhereverItIs() throws Exception {
+        foldIntoAnItemFromElsewhereWhilePublishing("slow-folded");
+    }
+
+    @Test
+    void aRequestFoldedIntoAnItemFromElsewhereLeavesThatItemOnASecuredController() throws Exception {
+        r.jenkins.setSecurityRealm(r.createDummySecurityRealm());
+        r.jenkins.setAuthorizationStrategy(new MockAuthorizationStrategy().grant(Jenkins.READ, hudson.model.Item.READ).everywhere().to("bob"));
+        foldIntoAnItemFromElsewhereWhilePublishing("slow-folded-secured");
+    }
+
+    /**
+     * Schedules a job with no quiet period while another controller publishes the same, so that the item here is
+     * buildable by the time it folds into the other: it must not start, and only the other's item is left.
+     */
+    private void foldIntoAnItemFromElsewhereWhilePublishing(String name) throws Exception {
+        FreeStyleProject slow = r.createFreeStyleProject(name);
+        slowPublish = new java.util.concurrent.CountDownLatch(1);
+        ClusterQueue.Record rec;
+        try {
+            slow.scheduleBuild2(0, new CauseAction(new Cause.UserIdCause("here")));
+            long here = Queue.getInstance().getItems()[0].getId();
+            rec = publishElsewhere(name, 60_000, "there");
+            for (int i = 0; i < 100 && !(Queue.getInstance().getItem(here) instanceof Queue.BuildableItem); i++) {
+                Thread.sleep(100);
+            }
+            assertThat(Queue.getInstance().getItem(here), instanceOf(Queue.BuildableItem.class));
+            slowPublish.countDown();
+            for (int i = 0; i < 100 && Queue.getInstance().getLocalItem(rec.id()) == null; i++) {
+                Thread.sleep(100);
+            }
+            Thread.sleep(2_000); // it would have started by now
+        } finally {
+            slowPublish.countDown();
+            slowPublish = null;
+        }
+        assertNull(slow.getLastBuild(), "folded into the item from elsewhere, which is not due yet");
+        Queue.Item[] items = Queue.getInstance().getItems();
+        assertEquals(1, items.length, "only the item from elsewhere");
+        assertEquals(rec.id(), items[0].getId());
+        assertThat(causes(STORE.clusterQueue().get(rec.id())), containsString("here"));
+        other.cancel(rec.id()); // the store outlives this test
+    }
+
+    @Test
     void anItemOneMayNotSeeIsNotFound() throws Exception {
         r.createFreeStyleProject("hidden");
         r.jenkins.setSecurityRealm(r.createDummySecurityRealm());

@@ -294,7 +294,7 @@ public class InMemoryPersistenceStore implements PersistenceStore {
                 Record next;
                 synchronized (root) {
                     Record r = queueRecords.get(id);
-                    if (r == null || r.state() != State.WAITING) {
+                    if (r == null || r.state() != State.WAITING && !(r.state() == State.CLAIMED && origin.equals(r.claimedBy()))) {
                         return false;
                     }
                     next = with(r, State.CANCELLED, null, 0, r.actions(), r.dueAt());
