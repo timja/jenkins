@@ -60,6 +60,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
 import java.util.GregorianCalendar;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
@@ -219,8 +220,11 @@ public final class SharedQueue {
         return item instanceof Queue.WaitingItem wi ? wi.timestamp.getTimeInMillis() : System.currentTimeMillis();
     }
 
-    /** Merges the causes of {@code from} into {@code into}. */
-    private static List<Action> mergeCauses(List<Action> into, List<? extends Action> from) {
+    /**
+     * Merges a request folded into an item: its causes join the item's, and its other {@link FoldableAction}s (such as a
+     * {@code build} step's, which the local queue folded into its copy) are added unless an equal one is there.
+     */
+    private static List<Action> merge(List<Action> into, List<? extends Action> from) {
         List<Cause> causes = new ArrayList<>();
         for (Action a : into) {
             if (a instanceof CauseAction ca) {
@@ -233,8 +237,15 @@ public final class SharedQueue {
             }
         }
         List<Action> merged = new ArrayList<>();
+        Set<String> present = new HashSet<>();
         for (Action a : into) {
             if (!(a instanceof CauseAction)) {
+                merged.add(a);
+                present.add(Queue.XSTREAM.toXML(a));
+            }
+        }
+        for (Action a : from) {
+            if (a instanceof FoldableAction && !(a instanceof CauseAction) && present.add(Queue.XSTREAM.toXML(a))) {
                 merged.add(a);
             }
         }
@@ -263,8 +274,22 @@ public final class SharedQueue {
     /** Items with a claim under way. */
     private static final Set<Long> claiming = ConcurrentHashMap.newKeySet();
 
-    /** A few threads: items are shared independently, so one waiting on a slow write does not hold up the others. */
-    private static final ExecutorService outbox = Executors.newFixedThreadPool(4, new NamingThreadFactory(new DaemonThreadFactory(), "Shared queue outbox"));
+    /**
+     * A few threads: items are shared independently, so one waiting on a slow write does not hold up the others; the
+     * changes of one item go through one thread, in order (its publication before the folds into it).
+     */
+    private static final ExecutorService[] outbox = new ExecutorService[4];
+
+    static {
+        for (int i = 0; i < outbox.length; i++) {
+            outbox[i] = Executors.newSingleThreadExecutor(new NamingThreadFactory(new DaemonThreadFactory(), "Shared queue outbox " + i));
+        }
+    }
+
+    private static ExecutorService outbox(long id) {
+        return outbox[(int) Math.floorMod(id, (long) outbox.length)];
+    }
+
     private static final ExecutorService claims = Executors.newFixedThreadPool(4, new NamingThreadFactory(new DaemonThreadFactory(), "Shared queue claims"));
 
     /** Records a record, unless it is older than the one known (records only move on: waiting, claimed, started). */
@@ -342,7 +367,7 @@ public final class SharedQueue {
             ClusterQueue.Record record = new ClusterQueue.Record(wi.getId(), ((Job<?, ?>) wi.task).getFullName(),
                     dedupKey(wi.task, actions), toXml(actions), dueOf(wi), ClusterQueue.State.WAITING, origin(), pinnedTo(actions), null, 0);
             sharing.add(wi.getId());
-            outbox.submit(() -> share(wi, record, actions));
+            outbox(wi.getId()).submit(() -> share(wi, record, actions));
         }
 
         private static void share(Queue.WaitingItem wi, ClusterQueue.Record record, List<Action> actions) {
@@ -354,7 +379,7 @@ public final class SharedQueue {
                     // the same job and parameters were already waiting (scheduled elsewhere at the same time): fold into
                     // that item, then drop this one, which has not started (the gate held it)
                     LOGGER.fine(() -> wi + " folds into queue item " + stored.id() + " from " + stored.origin());
-                    fold(cq, stored.id(), actions, dueOf(wi));
+                    fold(cq, stored.id(), actions, dueOf(wi), record.pinnedTo());
                     PersistenceStores.applyingRemoteChange(() -> Queue.getInstance().cancel(wi));
                     Mirror.mirror(stored.id());
                 }
@@ -366,14 +391,24 @@ public final class SharedQueue {
             }
         }
 
-        /** Merges a request's causes into a waiting item, compare-and-set: one fold elsewhere at the same time is kept. */
-        private static void fold(ClusterQueue cq, long id, List<Action> actions, long due) throws IOException {
+        /**
+         * Merges a request into a waiting item, compare-and-set: one fold elsewhere at the same time is kept.
+         *
+         * @param pinTo pins the item to this controller, unless it is pinned already: the request must run here
+         */
+        private static void fold(ClusterQueue cq, long id, List<Action> actions, long due, @CheckForNull String pinTo) throws IOException {
             for (int attempt = 0; attempt < 20; attempt++) {
                 ClusterQueue.Record now = cq.get(id);
                 if (now == null || now.state() != ClusterQueue.State.WAITING) {
+                    if (pinTo != null && now != null && !pinTo.equals(now.claimedBy())) {
+                        LOGGER.info(() -> "Queue item " + id + " was taken by " + now.claimedBy() + " before a request needing this controller was folded into it");
+                    }
                     return; // started (or cancelled) meanwhile, as a request folded a moment later would have found
                 }
-                if (cq.update(id, now.actions(), toXml(mergeCauses(fromXml(now.actions()), actions)), Math.min(now.dueAt(), due))) {
+                if (cq.update(id, now.actions(), toXml(merge(fromXml(now.actions()), actions)), Math.min(now.dueAt(), due), pinTo)) {
+                    if (pinTo != null && now.pinnedTo() != null && !pinTo.equals(now.pinnedTo())) {
+                        LOGGER.info(() -> "Queue item " + id + " is pinned to " + now.pinnedTo() + "; a request needing this controller was folded into it");
+                    }
                     return;
                 }
             }
@@ -381,16 +416,18 @@ public final class SharedQueue {
         }
 
         @Override
-        public void onFolded(Queue.Item item) {
+        public void onFolded(Queue.Item item, List<Action> request) {
             if (PersistenceStores.isApplyingRemoteChange() || !shared(item.task)) {
                 return;
             }
             long id = item.getId();
-            String actions = toXml(item.getActions());
+            List<Action> actions = List.copyOf(request);
             long due = dueOf(item);
-            outbox.submit(() -> {
+            String pinTo = pinnedTo(actions);
+            // after the item's publication (the same outbox thread): only the request is merged into what is stored
+            outbox(id).submit(() -> {
                 try {
-                    queue().update(id, actions, due);
+                    fold(queue(), id, actions, due, pinTo);
                 } catch (IOException | RuntimeException e) {
                     LOGGER.log(Level.WARNING, "Failed to share changes to queue item " + id, e);
                 }

@@ -59,6 +59,7 @@ import java.util.Objects;
 import jenkins.model.Jenkins;
 import org.htmlunit.HttpMethod;
 import org.htmlunit.WebRequest;
+import org.jenkinsci.plugins.workflow.support.steps.build.BuildTriggerAction;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
@@ -80,7 +81,7 @@ class SharedQueueTest {
         }
     };
 
-    /** While set, publishing an item of job "slow" waits for it: a store answering slowly. */
+    /** While set, publishing an item of a job named "slow…" waits for it: a store answering slowly. */
     static volatile java.util.concurrent.CountDownLatch slowPublish;
 
     private static ClusterQueue slowFor(ClusterQueue cq) {
@@ -93,7 +94,7 @@ class SharedQueueTest {
             @Override
             public Record publish(Record item) throws java.io.IOException {
                 java.util.concurrent.CountDownLatch l = slowPublish;
-                if (l != null && item.task().equals("slow")) {
+                if (l != null && item.task().startsWith("slow")) {
                     try {
                         l.await();
                     } catch (InterruptedException e) {
@@ -104,13 +105,8 @@ class SharedQueueTest {
             }
 
             @Override
-            public void update(long id, String actions, long dueAt) throws java.io.IOException {
-                cq.update(id, actions, dueAt);
-            }
-
-            @Override
-            public boolean update(long id, String expectedActions, String actions, long dueAt) throws java.io.IOException {
-                return cq.update(id, expectedActions, actions, dueAt);
+            public boolean update(long id, String expectedActions, String actions, long dueAt, String pinTo) throws java.io.IOException {
+                return cq.update(id, expectedActions, actions, dueAt, pinTo);
             }
 
             @Override
@@ -277,7 +273,7 @@ class SharedQueueTest {
         ClusterQueue.Record rec = awaitShared(local.getId(), x -> true);
         // another controller folds a request into it
         List<Action> merged = List.of(new CauseAction(new Cause.UserIdCause("grace"), new Cause.UserIdCause("heidi")));
-        other.update(rec.id(), SharedQueue.toXml(merged), rec.dueAt());
+        assertTrue(other.update(rec.id(), rec.actions(), SharedQueue.toXml(merged), rec.dueAt()));
         awaitMirrored();
 
         StringBuilder users = new StringBuilder();
@@ -288,6 +284,42 @@ class SharedQueueTest {
         }
         assertThat(users.toString(), containsString("heidi"));
         assertEquals(1, Queue.getInstance().getItems().length);
+    }
+
+    @Test
+    void foldingARequestNeedingThisControllerIntoAnItemFromElsewherePinsIt() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("pinned");
+        ClusterQueue.Record rec = publishElsewhere("pinned", 60_000, "kim");
+        assertNull(rec.pinnedTo());
+
+        // a build step here waits for the build: it is folded into the item mirrored here
+        p.scheduleBuild2(60, new CauseAction(new Cause.UserIdCause("lee")), new BuildTriggerAction("step"));
+        assertEquals(1, Queue.getInstance().getItems().length, "one item");
+
+        ClusterQueue.Record now = awaitShared(rec.id(), x -> causes(x).contains("lee"));
+        assertEquals(STORE.getOrigin(), now.pinnedTo(), "the build must run where the step waits for it");
+        assertThat(causes(now), containsString("kim"));
+        assertThat(now.actions(), containsString(BuildTriggerAction.class.getName()));
+        other.cancel(rec.id()); // the store outlives this test
+    }
+
+    @Test
+    void aRequestFoldedHereBeforeItsItemIsSharedIsKept() throws Exception {
+        FreeStyleProject slow = r.createFreeStyleProject("slow-folded-here");
+        slowPublish = new java.util.concurrent.CountDownLatch(1);
+        try {
+            slow.scheduleBuild2(60, new CauseAction(new Cause.UserIdCause("mia")));
+            slow.scheduleBuild2(60, new CauseAction(new Cause.UserIdCause("ned"))); // folded locally
+            long id = Queue.getInstance().getItems()[0].getId();
+            slowPublish.countDown();
+            ClusterQueue.Record rec = awaitShared(id, x -> causes(x).contains("ned"));
+            assertThat(causes(rec), containsString("mia"));
+            assertThat(causes(rec), containsString("ned"));
+        } finally {
+            slowPublish.countDown();
+            slowPublish = null;
+        }
+        Queue.getInstance().clear();
     }
 
     @Test

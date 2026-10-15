@@ -240,32 +240,14 @@ public class InMemoryPersistenceStore implements PersistenceStore {
             }
 
             @Override
-            public void update(long id, @NonNull String actions, long dueAt) {
-                Record next;
-                synchronized (root) {
-                    Record r = queueRecords.get(id);
-                    if (r == null || r.state() != State.WAITING) {
-                        return;
-                    }
-                    next = with(r, r.state(), r.claimedBy(), r.buildNumber(), actions, Math.min(r.dueAt(), dueAt));
-                    if (next.equals(r)) {
-                        return;
-                    }
-                    queueRecords.put(id, next);
-                    fire(next);
-                }
-                deliverQueue();
-            }
-
-            @Override
-            public boolean update(long id, @NonNull String expectedActions, @NonNull String actions, long dueAt) {
-                Record next;
+            public boolean update(long id, @NonNull String expectedActions, @NonNull String actions, long dueAt, @CheckForNull String pinTo) {
                 synchronized (root) {
                     Record r = queueRecords.get(id);
                     if (r == null || r.state() != State.WAITING || !r.actions().equals(expectedActions)) {
                         return false;
                     }
-                    next = with(r, r.state(), r.claimedBy(), r.buildNumber(), actions, Math.min(r.dueAt(), dueAt));
+                    Record next = new Record(r.id(), r.task(), r.dedupKey(), actions, Math.min(r.dueAt(), dueAt), r.state(), r.origin(),
+                            r.pinnedTo() != null ? r.pinnedTo() : pinTo, r.claimedBy(), r.buildNumber());
                     if (next.equals(r)) {
                         return true;
                     }
