@@ -330,6 +330,24 @@ public class InMemoryPersistenceStore implements PersistenceStore {
     }
 
     /**
+     * Puts an item claimed by a controller which went away back into the queue, under the same id, as a store does once
+     * it finds that controller gone; for tests.
+     */
+    public void requeue(long id) {
+        synchronized (root) {
+            ClusterQueue.Record r = queueRecords.get(id);
+            if (r == null || r.state() != ClusterQueue.State.CLAIMED) {
+                return;
+            }
+            ClusterQueue.Record next = new ClusterQueue.Record(r.id(), r.task(), r.dedupKey(), r.actions(), r.dueAt(), ClusterQueue.State.WAITING,
+                    r.origin(), r.pinnedTo(), null, 0);
+            queueRecords.put(id, next);
+            queueOutbox.add(next);
+        }
+        deliverQueue();
+    }
+
+    /**
      * Views made by {@link #as} share the liveness of the store they were made from, so tests can override it once.
      */
     @Override
