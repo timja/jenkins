@@ -86,26 +86,58 @@ class BuildLeasesTest {
         }
 
         @Override
-        public long writeIfHeld(String leaseKey, long epoch, String key, byte[] content, long expectedVersion) throws java.io.IOException {
-            if (key.equals(failWriteOf)) {
-                failWriteOf = null;
-                throw new java.io.IOException("store unreachable, this time");
-            }
-            return super.writeIfHeld(leaseKey, epoch, key, content, expectedVersion);
-        }
-
-        @Override
         public Entry read(String key) {
             if (key.equals(failRead)) {
                 failRead = null;
                 throw new IllegalStateException("the store is unreachable, this time");
             }
+            Runnable hook = onRead;
+            if (hook != null && key.equals(onReadKey) && Thread.currentThread() == onReadThread) {
+                onRead = null;
+                hook.run();
+            }
             return super.read(key);
+        }
+
+        @Override
+        public long write(String key, byte[] content, long expectedVersion) throws ConflictException {
+            failIfAsked(key);
+            return super.write(key, content, expectedVersion);
+        }
+
+        @Override
+        public long writeIfHeld(String leaseKey, long epoch, String key, byte[] content, long expectedVersion) throws java.io.IOException {
+            failIfAsked(key);
+            if (key.equals(failWriteOf)) {
+                failWriteOf = null;
+                throw new java.io.IOException("store unreachable, this time");
+            }
+            long version = super.writeIfHeld(leaseKey, epoch, key, content, expectedVersion);
+            if (key.equals(commitThenFail)) {
+                commitThenFail = null;
+                throw new java.io.IOException("the connection broke before the answer came");
+            }
+            return version;
         }
     };
 
     /** A key whose next lease-fenced write fails. */
     static volatile String failWriteOf;
+    /** While set, this controller's writes of the keys it matches fail, as when the store is unreachable. */
+    static volatile java.util.function.Predicate<String> failWrites;
+    /** A key whose next write with a lease is committed, then fails as if its answer was lost. */
+    static volatile String commitThenFail;
+    /** Run, once, as the thread {@link #onReadThread} reads {@link #onReadKey}. */
+    static volatile Runnable onRead;
+    static volatile String onReadKey;
+    static volatile Thread onReadThread;
+
+    private static void failIfAsked(String key) {
+        java.util.function.Predicate<String> fail = failWrites;
+        if (fail != null && fail.test(key)) {
+            throw new IllegalStateException("the store is unreachable, for now");
+        }
+    }
 
     /** A key whose next read fails. */
     static volatile String failRead;
@@ -120,6 +152,9 @@ class BuildLeasesTest {
         dead = STORE.as("dead-controller");
         live = null;
         failRead = null;
+        failWrites = null;
+        commitThenFail = null;
+        onRead = null;
         Adopter.prepared.clear();
         Adopter.resumed.clear();
         Adopter.abandoned.set(0);
@@ -841,6 +876,168 @@ class BuildLeasesTest {
         }
         STORE.delete("jobs/reclaimed-later/running/2.xml", PersistenceStore.ANY);
         forget("reclaimed-later");
+    }
+
+    @Test
+    void anAdoptionWrittenAlthoughItsWriteFailedIsResumedByTheNextSweep() throws Exception {
+        String key = orphan("unsure");
+        commitThenFail = key;
+
+        assertEquals(0, RunningBuilds.removeStale());
+        assertThat("written all the same", text(key), containsString("origin=" + STORE.getOrigin()));
+        assertTrue(Adopter.resumed.isEmpty());
+
+        assertEquals(1, RunningBuilds.removeStale());
+        assertEquals(1, Adopter.resumed.size(), "resumed, although it named this controller already");
+        assertEquals(0, RunningBuilds.removeStale());
+        assertEquals(1, Adopter.resumed.size(), "and only once");
+        forget("unsure");
+    }
+
+    /** Waits for a completed build's publication to fail, so that it is retried. */
+    private static void awaitUnpublished(Job<?, ?> job) throws InterruptedException {
+        for (int i = 0; i < 300 && !BuildRecords.hasUnpublished(job); i++) {
+            Thread.sleep(100);
+        }
+        assertTrue(BuildRecords.hasUnpublished(job), "publication failed, and is retried");
+    }
+
+    @Test
+    void aJobWithABuildNotPublishedYetIsNotRenamed() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("unpublished");
+        failWrites = k -> k.startsWith("jobs/unpublished/builds/");
+        r.buildAndAssertSuccess(p);
+        awaitUnpublished(p);
+        assertTrue(p.isBuilding(), "running, for the other controllers");
+        JenkinsRule.WebClient wc = r.createWebClient().withThrowExceptionOnFailingStatusCode(false);
+        assertEquals(400, wc.getPage(wc.addCrumb(new org.htmlunit.WebRequest(new java.net.URL(r.getURL(), "job/unpublished/confirmRename?newName=renamed"),
+                org.htmlunit.HttpMethod.POST))).getWebResponse().getStatusCode(), "no rename meanwhile: its retry finds it by the job's name");
+
+        failWrites = null;
+        new BuildRecords.Unpublished().execute(hudson.model.TaskListener.NULL);
+        assertNotNull(text("jobs/unpublished/builds/1/build.xml"), "published");
+        assertNull(text("jobs/unpublished/running/1.xml"));
+        assertFalse(p.isBuilding());
+        p.renameTo("renamed");
+        assertNotNull(text("jobs/renamed/builds/1/build.xml"));
+    }
+
+    @Test
+    void aBuildDeletedBeforeItIsPublishedLeavesNothingRunning() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("deleted-unpublished");
+        String key = "jobs/deleted-unpublished/running/1.xml";
+        failWrites = k -> k.startsWith("jobs/deleted-unpublished/builds/");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p);
+        awaitUnpublished(p);
+        assertNotNull(text(key), "running, for the other controllers");
+
+        b.delete();
+        failWrites = null;
+
+        assertNull(text(key), "nor once deleted");
+        long epoch = dead.leases().acquire(key);
+        assertThat("its lease is released", epoch, greaterThan(0L));
+        dead.leases().release(key, epoch);
+        assertFalse(p.isBuilding());
+        new BuildRecords.Unpublished().execute(hudson.model.TaskListener.NULL);
+        assertNull(text("jobs/deleted-unpublished/builds/1/build.xml"), "nor published later");
+    }
+
+    @Test
+    void aSavePointRecordedBeforeARegistrationIsRetriedIsKept() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        FreeStyleProject p = blocking(r, "save-points", started, release);
+        String key = "jobs/save-points/running/1.xml";
+        failRead = "jobs/save-points/running/1.stop"; // its registration fails after the placeholder is written
+        QueueTaskFuture<FreeStyleBuild> f = p.scheduleBuild2(0);
+        assertTrue(started.await(60, TimeUnit.SECONDS));
+        assertNull(failRead);
+        FreeStyleBuild b = p.getBuildByNumber(1);
+        RunningBuilds.update(b, Map.of("savePoint", "9"));
+        assertThat(text(key), containsString("x.savePoint=9"));
+
+        RunningBuilds.registerPending();
+
+        assertThat("not written again without it", text(key), containsString("x.savePoint=9"));
+        release.countDown();
+        r.assertBuildStatusSuccess(f);
+    }
+
+    static volatile CountDownLatch publishing;
+    static volatile CountDownLatch registered;
+
+    @Test
+    void aBuildRegisteredAsItCompletesIsPublishedUnderThatLease() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        FreeStyleProject p = blocking(r, "late", started, release);
+        String key = "jobs/late/running/1.xml";
+        failWrites = k -> k.equals(key); // not registered as it starts
+        QueueTaskFuture<FreeStyleBuild> f = p.scheduleBuild2(0);
+        assertTrue(started.await(60, TimeUnit.SECONDS));
+        failWrites = null;
+        FreeStyleBuild b = p.getBuildByNumber(1);
+        assertNull(RunningBuilds.ownedPlaceholder(b), "not registered");
+
+        // registered again: its placeholder is written; it then completes and is published under that lease, while
+        // the registration finds it completed
+        long delay = BuildRecords.COMPLETE_AGAIN_SECONDS;
+        BuildRecords.COMPLETE_AGAIN_SECONDS = 1;
+        CountDownLatch registering = new CountDownLatch(1);
+        publishing = new CountDownLatch(1);
+        registered = new CountDownLatch(1);
+        try {
+            Thread registration = new Thread(() -> {
+                RunningBuilds.registerPending();
+                registered.countDown();
+            });
+            onReadKey = "jobs/late/running/1.stop";
+            onReadThread = registration;
+            onRead = () -> {
+                registering.countDown();
+                try {
+                    assertTrue(publishing.await(60, TimeUnit.SECONDS));
+                } catch (InterruptedException e) {
+                    throw new AssertionError(e);
+                }
+            };
+            registration.start();
+            assertTrue(registering.await(60, TimeUnit.SECONDS));
+            release.countDown();
+            r.assertBuildStatusSuccess(f);
+            registration.join(60_000);
+            for (int i = 0; i < 100 && (text("jobs/late/builds/1/build.xml") == null || text(key) != null); i++) {
+                Thread.sleep(100);
+            }
+            assertFalse(RunningBuilds.wasLost(b), "not taken for lost");
+            assertNotNull(text("jobs/late/builds/1/build.xml"), "published");
+            assertNull(text(key), "and no longer running");
+            Thread.sleep(2_000); // completed again
+            assertNotNull(text("jobs/late/builds/1/build.xml"));
+            assertNull(text(key));
+            assertThat(b.getRootDir().toString(), b.getRootDir().isDirectory());
+        } finally {
+            BuildRecords.COMPLETE_AGAIN_SECONDS = delay;
+        }
+    }
+
+    /** As "late" is published, after its lease is read: lets the registration go on, and waits for it. */
+    @TestExtension("aBuildRegisteredAsItCompletesIsPublishedUnderThatLease")
+    public static class RegisteredWhilePublishing implements BuildRecords.Exclusion {
+        @Override
+        public java.util.Collection<String> excludes(Run<?, ?> run) {
+            CountDownLatch p = publishing;
+            if (run.getParent().getName().equals("late") && p != null && p.getCount() > 0) {
+                p.countDown();
+                try {
+                    assertTrue(registered.await(60, TimeUnit.SECONDS));
+                } catch (InterruptedException e) {
+                    throw new AssertionError(e);
+                }
+            }
+            return List.of();
+        }
     }
 
     @TestExtension

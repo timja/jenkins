@@ -455,10 +455,14 @@ public final class RunningBuilds {
                 epoch, Map.of(), PersistenceStore.ABSENT);
         long version = store.write(key, p.toBytes(), PersistenceStore.ANY);
         owned.put(key, new Placeholder(key, p.number, p.origin, p.controller, p.displayName, p.startTime, epoch, Map.of(), version));
+        invalidate(jobKeyOfRunning(runningKey(run.getParent())));
+        stopRequestedMeanwhile(run);
+    }
+
+    /** Stops a build asked to stop between its placeholder's write and its registration: that request was not taken as ours. */
+    private static void stopRequestedMeanwhile(@NonNull Run<?, ?> run) throws IOException {
         String jobKey = jobKeyOfRunning(runningKey(run.getParent()));
-        invalidate(jobKey);
-        // a stop requested between the placeholder's write and its registration above was not taken as ours
-        if (store.read(jobKey + "/" + PREFIX + "/" + run.getNumber() + STOP_SUFFIX) != null) {
+        if (PersistenceStores.get().read(jobKey + "/" + PREFIX + "/" + run.getNumber() + STOP_SUFFIX) != null) {
             stopRequested(jobKey, run.getNumber());
         }
     }
@@ -635,9 +639,13 @@ public final class RunningBuilds {
      */
     static void finished(@NonNull Run<?, ?> run) throws IOException {
         String key = placeholderKey(run);
-        if (key == null) {
-            return;
+        if (key != null) {
+            finished(key);
         }
+    }
+
+    /** {@link #finished(Run)} by the placeholder's key, for a build which may be gone (deleted) since. */
+    static void finished(@NonNull String key) throws IOException {
         // kept until all is done: should a delete fail, the retry still knows the epoch to release the lease with
         Placeholder p = owned.get(key);
         PersistenceStore store = PersistenceStores.get();
@@ -648,7 +656,10 @@ public final class RunningBuilds {
             leases.release(key, p.epoch);
         }
         owned.remove(key);
-        invalidate(jobKeyOfRunning(runningKey(run.getParent())));
+        String jobKey = jobKeyOf(key);
+        if (jobKey != null) {
+            invalidate(jobKey);
+        }
     }
 
     /**
@@ -730,10 +741,19 @@ public final class RunningBuilds {
                 continue;
             }
             try {
-                started(run);
+                String key = placeholderKey(run);
+                if (key != null && owned.containsKey(key)) {
+                    // recorded already, and only the look-up that followed failed: not written again, which would drop
+                    // what it recorded since (a save point)
+                    stopRequestedMeanwhile(run);
+                } else {
+                    started(run);
+                }
                 unregistered.remove(id);
                 if (!run.isLogUpdated()) {
-                    finished(run); // it completed while being recorded: no placeholder of a completed build is left
+                    // it completed while being recorded, and may be being published under the lease just taken: completed
+                    // again a little later (published, then its placeholder removed, in that order), not cleaned up now
+                    BuildRecords.completeLater(run);
                     continue;
                 }
                 LOGGER.info(() -> "Recorded " + run + " as running, after the store was back");
@@ -815,7 +835,7 @@ public final class RunningBuilds {
             int removedHere = 0;
             for (Placeholder p : all(job)) {
                 // a build handed over and not taken (its taker went away, say) is adopted as one of a controller gone
-                if ((!live.contains(p.origin) && stillGone(store, p.origin, gone)) || handoverLapsed(p)) {
+                if (unsure.contains(p.key) || (!live.contains(p.origin) && stillGone(store, p.origin, gone)) || handoverLapsed(p)) {
                     long epoch = 0;
                     if (leases != null) {
                         epoch = leases.acquire(p.key);
@@ -1041,6 +1061,12 @@ public final class RunningBuilds {
         }
     }
 
+    /**
+     * Placeholders whose adoption here failed as it was written, so that it may have been written all the same: they
+     * name this controller, but nothing resumed them. Adopted again by the next sweep (or take-over).
+     */
+    private static final Set<String> unsure = ConcurrentHashMap.newKeySet();
+
     /** How many times adoption is retried when the placeholder changes under it. */
     private static final int ADOPTION_ATTEMPTS = 5;
 
@@ -1078,6 +1104,7 @@ public final class RunningBuilds {
         for (int attempt = 0; attempt < ADOPTION_ATTEMPTS; attempt++) {
             PersistenceStore.Entry entry = store.read(key);
             if (entry == null) {
+                unsure.remove(key);
                 // completed meanwhile: nothing to adopt, nor to keep the lease for
                 BuildLeases leases = store.leases();
                 if (leases != null) {
@@ -1098,9 +1125,9 @@ public final class RunningBuilds {
                 BuildRecords.forgetLocalCopy(job, number); // a stale copy (lost here before): the adopted build replaces it
             }
             Placeholder p = Placeholder.fromBytes(key, number, entry.content(), entry.version());
-            if (p != null && store.getOrigin().equals(p.origin)) {
+            if (p != null && store.getOrigin().equals(p.origin) && !unsure.contains(key)) {
                 return Adoption.ADOPTED; // this controller has it already (a sweep listed it as it was): its lease stays
-            }
+            } // else written by an adoption here whose write seemed to fail: not resumed yet, so it carries on
             BuildAdopter.Adoption adoption = p == null ? null : prepare(job, p);
             if (adoption == null) {
                 return Adoption.NONE;
@@ -1137,9 +1164,13 @@ public final class RunningBuilds {
                 LOGGER.fine(() -> key + " changed while preparing its adoption; retrying");
                 continue;
             } catch (IOException | RuntimeException e) {
-                adoption.abandon(); // retried by the next sweep, which prepares it again
+                // perhaps written all the same (the answer lost): it then names this live controller, which a sweep
+                // would leave alone, while nothing runs it here; so the next one adopts it again
+                unsure.add(key);
+                adoption.abandon();
                 throw e;
             }
+            unsure.remove(key);
             owned.put(key, new Placeholder(key, number, mine.origin, mine.controller, p.displayName, p.startTime, epoch, p.properties, version));
             invalidate(jobKeyOfRunning(runningKey(job)));
             LOGGER.info(() -> "Adopting " + job.getFullName() + " #" + number + " from " + p.controller + " (" + p.origin + ")");

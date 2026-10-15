@@ -1046,6 +1046,37 @@ public final class BuildRecords {
         }
     }
 
+    /**
+     * Whether a build of a job completed here and is not published yet (nor its placeholder removed): for the other
+     * controllers it is still running, so the job is building, and is not renamed meanwhile (the retry finds the build
+     * by the job's name).
+     */
+    @Restricted(NoExternalUse.class)
+    public static boolean hasUnpublished(@NonNull Job<?, ?> job) {
+        if (unpublished.isEmpty()) {
+            return false;
+        }
+        String name = job.getFullName();
+        return unpublished.values().stream().anyMatch(e -> e.getKey().equals(name));
+    }
+
+    /**
+     * Completes a build again a little later: one registered as running as it completed, so that its completion here
+     * (publication, then the placeholder's removal) may have been under way without that placeholder. Idempotent.
+     */
+    static void completeLater(@NonNull Run<?, ?> run) {
+        jenkins.util.Timer.get().schedule(() -> {
+            try (hudson.security.ACLContext ctx = hudson.security.ACL.as2(hudson.security.ACL.SYSTEM2)) {
+                complete(run);
+            }
+        }, COMPLETE_AGAIN_SECONDS, TimeUnit.SECONDS);
+    }
+
+    static /* non-final for tests */ long COMPLETE_AGAIN_SECONDS = 15;
+
+    /** Placeholders of builds deleted before they were published whose removal failed: retried with the publications. */
+    private static final Set<String> unfinished = ConcurrentHashMap.newKeySet();
+
     /** Retries {@link #complete} for builds whose publication failed. */
     @Restricted(NoExternalUse.class)
     @Extension
@@ -1061,6 +1092,14 @@ public final class BuildRecords {
 
         @Override
         protected void execute(hudson.model.TaskListener listener) {
+            for (String key : List.copyOf(unfinished)) {
+                try {
+                    RunningBuilds.finished(key);
+                    unfinished.remove(key);
+                } catch (IOException | RuntimeException x) {
+                    LOGGER.log(Level.FINE, "Still cannot remove the placeholder " + key + " of a deleted build", x);
+                }
+            }
             for (Map.Entry<String, Map.Entry<String, Integer>> e : Map.copyOf(unpublished).entrySet()) {
                 Job<?, ?> job = jenkins.model.Jenkins.get().getItemByFullName(e.getValue().getKey(), Job.class);
                 Run<?, ?> run = job == null ? null : job.getBuildByNumber(e.getValue().getValue());
@@ -1111,6 +1150,19 @@ public final class BuildRecords {
                 delete(run);
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.WARNING, "Failed to delete stored " + run, e);
+            }
+            // completed here and not published yet (the store was unreachable): no retry publishes it now, so its
+            // placeholder goes too, or it would show as running elsewhere, and be closed into a record once this
+            // controller is gone
+            unpublished.remove(run.getParent().getFullName() + "#" + run.getNumber());
+            RunningBuilds.Placeholder placeholder = RunningBuilds.ownedPlaceholder(run);
+            if (placeholder != null && !run.isLogUpdated()) {
+                try {
+                    RunningBuilds.finished(placeholder.getKey());
+                } catch (IOException | RuntimeException e) {
+                    LOGGER.log(Level.WARNING, "Failed to remove the placeholder of deleted " + run + "; will retry", e);
+                    unfinished.add(placeholder.getKey());
+                }
             }
         }
     }

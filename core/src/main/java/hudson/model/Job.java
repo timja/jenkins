@@ -316,6 +316,9 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
         if (b != null && b.isBuilding()) {
             return true;
         }
+        if (jenkins.persistence.BuildRecords.hasUnpublished(this)) {
+            return true; // completed here, but other controllers still see it running until it is published
+        }
         // or on another controller of a cluster sharing build records (e.g. renames are refused meanwhile, here too);
         // under the queue lock (blocking on related jobs), from what is cached only: SharedBlocking waits for the rest
         Jenkins j = Jenkins.getInstanceOrNull();
