@@ -33,6 +33,7 @@ import hudson.model.AbstractItem;
 import hudson.model.AsyncPeriodicWork;
 import hudson.model.Item;
 import hudson.model.TaskListener;
+import hudson.model.listeners.ItemListener;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -170,6 +171,10 @@ public final class ItemFiles {
                     blobs.put(itemKey + "/" + BLOBS + "/" + f.getValue(), in, Files.size(p));
                 }
             }
+        }
+        String config = itemKey + "/config.xml";
+        if (store.owns(config) && store.read(config) == null) {
+            return; // deleted meanwhile (here or elsewhere): its manifest is not brought back
         }
         for (int attempt = 0; attempt < 10; attempt++) {
             PersistenceStore.Entry e = store.read(itemKey + "/" + MANIFEST);
@@ -375,6 +380,56 @@ public final class ItemFiles {
             }
         }
         return dirs;
+    }
+
+    /** {@code a/b} → {@code jobs/a/jobs/b}: the key of an item's directory by its full name. */
+    private static String itemKey(String fullName) {
+        return "jobs/" + fullName.replace("/", "/jobs/");
+    }
+
+    /**
+     * Removes the shared files of a deleted item (or a deleted folder's items), so that an item made or moved there later
+     * neither takes them nor finds its destination in use; keeps the record of what was shared with a renamed or moved one.
+     */
+    @Extension
+    public static final class Lifecycle extends ItemListener {
+        @Override
+        public void onDeleted(Item item) {
+            PersistenceStore store = PersistenceStores.get();
+            BlobStore blobs = PersistenceStores.getBlobStore();
+            String itemKey = PersistenceStores.keyFor(item.getRootDir());
+            if (store == null || itemKey == null) {
+                return;
+            }
+            known.keySet().removeIf(k -> k.equals(itemKey) || k.startsWith(itemKey + "/"));
+            if (PersistenceStores.isApplyingRemoteChange()) {
+                return; // deleted elsewhere: that controller removes them
+            }
+            try {
+                if (store.read(itemKey + "/" + MANIFEST) != null) {
+                    store.delete(itemKey + "/" + MANIFEST, PersistenceStore.ANY);
+                    if (blobs != null) {
+                        blobs.delete(itemKey + "/" + BLOBS);
+                    }
+                }
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.WARNING, "Could not remove the shared files of " + item.getFullName(), e);
+            }
+        }
+
+        @Override
+        public void onLocationChanged(Item item, String oldFullName, String newFullName) {
+            String from = itemKey(oldFullName);
+            String to = itemKey(newFullName);
+            for (String k : Set.copyOf(known.keySet())) {
+                if (k.equals(from) || k.startsWith(from + "/")) {
+                    Map<String, String> files = known.remove(k);
+                    if (files != null) {
+                        known.put(to + k.substring(from.length()), files);
+                    }
+                }
+            }
+        }
     }
 
     /** Shares what plugins changed in item directories, every minute. */

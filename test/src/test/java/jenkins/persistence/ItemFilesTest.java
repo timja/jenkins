@@ -27,6 +27,7 @@ package jenkins.persistence;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import hudson.model.FreeStyleProject;
@@ -164,6 +165,22 @@ class ItemFilesTest {
         assertFalse(Files.exists(root.resolve("../escaped.txt")));
         assertEquals("<counts/>", Files.readString(root.resolve("stats.xml")), "nor a file kept per controller");
         assertFalse(Files.exists(elsewhere.resolve("x.txt")), "nor through a link");
+    }
+
+    @Test
+    void theFilesOfADeletedItemGoWithIt(JenkinsRule r) throws Exception {
+        FreeStyleProject a = r.createFreeStyleProject("a");
+        Files.writeString(a.getRootDir().toPath().resolve("a.txt"), "a");
+        ItemFiles.publish(a);
+        assertNotNull(manifest("jobs/a/item-files.json"));
+        a.delete();
+        assertNull(manifest("jobs/a/item-files.json"));
+        assertNull(BLOBS.get("jobs/a/item-files/" + sha256("a".getBytes(StandardCharsets.UTF_8))));
+        // its name is free, for an item renamed to it, which takes none of its files
+        FreeStyleProject b = r.createFreeStyleProject("b");
+        b.renameTo("a");
+        ItemFiles.take(b);
+        assertFalse(Files.exists(b.getRootDir().toPath().resolve("a.txt")));
     }
 
     @TestExtension
