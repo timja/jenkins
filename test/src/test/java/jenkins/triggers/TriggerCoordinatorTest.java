@@ -97,8 +97,35 @@ class TriggerCoordinatorTest {
         @Override
         public boolean shouldRun(TriggeredItem item, Trigger<?> trigger, Calendar tick) {
             minutes.put(item.getName(), tick.get(Calendar.MINUTE));
-            tick.add(Calendar.HOUR, 5); // a careless coordinator
+            tick.add(Calendar.MINUTE, 7); // a careless coordinator
             return false;
+        }
+    }
+
+    @Test
+    void aBrokenCoordinatorRefusesOnlyItsOwnTriggers(JenkinsRule r) throws Exception {
+        FreeStyleProject broken = r.createFreeStyleProject("a-broken");
+        broken.addTrigger(new TimerTrigger("* * * * *"));
+        broken.getTrigger(TimerTrigger.class).start(broken, true);
+        FreeStyleProject fine = r.createFreeStyleProject("b-fine");
+        fine.addTrigger(new TimerTrigger("* * * * *"));
+        fine.getTrigger(TimerTrigger.class).start(fine, true);
+
+        Trigger.checkTriggers(Calendar.getInstance());
+        r.waitUntilNoActivity();
+
+        assertNull(broken.getLastBuild(), "refused when its coordinator failed");
+        assertNotNull(fine.getLastBuild(), "the other trigger was still asked about and ran");
+    }
+
+    @TestExtension("aBrokenCoordinatorRefusesOnlyItsOwnTriggers")
+    public static class LinkageBroken implements TriggerCoordinator {
+        @Override
+        public boolean shouldRun(TriggeredItem item, Trigger<?> trigger, Calendar tick) {
+            if (item.getName().equals("a-broken")) {
+                throw new NoClassDefFoundError("some/missing/Class");
+            }
+            return true;
         }
     }
 
