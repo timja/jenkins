@@ -147,6 +147,11 @@ class PersistenceStoreItemConfigTest {
         p.setDescription("here");
         assertEquals(before + 1, PersistenceStores.getConflictCount());
         assertThat(new String(STORE.read(key).content(), StandardCharsets.UTF_8), containsString("here"));
+        // the merge reloads the job from the store: done before the next change, which it would otherwise take for seen
+        for (int i = 0; i < 500 && !ItemChangeApplier.isIdle(); i++) {
+            Thread.sleep(10);
+        }
+        assertTrue(ItemChangeApplier.isIdle());
 
         PersistenceStores.CONFLICTS = "fail";
         STORE.write(key, "<project><description>elsewhere again</description></project>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
