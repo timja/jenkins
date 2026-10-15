@@ -208,6 +208,20 @@ class RunningBuildsTest {
         assertEquals(List.of(1), elsewhere(p));
     }
 
+    @Test
+    void placeholdersFollowAnItemRenamedHere() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("old");
+        other.write("jobs/old/running/1.xml", placeholder("other-controller", "jenkins-a", 1), PersistenceStore.ABSENT);
+        awaitApplied();
+        assertEquals(List.of(1), elsewhere(p));
+
+        p.renameTo("new");
+        FreeStyleProject replacement = r.createFreeStyleProject("old");
+        awaitApplied();
+        assertEquals(List.of(), elsewhere(replacement), "the renamed job's build is not shown for a new job under the old name");
+        assertEquals(List.of(1), elsewhere(p));
+    }
+
     @TestExtension
     public static class Provider implements PersistenceStoreProvider {
         @Override

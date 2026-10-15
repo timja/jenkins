@@ -214,6 +214,14 @@ public final class RunningBuilds {
         cache.remove(jobKey);
     }
 
+    /**
+     * Forgets cached placeholders of the job at a key and of any job below it, as after the item is moved here
+     * (this controller does not apply its own move events).
+     */
+    static void invalidateBelow(@NonNull String key) {
+        cache.keySet().removeIf(k -> k.equals(key) || k.startsWith(key + "/"));
+    }
+
     @NonNull
     private static List<Placeholder> load(@NonNull PersistenceStore store, @NonNull String runningKey) {
         List<Placeholder> placeholders = new ArrayList<>();
