@@ -33,12 +33,17 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 
 import hudson.model.FreeStyleProject;
+import hudson.model.Item;
+import hudson.model.User;
+import hudson.security.ACL;
+import hudson.security.ACLContext;
 import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import javax.xml.transform.stream.StreamSource;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
+import org.jvnet.hudson.test.MockAuthorizationStrategy;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 
 /** An item's identity survives renames and configuration updates, and copies get their own (Target 15). */
@@ -74,6 +79,30 @@ class ItemUuidTest {
         assertNotEquals(src.getItemUuid(), imported.getItemUuid());
         assertSame(src, ItemUuids.get(src.getItemUuid()));
         assertSame(imported, ItemUuids.get(imported.getItemUuid()));
+    }
+
+    @Test
+    void theIdentityOfAnItemItsCreatorCannotSeeIsNotTaken(JenkinsRule r) throws Exception {
+        FreeStyleProject secret = r.createFreeStyleProject("secret");
+        String id = secret.getItemUuid();
+        r.jenkins.setSecurityRealm(r.createDummySecurityRealm());
+        r.jenkins.setAuthorizationStrategy(new MockAuthorizationStrategy()
+                .grant(Jenkins.READ, Item.CREATE).everywhere().to("alice")
+                .grant(Item.READ, Item.CONFIGURE).onPaths("mine").to("alice"));
+        byte[] xml = ("<project><itemUuid>" + id + "</itemUuid></project>").getBytes(StandardCharsets.UTF_8);
+        FreeStyleProject mine;
+        try (ACLContext ctx = ACL.as2(User.getById("alice", true).impersonate2())) {
+            mine = (FreeStyleProject) r.jenkins.createProjectFromXML("mine", new ByteArrayInputStream(xml));
+        }
+        assertNotEquals(id, mine.getItemUuid(), "one of its own");
+        assertSame(secret, ItemUuids.get(id));
+        // nor by posting it as the configuration of a job of theirs
+        try (ACLContext ctx = ACL.as2(User.getById("alice", true).impersonate2())) {
+            mine.updateByXml(new StreamSource(new ByteArrayInputStream(xml)));
+        }
+        assertNotEquals(id, mine.getItemUuid());
+        assertSame(secret, ItemUuids.get(id));
+        assertSame(mine, ItemUuids.get(mine.getItemUuid()));
     }
 
     @Test
