@@ -386,6 +386,54 @@ class ItemChangeApplierTest {
     }
 
     @Test
+    void anItemRenamedAndThenSavedElsewhereIsMovedNotLoadedAgain() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("before-rename");
+        pauseApplier();
+        try {
+            other.move("jobs/before-rename", "jobs/after-rename");
+            other.write("jobs/after-rename/config.xml", project("saved after the rename"), PersistenceStore.ANY);
+        } finally {
+            resumeApplier();
+        }
+        awaitApplied();
+        assertNull(r.jenkins.getItem("before-rename"), "moved, not left at its old name");
+        assertThat(r.jenkins.getItem("after-rename"), sameInstance(p));
+        assertEquals("saved after the rename", p.getDescription());
+    }
+
+    /** The name of an item whose next deletion fails, as a deletion that cannot be applied for now would. */
+    static volatile String refuseDeletion;
+
+    @TestExtension("aDeletionRetriedAfterTheItemWasMadeAgainDoesNotDeleteIt")
+    public static class RefuseDeletion extends ItemListener {
+        @Override
+        public void onCheckDelete(Item item) {
+            if (item.getName().equals(refuseDeletion)) {
+                refuseDeletion = null;
+                throw new hudson.model.Failure("cannot be deleted now");
+            }
+        }
+    }
+
+    @Test
+    void aDeletionRetriedAfterTheItemWasMadeAgainDoesNotDeleteIt() throws Exception {
+        r.createFreeStyleProject("retried");
+        pauseApplier();
+        try {
+            refuseDeletion = "retried";
+            other.delete("jobs/retried/config.xml", PersistenceStore.ANY);
+            other.write("jobs/retried/config.xml", project("made again elsewhere"), PersistenceStore.ABSENT);
+        } finally {
+            resumeApplier();
+        }
+        awaitApplied();
+        assertNull(refuseDeletion, "the deletion failed once");
+        FreeStyleProject again = r.jenkins.getItemByFullName("retried", FreeStyleProject.class);
+        assertNotNull(again, "not deleted by the deletion retried after it was made again");
+        assertEquals("made again elsewhere", again.getDescription());
+    }
+
+    @Test
     void aJobMovedIntoAFolderJustCreatedElsewhereKeepsItsIdentityAndBuilds() throws Exception {
         byte[] folderXml = Items.getConfigFile(r.createFolder("template2")).readRawBytes();
         FreeStyleProject j = r.createFreeStyleProject("j");

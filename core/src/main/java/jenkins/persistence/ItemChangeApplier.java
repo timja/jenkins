@@ -290,7 +290,10 @@ public final class ItemChangeApplier {
                 // except an item's deletion: the item made again since is another one, which must not take over the
                 // deleted one's builds and history (deleted() skips one older than what this controller has read)
                 boolean itemDeleted = e.kind() == ChangeEvent.Kind.DELETED && itemPath(e.key()) != null;
-                if (!MERGED.equals(e.origin()) && latest != null && latest > e.version() && !itemDeleted) {
+                // nor a move: a later write of its destination does not move the item from its old name (or a second
+                // one would be loaded at the new name, the moved one left where it was)
+                boolean move = e.kind() == ChangeEvent.Kind.MOVED;
+                if (!MERGED.equals(e.origin()) && latest != null && latest > e.version() && !itemDeleted && !move) {
                     failures.remove(e.key()); // overtaken by a newer change of its key, which applies the latest state
                     continue;
                 }
