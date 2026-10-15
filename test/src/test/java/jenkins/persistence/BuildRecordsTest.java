@@ -26,6 +26,7 @@ package jenkins.persistence;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.contains;
+import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.not;
@@ -94,7 +95,20 @@ class BuildRecordsTest {
         }
     };
     static volatile Consumer<String> afterRead;
-    static final InMemoryBlobStore BLOBS = new InMemoryBlobStore();
+    static final InMemoryBlobStore BLOBS = new InMemoryBlobStore() {
+        @Override
+        public void move(String fromPrefix, String toPrefix) {
+            if (failMove) {
+                // moves one blob, then fails
+                failMove = false;
+                String first = keys().stream().filter(k -> k.startsWith(fromPrefix + "/")).findFirst().orElseThrow();
+                super.move(first, toPrefix + first.substring(fromPrefix.length()));
+                throw new IllegalStateException("connection lost");
+            }
+            super.move(fromPrefix, toPrefix);
+        }
+    };
+    static volatile boolean failMove;
 
     private JenkinsRule r;
 
@@ -307,6 +321,50 @@ class BuildRecordsTest {
         p.renameTo("claimed");
         assertNotNull(record("jobs/claimed/builds/1/build.xml"));
         assertNull(STORE.read("jobs/claimed.moving"), "the claim is released");
+    }
+
+    @Test
+    void aMoveClaimsItsSourceToo() throws Exception {
+        FreeStyleProject p = project(r, "contested");
+        r.buildAndAssertSuccess(p);
+        // another controller is moving "contested" somewhere else right now
+        STORE.as("other").write("jobs/contested.moving", (System.currentTimeMillis() + " other jobs/contested").getBytes(StandardCharsets.UTF_8),
+                PersistenceStore.ABSENT);
+        assertThrows(ConflictException.class, () -> p.renameTo("mine"));
+        assertEquals("contested", p.getName());
+        assertNotNull(record("jobs/contested/builds/1/build.xml"), "nothing moved");
+        assertThat(BLOBS.keys(), contains("jobs/contested/builds/1/files.tgz"));
+        assertNull(STORE.read("jobs/mine.moving"), "the destination's claim is released");
+        assertNotNull(STORE.read("jobs/contested.moving"), "the other claim is left alone");
+    }
+
+    @Test
+    void aMoveOfAnItemMovedElsewhereLeavesItsBlobsAlone() throws Exception {
+        FreeStyleProject p = project(r, "gone");
+        r.buildAndAssertSuccess(p);
+        // another controller renamed it (blobs, then entries); this one has not applied that yet
+        BLOBS.move("jobs/gone", "jobs/gone-there");
+        STORE.move("jobs/gone", "jobs/gone-there");
+        assertThrows(ConflictException.class, () -> p.renameTo("gone-here"));
+        assertThat(BLOBS.keys(), contains("jobs/gone-there/builds/1/files.tgz"));
+        assertNull(STORE.read("jobs/gone-here/builds/1/build.xml"));
+    }
+
+    @Test
+    void blobsMovedBeforeAMoveFailedAreMovedBack() throws Exception {
+        FreeStyleProject p = project(r, "partly");
+        r.buildAndAssertSuccess(p);
+        r.buildAndAssertSuccess(p);
+        failMove = true;
+        try {
+            assertThrows(IllegalStateException.class, () -> p.renameTo("partly-moved"));
+        } finally {
+            failMove = false;
+        }
+        assertEquals("partly", p.getName());
+        assertThat(BLOBS.keys(), containsInAnyOrder("jobs/partly/builds/1/files.tgz", "jobs/partly/builds/2/files.tgz"));
+        assertNotNull(record("jobs/partly/builds/1/build.xml"));
+        assertNotNull(record("jobs/partly/builds/2/build.xml"));
     }
 
     @Test
