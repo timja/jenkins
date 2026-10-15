@@ -31,7 +31,9 @@ import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Util;
 import hudson.model.FreeStyleProject;
 import hudson.model.Items;
@@ -39,6 +41,12 @@ import java.io.File;
 import java.io.IOException;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import org.htmlunit.HttpMethod;
 import org.htmlunit.WebRequest;
 import org.htmlunit.WebResponse;
@@ -56,7 +64,26 @@ import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 class PersistenceStoreItemLifecycleTest {
 
     static final InMemoryPersistenceStore STORE = new InMemoryPersistenceStore(
-            key -> key.startsWith("jobs/") && key.endsWith("/config.xml") && !key.contains("/builds/"));
+            key -> key.startsWith("jobs/") && key.endsWith("/config.xml") && !key.contains("/builds/")) {
+        @Override
+        public List<Moved> move(@NonNull String fromPrefix, @NonNull String toPrefix) throws ConflictException {
+            List<Moved> moved = super.move(fromPrefix, toPrefix);
+            CountDownLatch latch = moving;
+            if (latch != null) {
+                moveStarted.countDown();
+                try {
+                    latch.await();
+                } catch (InterruptedException e) {
+                    throw new AssertionError(e);
+                }
+            }
+            return moved;
+        }
+    };
+
+    /** While set, store moves wait for it once they moved the entries. */
+    static volatile CountDownLatch moving;
+    static volatile CountDownLatch moveStarted;
 
     private JenkinsRule r;
 
@@ -167,6 +194,86 @@ class PersistenceStoreItemLifecycleTest {
         assertThat(STORE.versions(), not(hasKey("jobs/old/jobs/child/config.xml")));
         freshHome();
         assertEquals("inside", r.jenkins.getItemByFullName("new/child", FreeStyleProject.class).getDescription());
+    }
+
+    @Test
+    void moveIntoItselfIsRefused() throws Exception {
+        MockFolder f = r.createFolder("self");
+        MockFolder g = f.createProject(MockFolder.class, "g");
+        Map<String, Long> before = STORE.versions();
+        assertThrows(IllegalArgumentException.class, () -> Items.move(f, g));
+        assertThrows(IllegalArgumentException.class, () -> PersistenceStores.move(f.getRootDir(), new File(g.getRootDir(), "jobs/self")));
+        assertEquals(before, STORE.versions());
+        assertEquals(f, r.jenkins.getItem("self"));
+    }
+
+    @Test
+    void renameWhoseDirectoryCannotMoveLeavesTheStoreAsItWas() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("undone-before");
+        // neither renamed nor copied: the item's directory is a file, and the new name a directory with something in it
+        Util.deleteRecursive(p.getRootDir());
+        Files.writeString(p.getRootDir().toPath(), "not a directory");
+        File taken = new File(r.jenkins.getRootDir(), "jobs/undone-after");
+        taken.mkdirs();
+        Files.writeString(new File(taken, "something").toPath(), "here");
+        assertThrows(RuntimeException.class, () -> p.renameTo("undone-after"));
+        assertEquals("undone-before", p.getName());
+        assertThat(STORE.versions(), hasKey("jobs/undone-before/config.xml"));
+        assertThat(STORE.versions(), not(hasKey("jobs/undone-after/config.xml")));
+    }
+
+    @Test
+    void anItemSavedWhileItIsMovedIsSavedInItsNewPlace() throws Exception {
+        MockFolder f = r.createFolder("during-f");
+        FreeStyleProject p = r.createFreeStyleProject("during-p");
+        moving = new CountDownLatch(1);
+        moveStarted = new CountDownLatch(1);
+        AtomicReference<Throwable> failed = new AtomicReference<>();
+        Thread mover = new Thread(() -> {
+            try {
+                Items.move(p, f);
+            } catch (Throwable t) {
+                failed.set(t);
+            }
+        });
+        Thread saver = new Thread(() -> {
+            try {
+                p.setDescription("saved during the move");
+            } catch (Throwable t) {
+                failed.set(t);
+            }
+        });
+        try {
+            mover.start();
+            assertTrue(moveStarted.await(30, TimeUnit.SECONDS));
+            saver.start();
+            saver.join(500); // waits for the move
+        } finally {
+            moving.countDown();
+            moving = null;
+        }
+        mover.join();
+        saver.join();
+        assertNull(failed.get());
+        assertThat(STORE.versions(), not(hasKey("jobs/during-p/config.xml")));
+        assertThat(new String(STORE.read("jobs/during-f/jobs/during-p/config.xml").content(), StandardCharsets.UTF_8),
+                containsString("saved during the move"));
+    }
+
+    @Test
+    void somethingCreatedElsewhereWhereAnItemWasRenamedFromIsNotReplaced() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("vacated");
+        p.renameTo("vacated-new");
+        STORE.write("jobs/vacated/config.xml", "<?xml version='1.1' encoding='UTF-8'?><project><description>elsewhere</description></project>"
+                .getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        PersistenceStores.Route old = PersistenceStores.route(PersistenceStores.fileFor("jobs/vacated/config.xml"));
+        PersistenceStores.CONFLICTS = "fail";
+        try {
+            // as a save resolving the old name would
+            assertThrows(ConflictException.class, () -> old.write("<project/>".getBytes(StandardCharsets.UTF_8)));
+        } finally {
+            PersistenceStores.CONFLICTS = "warn";
+        }
     }
 
     @TestExtension
