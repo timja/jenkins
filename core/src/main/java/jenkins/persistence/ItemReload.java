@@ -94,25 +94,37 @@ final class ItemReload {
         }
     }
 
+    /** What {@link #apply} did. */
+    enum Outcome {
+        /** Nothing: a full reload is needed. */
+        RELOAD,
+        /** Every field that changed elsewhere was copied: the item is in sync with the version read. */
+        APPLIED,
+        /**
+         * Some were not, having changed here too: the item is not that version, so it is not recorded as loaded (nor the
+         * caller's snapshot taken), and its pending save conflicts and merges against the last version in sync.
+         */
+        PARTLY
+    }
+
     /**
      * Copies the changed fields into the live item and runs its {@code onLoad}; call under the item's lock.
-     *
-     * @return false if nothing was done and a full reload is needed
      */
-    static boolean apply(@NonNull AbstractItem item, @NonNull Prepared prepared) throws Exception {
+    @NonNull
+    static Outcome apply(@NonNull AbstractItem item, @NonNull Prepared prepared) throws Exception {
         XmlFile file = item.getConfigFile();
         byte[] snapshot = PersistenceStores.snapshotOf(file);
         if (snapshot != prepared.snapshot()) {
             LOGGER.fine(() -> item.getFullName() + " was saved here since version " + prepared.entry().version() + " was read: full reload");
             // saved here since the scratch copy was read (and perhaps merged with the store): the scratch copy is not
             // the newest content any more; the full reload reads what the store has now
-            return false;
+            return Outcome.RELOAD;
         }
         XStream xs = file.getXStream();
         Map<String, String> before = XmlMerge.parts(snapshot);
         Map<String, String> live = XmlMerge.parts(serialise(xs, item));
         if (before == null || live == null) {
-            return false;
+            return Outcome.RELOAD;
         }
         Set<String> changed = new HashSet<>(before.keySet());
         changed.addAll(prepared.parts().keySet());
@@ -121,24 +133,28 @@ final class ItemReload {
         for (String name : changed) {
             Field f = field(xs, item.getClass(), name);
             if (f == null) {
-                return false; // e.g. an implicit collection: cannot tell which field it is
+                return Outcome.RELOAD; // e.g. an implicit collection: cannot tell which field it is
             }
             fields.put(name, f);
         }
         LOGGER.fine(() -> "Reloading " + item.getFullName() + " field by field from version " + prepared.entry().version() + ": changed " + changed);
+        boolean kept = false;
         for (Map.Entry<String, Field> e : fields.entrySet()) {
             if (!Objects.equals(live.get(e.getKey()), before.get(e.getKey()))) {
                 // changed here too since the last sync: keep it; its save is pending and merges with the store
                 LOGGER.fine(() -> "Keeping the local change of " + e.getKey() + " in " + item.getFullName());
+                kept = true;
                 continue;
             }
             e.getValue().set(item, e.getValue().get(prepared.scratch()));
         }
-        PersistenceStores.loaded(prepared.key(), prepared.entry());
+        if (!kept) {
+            PersistenceStores.loaded(prepared.key(), prepared.entry());
+        } // else still as of the last sync: its save then merges with the store, instead of writing over what was kept
         // as AbstractItem.load does after unmarshalling
         Items.runWhileUpdatingByXml(() -> item.onLoad(item.getParent(), item.getParent().getItemName(item.getRootDir(), item)));
         Jenkins.get().rebuildDependencyGraphAsync();
-        return true;
+        return kept ? Outcome.PARTLY : Outcome.APPLIED;
     }
 
     private static byte[] serialise(XStream xs, Object o) {

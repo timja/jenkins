@@ -462,10 +462,13 @@ public final class ItemChangeApplier {
                 }
                 // after a refused save, all of it: field by field only copies what changed in the store, which would
                 // leave the refused values (changed in memory only) where they are
-                if (REFUSED.equals(e.origin()) || prepared == null || !ItemReload.apply(existing, prepared)) {
+                ItemReload.Outcome reloaded = REFUSED.equals(e.origin()) || prepared == null ? ItemReload.Outcome.RELOAD : ItemReload.apply(existing, prepared);
+                if (reloaded == ItemReload.Outcome.RELOAD) {
                     PersistenceStores.reload(existing.getConfigFile(), existing, existing::load); // a display name cleared, say
                 }
-                PersistenceStores.synced(existing.getConfigFile(), existing);
+                if (reloaded != ItemReload.Outcome.PARTLY) {
+                    PersistenceStores.synced(existing.getConfigFile(), existing);
+                }
             }
             applied(e.key());
             ItemListener.fireOnUpdated(existing);
