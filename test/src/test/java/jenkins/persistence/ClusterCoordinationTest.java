@@ -32,18 +32,32 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import hudson.ExtensionList;
 import hudson.Launcher;
 import hudson.model.AbstractBuild;
 import hudson.model.BuildListener;
 import hudson.model.FreeStyleBuild;
 import hudson.model.FreeStyleProject;
+import hudson.model.Job;
 import hudson.model.Queue;
 import hudson.model.Result;
+import hudson.model.Run;
+import hudson.model.listeners.RunListener;
+import hudson.model.queue.CauseOfBlockage;
+import hudson.model.queue.QueueTaskDispatcher;
 import hudson.model.queue.QueueTaskFuture;
 import hudson.tasks.BuildTrigger;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.htmlunit.HttpMethod;
 import org.htmlunit.WebRequest;
 import org.junit.jupiter.api.BeforeEach;
@@ -68,9 +82,36 @@ class ClusterCoordinationTest {
 
         @Override
         public ClusterQueue queue() {
-            return clusterQueue();
+            ClusterQueue cq = clusterQueue();
+            return (ClusterQueue) Proxy.newProxyInstance(ClusterQueue.class.getClassLoader(), new Class<?>[] {ClusterQueue.class}, (proxy, m, args) -> {
+                if (m.getName().equals("get") && failingReads.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+                    throw new IOException("the store cannot be read");
+                }
+                Object result;
+                try {
+                    result = m.invoke(cq, args);
+                } catch (InvocationTargetException e) {
+                    throw e.getCause();
+                }
+                if (m.getName().equals("claim") && lostClaimAnswers.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+                    failingReads.set(1);
+                    throw new IOException("connection reset after claiming");
+                }
+                return result;
+            });
+        }
+
+        @Override
+        public Set<String> liveOrigins() {
+            return live;
         }
     };
+
+    /** How many of the next claims go through but fail to answer, as does the read that follows each. */
+    static final AtomicInteger lostClaimAnswers = new AtomicInteger();
+    static final AtomicInteger failingReads = new AtomicInteger();
+    /** Origins the store reports as alive; null means everyone. */
+    static volatile Set<String> live;
 
     private JenkinsRule r;
     private PersistenceStore other;
@@ -79,6 +120,22 @@ class ClusterCoordinationTest {
     void setUp(JenkinsRule rule) {
         r = rule;
         other = STORE.as("other-controller");
+        live = null;
+        lostClaimAnswers.set(0);
+        failingReads.set(0);
+        HoldClaimed.job = null;
+        Adopter.job = null;
+        Adopter.resumed.clear();
+    }
+
+    /** Waits for the lease to be free, taking it for the other controller; returns its epoch. */
+    private long awaitFree(String lease) throws Exception {
+        long epoch = 0;
+        for (int i = 0; i < 100 && epoch == 0; i++) {
+            Thread.sleep(100);
+            epoch = other.leases().acquire(lease);
+        }
+        return epoch;
     }
 
     private static void awaitApplied() throws InterruptedException {
@@ -212,6 +269,170 @@ class ClusterCoordinationTest {
             Thread.sleep(100);
         }
         assertTrue(up.getDownstreamProjects().contains(down), "the trigger defined elsewhere links up2 to down2 here");
+    }
+
+    @Test
+    void cancellingAClaimedItemReleasesTheJobsExclusiveLease() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("claimed-then-cancelled");
+        String lease = "jobs/claimed-then-cancelled/running/exclusive";
+        HoldClaimed.job = p.getFullName(); // claimed, then held from starting
+        p.scheduleBuild2(0);
+        Queue.Item item = null;
+        for (int i = 0; i < 600 && item == null; i++) {
+            Thread.sleep(100);
+            Queue.Item it = Queue.getInstance().getItem(p);
+            ClusterQueue.Record rec = it == null ? null : STORE.clusterQueue().get(it.getId());
+            item = rec != null && STORE.getOrigin().equals(rec.claimedBy()) ? it : null;
+        }
+        assertNotNull(item, "claimed here");
+        assertEquals(0, other.leases().acquire(lease), "held for the item claimed here");
+
+        Queue.getInstance().cancel(item);
+
+        long epoch = awaitFree(lease);
+        assertThat("released: no build of it runs here", epoch, greaterThan(0L));
+        other.leases().release(lease, epoch);
+    }
+
+    @Test
+    void claimWithUnknownOutcomeKeepsTheLease() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        FreeStyleProject p = blocking(r, "unsure", started, release);
+        String lease = "jobs/unsure/running/exclusive";
+        lostClaimAnswers.set(1);
+
+        QueueTaskFuture<FreeStyleBuild> f = p.scheduleBuild2(0);
+        assertTrue(started.await(60, TimeUnit.SECONDS));
+        assertEquals(0, lostClaimAnswers.get(), "the claim's answer was lost");
+        assertEquals(0, other.leases().acquire(lease), "the lease is kept for the build its claim started here");
+
+        release.countDown();
+        r.assertBuildStatusSuccess(f);
+        long epoch = awaitFree(lease);
+        assertThat("released after the build", epoch, greaterThan(0L));
+        other.leases().release(lease, epoch);
+    }
+
+    @Test
+    void finalizingAnOlderBuildKeepsTheLeaseOfTheNextOne() throws Exception {
+        CountDownLatch secondStarted = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        FreeStyleProject p = r.createFreeStyleProject("successive");
+        p.getBuildersList().add(new TestBuilder() {
+            @Override
+            public boolean perform(AbstractBuild<?, ?> build, Launcher launcher, BuildListener listener) throws InterruptedException {
+                if (build.getNumber() == 1) {
+                    return true;
+                }
+                secondStarted.countDown();
+                return release.await(60, TimeUnit.SECONDS);
+            }
+        });
+        String lease = "jobs/successive/running/exclusive";
+        // #1 is completed (so #2 may start), but its finalization is slow (a listener before the shared queue's)
+        CountDownLatch finalizing = new CountDownLatch(1);
+        CountDownLatch finish = new CountDownLatch(1);
+        RunListener<Run<?, ?>> slow = new RunListener<>() {
+            @Override
+            public void onFinalized(Run<?, ?> run) {
+                if (run.getParent() == p && run.getNumber() == 1) {
+                    finalizing.countDown();
+                    try {
+                        finish.await(60, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }
+        };
+        ExtensionList.lookup(RunListener.class).add(0, slow);
+        try {
+            QueueTaskFuture<FreeStyleBuild> first = p.scheduleBuild2(0);
+            assertTrue(finalizing.await(60, TimeUnit.SECONDS));
+            QueueTaskFuture<FreeStyleBuild> second = p.scheduleBuild2(0);
+            assertTrue(secondStarted.await(60, TimeUnit.SECONDS));
+
+            finish.countDown();
+            r.assertBuildStatusSuccess(first);
+            Thread.sleep(1_000);
+            assertEquals(0, other.leases().acquire(lease), "still held, for #2, which runs");
+
+            release.countDown();
+            r.assertBuildStatusSuccess(second);
+            long epoch = awaitFree(lease);
+            assertThat(epoch, greaterThan(0L));
+            other.leases().release(lease, epoch);
+        } finally {
+            finish.countDown();
+            release.countDown();
+            ExtensionList.lookup(RunListener.class).remove(slow);
+        }
+    }
+
+    @Test
+    void orphanIsNotAdoptedWhileAnotherBuildOfTheJobRunsHere() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        FreeStyleProject p = blocking(r, "running-here", started, release);
+        QueueTaskFuture<FreeStyleBuild> f = p.scheduleBuild2(0);
+        assertTrue(started.await(60, TimeUnit.SECONDS)); // holding the job's exclusive lease (this controller's)
+        // a build of it whose controller died
+        PersistenceStore dead = STORE.as("dead-controller");
+        String key = "jobs/running-here/running/7.xml";
+        long deadEpoch = dead.leases().acquire(key);
+        dead.write(key, bytes("origin=dead-controller\ncontroller=jenkins-x\ndisplayName=#7\nstartTime=1\nepoch=" + deadEpoch + "\n"), PersistenceStore.ABSENT);
+        Adopter.job = p.getFullName();
+        live = Set.of(STORE.getOrigin());
+        try {
+            RunningBuilds.removeStale();
+            assertTrue(Adopter.resumed.isEmpty(), "not resumed beside the build running here");
+            assertNotNull(STORE.read(key), "left for a later sweep");
+        } finally {
+            live = null;
+            release.countDown();
+        }
+        r.assertBuildStatusSuccess(f);
+        STORE.delete(key, PersistenceStore.ANY);
+    }
+
+    /** Holds the items of a job from starting once they are claimed here. */
+    @TestExtension
+    public static class HoldClaimed extends QueueTaskDispatcher {
+        static volatile String job;
+
+        @Override
+        public CauseOfBlockage canRun(Queue.Item item) {
+            try {
+                ClusterQueue.Record rec = item.task instanceof Job<?, ?> j && j.getFullName().equals(job) ? STORE.clusterQueue().get(item.getId()) : null;
+                return rec != null && STORE.getOrigin().equals(rec.claimedBy()) ? new SharedQueue.Blocked("Held by the test") : null;
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        }
+    }
+
+    /** Adopts the builds of one job (resuming nothing). */
+    @TestExtension
+    public static class Adopter implements BuildAdopter {
+        static volatile String job;
+        static final List<Integer> resumed = new CopyOnWriteArrayList<>();
+
+        @Override
+        public Adoption prepare(Job<?, ?> j, RunningBuilds.Placeholder placeholder) {
+            if (!j.getFullName().equals(job)) {
+                return null;
+            }
+            return new Adoption() {
+                @Override
+                public void resume(long epoch) {
+                    resumed.add(placeholder.getNumber());
+                }
+
+                @Override
+                public void abandon() {}
+            };
+        }
     }
 
     @TestExtension
