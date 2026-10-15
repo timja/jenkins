@@ -27,15 +27,22 @@ package jenkins.util;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.greaterThan;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import hudson.ExtensionList;
+import hudson.model.Fingerprint;
 import hudson.model.FingerprintCleanupThread;
 import hudson.model.PeriodicWork;
+import hudson.model.TaskListener;
 import java.io.File;
 import java.nio.file.Files;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import jenkins.fingerprints.FingerprintStorage;
+import jenkins.fingerprints.FingerprintStorageDescriptor;
+import jenkins.fingerprints.GlobalFingerprintConfiguration;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.TestExtension;
@@ -47,11 +54,13 @@ class PeriodicWorkCoordinatorTest {
     @Test
     void onlyClusterSingletonWorkIsCoordinated(JenkinsRule r) throws Exception {
         Coordinator.allow = false;
+        Coordinator.asked.clear();
         Thread.sleep(2_000);
         assertEquals(0, Singleton.runs.get(), "refused by the coordinator");
         assertThat("ordinary periodic work is not coordinated", PerController.runs.get(), greaterThan(0));
-        assertThat(Coordinator.asked.size(), greaterThan(0));
-        assertTrue(Coordinator.asked.stream().allMatch(name -> name.equals(Singleton.class.getName())));
+        // other cluster-singleton work of core may be due meanwhile too: only these two are known to be
+        assertTrue(Coordinator.asked.contains(Singleton.class.getName()));
+        assertFalse(Coordinator.asked.contains(PerController.class.getName()));
 
         Coordinator.allow = true;
         Thread.sleep(2_000);
@@ -68,6 +77,48 @@ class PeriodicWorkCoordinatorTest {
             Thread.sleep(100);
         }
         assertTrue(log.isFile(), "the cleanup ran");
+    }
+
+    @Test
+    void localFingerprintsAreCleanedOnEveryController(JenkinsRule r) throws Exception {
+        Coordinator.allow = false;
+        CountingStorage shared = new CountingStorage();
+        GlobalFingerprintConfiguration.get().setStorage(shared);
+        assertTrue(PeriodicWorkCoordinator.allows(ExtensionList.lookupSingleton(FingerprintCleanupThread.class)),
+                "each controller cleans its own fingerprint files");
+        assertFalse(PeriodicWorkCoordinator.allows(ExtensionList.lookupSingleton(FingerprintCleanupThread.Shared.class)));
+        new FingerprintCleanupThread().execute(TaskListener.NULL);
+        assertEquals(0, shared.cleanups, "the shared storage is cleaned once per cluster, not by every controller");
+        new FingerprintCleanupThread.Shared().execute(TaskListener.NULL);
+        assertEquals(1, shared.cleanups);
+    }
+
+    public static class CountingStorage extends FingerprintStorage {
+        int cleanups;
+
+        @Override
+        public void save(Fingerprint fp) {}
+
+        @Override
+        public Fingerprint load(String id) {
+            return null;
+        }
+
+        @Override
+        public void delete(String id) {}
+
+        @Override
+        public boolean isReady() {
+            return false;
+        }
+
+        @Override
+        public void iterateAndCleanupFingerprints(TaskListener taskListener) {
+            cleanups++;
+        }
+
+        @TestExtension("localFingerprintsAreCleanedOnEveryController")
+        public static class DescriptorImpl extends FingerprintStorageDescriptor {}
     }
 
     @ClusterSingleton
