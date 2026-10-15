@@ -58,6 +58,8 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.htmlunit.HttpMethod;
@@ -108,8 +110,22 @@ class ClusterCoordinationTest {
             return live;
         }
 
+        @Override
+        public Set<String> children(String parentKey) {
+            CountDownLatch l = slowListing;
+            if (l != null && parentKey.startsWith("jobs/slow")) {
+                try {
+                    l.await(60, TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+            return super.children(parentKey);
+        }
     };
 
+    /** While set, listing below a job named "slow…" waits for it: a store answering slowly. */
+    static volatile CountDownLatch slowListing;
 
     /** How many of the next claims go through but fail to answer, as does the read that follows each. */
     static final AtomicInteger lostClaimAnswers = new AtomicInteger();
@@ -130,6 +146,7 @@ class ClusterCoordinationTest {
         HoldClaimed.job = null;
         Adopter.job = null;
         Adopter.resumed.clear();
+        slowListing = null;
     }
 
     /** Waits for the lease to be free, taking it for the other controller; returns its epoch. */
@@ -281,6 +298,43 @@ class ClusterCoordinationTest {
         other.delete("jobs/up/running/1.xml", PersistenceStore.ANY);
         awaitApplied();
         r.assertBuildStatusSuccess(f);
+    }
+
+    @Test
+    void upstreamBlockingDoesNotReadTheStoreUnderTheQueueLock() throws Exception {
+        FreeStyleProject up = r.createFreeStyleProject("slowup");
+        FreeStyleProject down = r.createFreeStyleProject("down3");
+        down.setBlockBuildWhenUpstreamBuilding(true);
+        up.getPublishersList().add(new BuildTrigger("down3", Result.SUCCESS));
+        r.jenkins.rebuildDependencyGraph();
+        other.write("jobs/slowup/running/1.xml", bytes("origin=other-controller\ncontroller=jenkins-b\ndisplayName=#1\nstartTime=1\n"), PersistenceStore.ABSENT);
+        awaitApplied();
+        RunningBuilds.invalidate("jobs/slowup");
+        CountDownLatch slow = new CountDownLatch(1);
+        slowListing = slow;
+        try {
+
+            QueueTaskFuture<FreeStyleBuild> f = down.scheduleBuild2(0);
+            Future<?> maintained = Executors.newSingleThreadExecutor().submit(() -> Queue.getInstance().maintain());
+            maintained.get(10, TimeUnit.SECONDS); // not waiting for the store's answer
+            assertNull(down.getLastBuild());
+            assertThat(Queue.getInstance().getItems()[0].getWhy(), containsString("Checking whether upstream project slowup is building"));
+
+            slow.countDown();
+            Queue.Item item = Queue.getInstance().getItems()[0];
+            for (int i = 0; i < 100 && !item.getWhy().contains("is building on jenkins-b"); i++) {
+                Thread.sleep(100);
+                item = Queue.getInstance().getItems()[0];
+            }
+            assertThat(item.getWhy(), containsString("Upstream project slowup is building on jenkins-b"));
+            assertNull(down.getLastBuild());
+
+            other.delete("jobs/slowup/running/1.xml", PersistenceStore.ANY);
+            awaitApplied();
+            r.assertBuildStatusSuccess(f);
+        } finally {
+            slow.countDown();
+        }
     }
 
     @Test

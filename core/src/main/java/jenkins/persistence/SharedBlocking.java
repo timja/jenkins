@@ -32,6 +32,7 @@ import hudson.model.Queue;
 import hudson.model.queue.CauseOfBlockage;
 import hudson.model.queue.QueueTaskDispatcher;
 import java.util.List;
+import java.util.Locale;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 
@@ -65,7 +66,12 @@ public final class SharedBlocking extends QueueTaskDispatcher {
     @SuppressWarnings("rawtypes")
     private static CauseOfBlockage runningElsewhere(Iterable<AbstractProject> jobs, String which) {
         for (Job<?, ?> job : (Iterable<Job<?, ?>>) (Iterable) jobs) {
-            List<RunningBuilds.Placeholder> running = RunningBuilds.elsewhere(job);
+            // under the queue lock: from what is cached only (a slow store would hold up the whole queue)
+            List<RunningBuilds.Placeholder> running = RunningBuilds.elsewhereCached(job);
+            if (running == null) {
+                return new SharedQueue.Blocked("Checking whether " + which.toLowerCase(Locale.ENGLISH) + " project " + job.getFullDisplayName()
+                        + " is building on another controller");
+            }
             if (!running.isEmpty()) {
                 RunningBuilds.Placeholder b = running.get(0);
                 return new SharedQueue.Blocked(which + " project " + job.getFullDisplayName() + " is building on " + b.getController()
