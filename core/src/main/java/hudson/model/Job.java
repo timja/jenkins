@@ -313,8 +313,15 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
      */
     public boolean isBuilding() {
         RunT b = getLastBuild();
-        // or on another controller of a cluster sharing build records (e.g. renames are refused meanwhile, here too)
-        return b != null && b.isBuilding() || !jenkins.persistence.RunningBuilds.elsewhere(this).isEmpty();
+        if (b != null && b.isBuilding()) {
+            return true;
+        }
+        // or on another controller of a cluster sharing build records (e.g. renames are refused meanwhile, here too);
+        // under the queue lock (blocking on related jobs), from what is cached only: SharedBlocking waits for the rest
+        Jenkins j = Jenkins.getInstanceOrNull();
+        List<jenkins.persistence.RunningBuilds.Placeholder> elsewhere = j != null && j.getQueue().isLockHeldByCurrentThread()
+                ? jenkins.persistence.RunningBuilds.elsewhereCached(this) : jenkins.persistence.RunningBuilds.elsewhere(this);
+        return elsewhere != null && !elsewhere.isEmpty();
     }
 
     /**
