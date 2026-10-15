@@ -210,6 +210,24 @@ class PersistenceStoreItemConfigTest {
     }
 
     @Test
+    void aSaveAfterARenameMergesAChangeMadeElsewhereBeforeIt() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("before-rename");
+        p.setDescription("base");
+        String key = "jobs/before-rename/config.xml";
+        String base = new String(STORE.read(key).content(), StandardCharsets.UTF_8);
+        assertThat(base, containsString("<concurrentBuild>false</concurrentBuild>"));
+        // changed by another controller, which this one has not applied yet
+        STORE.write(key, base.replace("<concurrentBuild>false<", "<concurrentBuild>true<").getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        long merges = PersistenceStores.getMergeCount();
+        p.renameTo("after-rename");
+        p.setDescription("here");
+        assertEquals(merges + 1, PersistenceStores.getMergeCount(), "merged, not overwritten");
+        String stored = new String(STORE.read("jobs/after-rename/config.xml").content(), StandardCharsets.UTF_8);
+        assertThat(stored, containsString("<description>here</description>"));
+        assertThat(stored, containsString("<concurrentBuild>true</concurrentBuild>"));
+    }
+
+    @Test
     void getFileReplacesTheSnapshotWhole() throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("w");
         String key = "jobs/w/config.xml";
