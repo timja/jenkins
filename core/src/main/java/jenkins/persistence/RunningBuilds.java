@@ -689,14 +689,29 @@ public final class RunningBuilds {
                 return;
             }
         }
-        PersistenceStores.get().write(runningKey + "/" + number + STOP_SUFFIX,
-                ("controller=" + CONTROLLER_NAME + "\nby=" + by + "\n").getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        PersistenceStore store = PersistenceStores.get();
+        if (store.read(key) == null) {
+            return; // no such build runs: a request left behind would stop a later build given that number
+        }
+        Properties request = new Properties();
+        request.setProperty("controller", CONTROLLER_NAME);
+        request.setProperty("by", by);
+        StringWriter w = new StringWriter();
+        request.store(w, null); // escaped, as it is read (a user name may hold a backslash)
+        store.write(runningKey + "/" + number + STOP_SUFFIX, w.toString().getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
     }
+
+    /** How many times a stop request is retried while the build it is for has no executor yet (being resumed). */
+    private static final int STOP_ATTEMPTS = 8;
 
     /**
      * Stops a build owned here for which another controller requested a stop.
      */
     static void stopRequested(@NonNull String jobKey, int number) throws IOException {
+        stopRequested(jobKey, number, 0);
+    }
+
+    private static void stopRequested(String jobKey, int number, int attempt) throws IOException {
         String placeholder = jobKey + "/" + PREFIX + "/" + number + SUFFIX;
         if (!owned.containsKey(placeholder)) {
             return; // not ours: its owner handles it
@@ -712,18 +727,33 @@ public final class RunningBuilds {
         List<String> names = ItemChangeApplier.itemPath(jobKey + "/config.xml");
         Job<?, ?> job = names == null ? null : Jenkins.get().getItemByFullName(String.join("/", names), Job.class);
         Run<?, ?> run = job == null ? null : job.getBuildByNumber(number);
-        if (run != null && run.isLogUpdated()) {
-            interrupt(run, new StoppedElsewhere(p.getProperty("controller", "?"), p.getProperty("by", "?")));
+        if (run == null || run.isLogUpdated() && !interrupt(run, new StoppedElsewhere(p.getProperty("controller", "?"), p.getProperty("by", "?")))) {
+            // adopted, but not loaded or given an executor yet: the request is kept (its build's completion removes it)
+            if (attempt < STOP_ATTEMPTS) {
+                Timer.get().schedule(() -> {
+                    try {
+                        stopRequested(jobKey, number, attempt + 1);
+                    } catch (IOException | RuntimeException e) {
+                        LOGGER.log(Level.WARNING, "Failed to stop " + jobKey + " #" + number + " as requested", e);
+                    }
+                }, Math.min(30, 1L << attempt), TimeUnit.SECONDS);
+            } else {
+                LOGGER.warning(() -> "Could not stop " + jobKey + " #" + number + " as requested: it has no executor");
+            }
+            return;
         }
         store.delete(stopKey, PersistenceStore.ANY);
     }
 
-    private static void interrupt(Run<?, ?> run, CauseOfInterruption cause) {
-        LOGGER.info(() -> "Stopping " + run + ": " + cause.getShortDescription());
+    /** @return false if the build has no executor (yet) to interrupt */
+    private static boolean interrupt(Run<?, ?> run, CauseOfInterruption cause) {
         Executor executor = run.getExecutor();
-        if (executor != null) {
-            executor.interrupt(Result.ABORTED, cause);
+        if (executor == null) {
+            return false;
         }
+        LOGGER.info(() -> "Stopping " + run + ": " + cause.getShortDescription());
+        executor.interrupt(Result.ABORTED, cause);
+        return true;
     }
 
     /** Cause of interruption of a build stopped from another controller. */

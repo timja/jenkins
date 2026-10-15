@@ -613,6 +613,32 @@ class BuildLeasesTest {
         forget("adopted-alone");
     }
 
+    @Test
+    void stopRequestedWhileTheOwnerWasGoneStopsTheAdoptedBuild() throws Exception {
+        String key = orphan("stopped-adopted");
+        String stop = "jobs/stopped-adopted/running/1.stop";
+        dead.write(stop, "controller=jenkins-b\nby=alice\n".getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+
+        RunningBuilds.removeStale();
+        assertThat(text(key), containsString("origin=" + STORE.getOrigin()));
+        assertNotNull(text(stop), "kept until the adopted build can be stopped (the test adopter loads none)");
+
+        // a build of that number, run here, stands for the adopted build getting its executor
+        FreeStyleProject p = r.jenkins.getItemByFullName("stopped-adopted", FreeStyleProject.class);
+        p.getBuildersList().add(new TestBuilder() {
+            @Override
+            public boolean perform(AbstractBuild<?, ?> build, Launcher launcher, BuildListener listener) throws InterruptedException {
+                Thread.sleep(30_000);
+                return true;
+            }
+        });
+        FreeStyleBuild b = p.scheduleBuild2(0).get(60, TimeUnit.SECONDS);
+        assertEquals(Result.ABORTED, b.getResult());
+        assertThat(b.getLog(), containsString("Stopped from jenkins-b by alice"));
+        assertNull(text(stop));
+        forget("stopped-adopted");
+    }
+
     @TestExtension
     public static class Adopter implements BuildAdopter {
         static final List<String> prepared = new CopyOnWriteArrayList<>();

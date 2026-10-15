@@ -48,11 +48,13 @@ import hudson.model.queue.QueueTaskDispatcher;
 import hudson.model.queue.QueueTaskFuture;
 import hudson.tasks.BuildTrigger;
 import java.io.IOException;
+import java.io.StringReader;
 import java.io.UncheckedIOException;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -105,7 +107,9 @@ class ClusterCoordinationTest {
         public Set<String> liveOrigins() {
             return live;
         }
+
     };
+
 
     /** How many of the next claims go through but fail to answer, as does the read that follows each. */
     static final AtomicInteger lostClaimAnswers = new AtomicInteger();
@@ -216,6 +220,29 @@ class ClusterCoordinationTest {
         PersistenceStore.Entry request = STORE.read("jobs/remote/running/3.stop");
         assertNotNull(request, "a stop request for the owner");
         assertThat(new String(request.content(), StandardCharsets.UTF_8), containsString("by="));
+    }
+
+    @Test
+    void stopForABuildThatIsNotRunningIsIgnored() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("not-yet");
+        RunningBuilds.requestStop(p, 1, "bob");
+        assertNull(STORE.read("jobs/not-yet/running/1.stop"), "no request left for the build that later gets that number");
+        r.buildAndAssertSuccess(p);
+    }
+
+    @Test
+    void stopRequestedByAUserWithABackslashInTheirName() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("domain");
+        other.write("jobs/domain/running/3.xml", bytes("origin=other-controller\ncontroller=jenkins-b\ndisplayName=#3\nstartTime=1\n"), PersistenceStore.ABSENT);
+        awaitApplied();
+
+        RunningBuilds.requestStop(p, 3, "ACME\\user");
+
+        PersistenceStore.Entry request = STORE.read("jobs/domain/running/3.stop");
+        assertNotNull(request);
+        Properties read = new Properties(); // as its owner reads it
+        read.load(new StringReader(new String(request.content(), StandardCharsets.UTF_8)));
+        assertEquals("ACME\\user", read.getProperty("by"));
     }
 
     @Test
