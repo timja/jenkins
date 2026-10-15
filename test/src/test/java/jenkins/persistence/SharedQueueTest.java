@@ -84,6 +84,9 @@ class SharedQueueTest {
     /** While set, publishing an item of a job named "slow…" waits for it: a store answering slowly. */
     static volatile java.util.concurrent.CountDownLatch slowPublish;
 
+    /** Publishing an item of job "flaky" fails after the store took it: the answer is lost. */
+    static final String FLAKY = "flaky";
+
     private static ClusterQueue slowFor(ClusterQueue cq) {
         return new ClusterQueue() {
             @Override
@@ -101,7 +104,11 @@ class SharedQueueTest {
                         throw new java.io.InterruptedIOException();
                     }
                 }
-                return cq.publish(item);
+                Record stored = cq.publish(item);
+                if (item.task().equals(FLAKY)) {
+                    throw new java.io.IOException("connection reset after publishing");
+                }
+                return stored;
             }
 
             @Override
@@ -455,6 +462,38 @@ class SharedQueueTest {
         assertEquals(rec.id(), items[0].getId());
         assertThat(causes(STORE.clusterQueue().get(rec.id())), containsString("here"));
         other.cancel(rec.id()); // the store outlives this test
+    }
+
+    @Test
+    void anItemRestoredFromBeforeARestartDoesNotStartWithoutItsRecord() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("restored");
+        // started elsewhere while this controller was down
+        long id = other.nextId();
+        other.publish(new ClusterQueue.Record(id, "restored", "restored", SharedQueue.toXml(List.of(new CauseAction(new Cause.UserIdCause("quinn")))),
+                System.currentTimeMillis(), ClusterQueue.State.STARTED, "other-controller", null, "other-controller", 1));
+        awaitMirrored();
+        // the item as Queue.load restores it: in the queue here, with nothing known of its record
+        SharedQueue.Ids.MIRRORED.set(id);
+        try {
+            PersistenceStores.applyingRemoteChange(() -> Queue.getInstance().schedule2(p, 0));
+        } finally {
+            SharedQueue.Ids.MIRRORED.remove();
+        }
+        for (int i = 0; i < 50 && !Queue.getInstance().isEmpty(); i++) {
+            Thread.sleep(100);
+        }
+        Thread.sleep(1_000);
+        assertNull(p.getLastBuild(), "it started elsewhere");
+        assertTrue(Queue.getInstance().isEmpty(), "dropped");
+    }
+
+    @Test
+    void anItemWhosePublicationFailedAfterTheStoreHadItIsClaimedBeforeItStarts() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject(FLAKY);
+        r.assertBuildStatusSuccess(p.scheduleBuild2(0));
+        ClusterQueue.Record rec = awaitShared(p.getLastBuild().getQueueId(), x -> x.state() == ClusterQueue.State.STARTED);
+        assertEquals(ClusterQueue.State.STARTED, rec.state(), "else the others would start it too");
+        assertEquals(STORE.getOrigin(), rec.claimedBy());
     }
 
     @Test
