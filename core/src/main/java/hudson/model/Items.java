@@ -610,6 +610,7 @@ public class Items {
         }
         String name = item.getName();
         verifyItemDoesNotAlreadyExist(destination, name, null);
+        AbstractItem.keepDerivedUuids(item);
         String oldFullName = item.getFullName();
         // TODO AbstractItem.renameTo has a more baroque implementation; factor it out into a utility method perhaps?
         File destDir = destination.getRootDirFor(item);
