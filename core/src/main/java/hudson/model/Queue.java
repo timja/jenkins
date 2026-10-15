@@ -823,6 +823,20 @@ public class Queue extends ResourceController implements Saveable {
         });
     }
 
+    /**
+     * Cancels the item with this id wherever it is in this controller's queue now: an {@link Item} captured earlier is
+     * stale once the item moved on (from waiting to blocked or buildable), and cancelling it would miss.
+     *
+     * @return false if there is no such item here (it started, or left)
+     */
+    @Restricted(NoExternalUse.class)
+    public boolean cancelLocal(long id) {
+        return callWithLock(() -> {
+            Item item = getLocalItem(id);
+            return item != null && !(item instanceof LeftItem) && cancel(item);
+        });
+    }
+
     public boolean isEmpty() {
         Snapshot snapshot = this.snapshot;
         return snapshot.waitingList.isEmpty() && snapshot.blockedProjects.isEmpty() && snapshot.buildables.isEmpty()

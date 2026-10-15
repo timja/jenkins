@@ -103,9 +103,10 @@ public interface ClusterQueue {
     void started(long id, int buildNumber) throws IOException;
 
     /**
-     * Cancels a waiting item.
+     * Cancels an item which has not started: a waiting one, or one claimed by this controller (whose copy here was
+     * cancelled before it could start).
      *
-     * @return false if it was not waiting
+     * @return false if it was neither
      */
     boolean cancel(long id) throws IOException;
 
