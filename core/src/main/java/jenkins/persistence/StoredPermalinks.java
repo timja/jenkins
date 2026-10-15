@@ -64,7 +64,21 @@ public final class StoredPermalinks implements PeepholePermalink.Cache {
     static final String NAME = "permalinks";
 
     /** Builds key ({@code jobs/x/builds}) → the stored cache, as last read or written here. */
-    private static final Map<String, Map<String, Known>> caches = new ConcurrentHashMap<>();
+    private static final Map<String, Cached> caches = new ConcurrentHashMap<>();
+
+    /**
+     * A stored cache and the version of it, or (without a map) only the version of a change made elsewhere, so that it is
+     * read again. Of two caches read or written here at once, the newer is kept, whichever is installed last.
+     */
+    private record Cached(long version, @CheckForNull Map<String, Known> map) {}
+
+    private static void install(String builds, @CheckForNull PersistenceStore.Entry e, Map<String, Known> map) {
+        install(builds, e == null ? PersistenceStore.ABSENT : e.version(), map);
+    }
+
+    private static void install(String builds, long version, @CheckForNull Map<String, Known> map) {
+        caches.merge(builds, new Cached(version, map), (old, now) -> now.version() >= old.version() ? now : old);
+    }
 
     @Override
     public boolean isShared(@NonNull Job<?, ?> job) {
@@ -101,14 +115,14 @@ public final class StoredPermalinks implements PeepholePermalink.Cache {
                 Map<String, Known> stored = parse(e);
                 Known current = stored.get(id);
                 if (target.equals(current)) {
-                    caches.put(builds, stored);
+                    install(builds, e, stored);
                     return;
                 }
                 if (current instanceof Some(int n) && (target instanceof None || target instanceof Some(int m) && m < n)
                         && exists(store, builds, n)) {
                     // this controller has not seen #n yet (or a deletion moved the target back without us): keep it
                     LOGGER.fine(() -> "Keeping " + id + " of " + job + " at #" + n + " (not " + target + ")");
-                    caches.put(builds, stored);
+                    install(builds, e, stored);
                     return;
                 }
                 stored.put(id, target);
@@ -118,8 +132,7 @@ public final class StoredPermalinks implements PeepholePermalink.Cache {
                     return;
                 }
                 try {
-                    store.write(key, format(stored), e == null ? PersistenceStore.ABSENT : e.version());
-                    caches.put(builds, stored);
+                    install(builds, store.write(key, format(stored), e == null ? PersistenceStore.ABSENT : e.version()), stored);
                     return;
                 } catch (ConflictException x) {
                     // another controller updated it meanwhile: merge again
@@ -136,7 +149,7 @@ public final class StoredPermalinks implements PeepholePermalink.Cache {
         } catch (IOException | RuntimeException x) {
             // kept here, and tried again below
         }
-        caches.computeIfAbsent(builds, k -> new ConcurrentHashMap<>()).put(id, target);
+        cacheOf(builds).put(id, target);
         // other controllers take the shared value for granted (they ignore the record's event for permalinks): try
         // again, or they would keep the old target until the next build; a newer target stored since is kept (above)
         if (retry < MAX_RETRIES) {
@@ -177,8 +190,8 @@ public final class StoredPermalinks implements PeepholePermalink.Cache {
     }
 
     /** The cache of a job changed (or went) elsewhere: read it again when next needed. */
-    static void changedElsewhere(@NonNull String builds) {
-        caches.remove(builds);
+    static void changedElsewhere(@NonNull String builds, long version) {
+        install(builds, version, null);
     }
 
     /** {@code jobs/f/jobs/x/builds/permalinks} → {@code jobs/f/jobs/x/builds}; null for other keys. */
@@ -189,14 +202,18 @@ public final class StoredPermalinks implements PeepholePermalink.Cache {
     }
 
     private static Map<String, Known> cacheOf(String builds) {
-        return caches.computeIfAbsent(builds, k -> {
+        return caches.compute(builds, (k, c) -> {
+            if (c != null && c.map() != null) {
+                return c;
+            }
             try {
-                return parse(PersistenceStores.get().read(k + "/" + NAME));
+                PersistenceStore.Entry e = PersistenceStores.get().read(k + "/" + NAME);
+                return new Cached(e == null ? PersistenceStore.ABSENT : e.version(), parse(e));
             } catch (IOException | RuntimeException x) {
                 LOGGER.log(Level.FINE, "Could not read the permalinks of " + k, x);
-                return new ConcurrentHashMap<>();
+                return new Cached(c == null ? PersistenceStore.ANY : c.version(), new ConcurrentHashMap<>());
             }
-        });
+        }).map();
     }
 
     static Map<String, Known> parse(@CheckForNull PersistenceStore.Entry e) {

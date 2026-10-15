@@ -53,7 +53,22 @@ class StoredPermalinksTest {
         public boolean storesBuildRecords(String jobKey) {
             return true;
         }
+
+        @Override
+        public long write(String key, byte[] content, long expectedVersion) throws ConflictException {
+            long version = super.write(key, content, expectedVersion);
+            Runnable hook = afterWrite;
+            if (hook != null && key.endsWith("/builds/permalinks") && Thread.currentThread() == afterWriteThread) {
+                afterWrite = null;
+                hook.run();
+            }
+            return version;
+        }
     };
+
+    /** Run, once, after the thread {@link #afterWriteThread} wrote a permalinks cache, before the write returns. */
+    static volatile Runnable afterWrite;
+    static volatile Thread afterWriteThread;
     static final InMemoryBlobStore BLOBS = new InMemoryBlobStore();
 
     private JenkinsRule r;
@@ -147,6 +162,36 @@ class StoredPermalinksTest {
         cache.put(p, "lastSuccessfulBuild", new PeepholePermalink.Cache.Some(1));
         assertThat("not moved back", stored("completing"), containsString("lastSuccessfulBuild 2"));
         other.delete("jobs/completing/running/2.xml", PersistenceStore.ANY);
+    }
+
+    @Test
+    void ofTwoUpdatesMadeHereAtOnceTheNewerIsKept() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("twice");
+        r.buildAndAssertSuccess(p);
+        PeepholePermalink.Cache cache = hudson.ExtensionList.lookupFirst(PeepholePermalink.Cache.class);
+        java.util.concurrent.CountDownLatch written = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        // the first update is written, and held before it is taken as this controller's cache...
+        Thread first = new Thread(() -> cache.put(p, "test-a", new PeepholePermalink.Cache.Some(1)));
+        afterWriteThread = first;
+        afterWrite = () -> {
+            written.countDown();
+            try {
+                assertTrue(release.await(30, java.util.concurrent.TimeUnit.SECONDS));
+            } catch (InterruptedException e) {
+                throw new AssertionError(e);
+            }
+        };
+        first.start();
+        assertTrue(written.await(30, java.util.concurrent.TimeUnit.SECONDS));
+        // ...while a second one is written on top of it and taken
+        cache.put(p, "test-b", PeepholePermalink.Cache.NONE);
+        release.countDown();
+        first.join(30_000);
+        assertThat(stored("twice"), containsString("test-a 1"));
+        assertThat(stored("twice"), containsString("test-b -1"));
+        assertEquals(new PeepholePermalink.Cache.Some(1), cache.get(p, "test-a"));
+        assertEquals(PeepholePermalink.Cache.NONE, cache.get(p, "test-b"), "the older cache is not taken over the newer one");
     }
 
     @TestExtension
