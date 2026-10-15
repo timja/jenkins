@@ -70,6 +70,24 @@ class InMemoryPersistenceStoreTest {
     }
 
     @Test
+    void aChangeMadeByAListenerIsDeliveredAfterTheOneItIsHandling() throws Exception {
+        InMemoryPersistenceStore store = new InMemoryPersistenceStore(key -> true);
+        store.subscribe(e -> {
+            if (e.key().equals("k1")) {
+                try {
+                    store.write("k2", new byte[] {2}, PersistenceStore.ANY);
+                } catch (ConflictException x) {
+                    throw new AssertionError(x);
+                }
+            }
+        });
+        List<String> delivered = new ArrayList<>();
+        store.subscribe(e -> delivered.add(e.key()));
+        store.write("k1", new byte[] {1}, PersistenceStore.ANY);
+        assertEquals(List.of("k1", "k2"), delivered);
+    }
+
+    @Test
     void deletingAnAbsentKeySucceedsWhateverTheVersion() throws Exception {
         InMemoryPersistenceStore store = new InMemoryPersistenceStore(key -> true);
         store.delete("never", 42);
