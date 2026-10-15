@@ -334,8 +334,8 @@ public abstract class PeepholePermalink extends Permalink implements Predicate<R
             if (target instanceof Cache.Some(int n) && (n > number || deleted && n < number)) {
                 continue; // points at another build, which this change cannot affect
             }
-            if (deleted && target instanceof Cache.None) {
-                continue;
+            if (deleted && target instanceof Cache.None || target instanceof Cache.Unknown) {
+                continue; // an unknown target is searched for from the newest build anyway: a hint would only narrow that
             }
             LOGGER.fine(() -> "Hinting " + pp.getId() + " of " + job + " at #" + number + " changed elsewhere");
             cache.put(job, pp.getId(), new Cache.Some(number));

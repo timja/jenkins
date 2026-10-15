@@ -34,6 +34,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import hudson.model.FreeStyleBuild;
 import hudson.model.FreeStyleProject;
+import hudson.model.Job;
 import hudson.model.Run;
 import hudson.model.listeners.RunListener;
 import java.io.ByteArrayInputStream;
@@ -43,10 +44,13 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import jenkins.model.PeepholePermalink;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
@@ -239,6 +243,41 @@ class RemoteBuildEventsTest {
     private static boolean applierWaitsForBuilds() {
         return Thread.getAllStackTraces().entrySet().stream().anyMatch(e -> e.getKey().getState() == Thread.State.BLOCKED
                 && Arrays.stream(e.getValue()).anyMatch(f -> f.getClassName().equals(BuildRecords.class.getName())));
+    }
+
+    @Test
+    void changesElsewhereDoNotNarrowAnUnresolvedPermalink() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("unresolved");
+        r.buildAndAssertSuccess(p);
+        publishElsewhere("unresolved", 1, 3, record("unresolved", 1));
+        MemoryCache.targets.clear(); // as on a controller that has not resolved the permalinks yet
+        other.write("jobs/unresolved/builds/1/build.xml", record("unresolved", 1).replaceFirst("<build>", "<build>\n  <description>older</description>")
+                .getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        awaitApplied();
+        assertEquals(3, p.getLastSuccessfulBuild().getNumber());
+
+        MemoryCache.targets.clear();
+        other.delete("jobs/unresolved/builds/1/build.xml", PersistenceStore.ANY);
+        awaitApplied();
+        assertNotNull(p.getLastSuccessfulBuild());
+        assertEquals(3, p.getLastSuccessfulBuild().getNumber());
+    }
+
+    /** Keeps permalinks in memory only, so that a test can forget them. */
+    @TestExtension("changesElsewhereDoNotNarrowAnUnresolvedPermalink")
+    public static class MemoryCache implements PeepholePermalink.Cache {
+        static final Map<String, Known> targets = new ConcurrentHashMap<>();
+
+        @Override
+        public PermalinkTarget get(Job<?, ?> job, String id) {
+            Known t = targets.get(job.getFullName() + "/" + id);
+            return t != null ? t : UNKNOWN;
+        }
+
+        @Override
+        public void put(Job<?, ?> job, String id, Known target) {
+            targets.put(job.getFullName() + "/" + id, target);
+        }
     }
 
     @TestExtension
