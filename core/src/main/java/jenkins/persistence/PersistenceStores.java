@@ -329,16 +329,26 @@ public final class PersistenceStores {
             throw new IllegalArgumentException("Cannot move " + fromKey + " to " + toKey);
         }
         // the destination is claimed first, so that no other move to it (on any controller) runs between checking it
-        // and moving there: blobs, moved before the entries, cannot be atomic with that check
+        // and moving there: blobs, moved before the entries, cannot be atomic with that check. The source too, so that
+        // two controllers moving the same item to two places do not split its blobs and entries between them
         long claim = claim(store, toKey, fromKey);
         try {
-            moveClaimed(store, fromKey, toKey);
-        } finally {
+            long sourceClaim = claim(store, fromKey, fromKey);
             try {
-                store.delete(toKey + MOVING, claim);
-            } catch (IOException | RuntimeException e) {
-                LOGGER.log(Level.WARNING, "Could not release the claim on " + toKey + "; it lapses", e);
+                moveClaimed(store, fromKey, toKey);
+            } finally {
+                release(store, fromKey, sourceClaim);
             }
+        } finally {
+            release(store, toKey, claim);
+        }
+    }
+
+    private static void release(PersistenceStore store, String key, long claim) {
+        try {
+            store.delete(key + MOVING, claim);
+        } catch (IOException | RuntimeException e) {
+            LOGGER.log(Level.WARNING, "Could not release the claim on " + key + "; it lapses", e);
         }
     }
 
@@ -348,7 +358,7 @@ public final class PersistenceStores {
     /** A claim this old was left by a move that never finished (its controller died): it may be taken over. */
     static final long CLAIM_LAPSE_MILLIS = TimeUnit.MINUTES.toMillis(10);
 
-    /** Claims a destination for a move, with a create-only write; returns the claim's version. */
+    /** Claims a destination (or source) for a move, with a create-only write; returns the claim's version. */
     private static long claim(PersistenceStore store, String toKey, String fromKey) throws IOException {
         byte[] claim = (System.currentTimeMillis() + " " + store.getOrigin() + " " + fromKey).getBytes(StandardCharsets.UTF_8);
         for (int attempt = 0; attempt < 3; attempt++) {
@@ -385,13 +395,19 @@ public final class PersistenceStores {
             // checked before touching blobs, which would otherwise overwrite those of whatever is at the destination
             throw new ConflictException(toKey, PersistenceStore.ABSENT, PersistenceStore.ANY);
         }
-        // blobs first: moving the entries tells other controllers, which may then look for the blobs at the new location
-        BlobStore blobs = getBlobStore();
-        if (blobs != null) {
-            blobs.move(fromKey, toKey);
+        String config = fromKey + "/config.xml";
+        if (store.owns(config) && store.read(config) == null) {
+            // moved or deleted elsewhere, which this controller has not applied yet: checked before touching blobs too
+            throw new ConflictException(config, PersistenceStore.ANY, PersistenceStore.ABSENT);
         }
+        BlobStore blobs = getBlobStore();
         List<PersistenceStore.Moved> moved;
         try {
+            // blobs first: moving the entries tells other controllers, which may then look for the blobs at the new
+            // location. A blob move may fail partway: what it moved is moved back below
+            if (blobs != null) {
+                blobs.move(fromKey, toKey);
+            }
             moved = store.move(fromKey, toKey);
             checkItemMoved(store, fromKey, toKey, moved);
         } catch (IOException | RuntimeException e) {
