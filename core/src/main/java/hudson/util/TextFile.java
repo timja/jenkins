@@ -144,7 +144,7 @@ public class TextFile {
     public @NonNull String head(int numChars) throws IOException {
         char[] buf = new char[numChars];
         int read = 0;
-        try (Reader r = new FileReader(file)) {
+        try (Reader r = PersistenceStores.route(file) != null ? openReader() : new FileReader(file)) {
             while (read < numChars) {
                 int d = r.read(buf, read, buf.length - read);
                 if (d < 0)
@@ -187,6 +187,12 @@ public class TextFile {
      * So all in all, this algorithm should work decently, and it works quite efficiently on a large text.
      */
     public @NonNull String fastTail(int numChars, Charset cs) throws IOException {
+        PersistenceStores.Route route = PersistenceStores.route(file);
+        if (route != null) {
+            // stored content is small: decode all of it
+            String all = cs.decode(java.nio.ByteBuffer.wrap(readStored(route))).toString();
+            return all.substring(Math.max(0, all.length() - numChars));
+        }
 
         try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
             long len = raf.length();
@@ -229,11 +235,15 @@ public class TextFile {
         if (route == null) {
             return Files.newBufferedReader(Util.fileToPath(file), StandardCharsets.UTF_8);
         }
+        return new BufferedReader(new StringReader(new String(readStored(route), StandardCharsets.UTF_8)));
+    }
+
+    private byte[] readStored(PersistenceStores.Route route) throws IOException {
         PersistenceStore.Entry entry = route.read();
         if (entry == null) {
             throw new NoSuchFileException(file.toString(), null, "not found in persistence store as " + route.key());
         }
-        return new BufferedReader(new StringReader(new String(entry.content(), StandardCharsets.UTF_8)));
+        return entry.content();
     }
 
     private static final Logger LOGGER = Logger.getLogger(TextFile.class.getName());
