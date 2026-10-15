@@ -564,6 +564,12 @@ public final class BuildRecords {
         PeepholePermalink.changedElsewhere(job, number, false);
     }
 
+    /** Whether a record of the build is stored. */
+    static boolean isStored(@NonNull Job<?, ?> job, int number) throws IOException {
+        String builds = buildsKey(job);
+        return builds != null && PersistenceStores.get().read(builds + "/" + number + "/" + RECORD) != null;
+    }
+
     /**
      * A build's record was moved elsewhere along with its job, whose move this controller has applied: a copy
      * materialized here is refreshed, as for a change, since an edit made elsewhere before the move found no record
@@ -680,6 +686,7 @@ public final class BuildRecords {
             if (RunningBuilds.wasLost(run) || !RunningBuilds.owns(run)) {
                 // another controller has taken it over and will publish it
                 LOGGER.warning(() -> "Not publishing " + run + ": it is owned by another controller");
+                RunningBuilds.lost(run); // fenced until discarded: a save of this copy meanwhile is not republished
                 RunningBuilds.discard(run);
                 return;
             }

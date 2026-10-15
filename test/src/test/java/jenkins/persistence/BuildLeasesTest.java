@@ -282,6 +282,7 @@ class BuildLeasesTest {
         assertFalse(RunningBuilds.owns(b));
         assertThrows(ConflictException.class, () -> RunningBuilds.update(b, Map.of("savePoint", "9")));
         RunningBuilds.checkOwnership();
+        assertThrows(ConflictException.class, () -> RunningBuilds.update(b, Map.of("savePoint", "9")), "still refused once lost");
 
         FreeStyleBuild done = f.get(60, TimeUnit.SECONDS);
         assertEquals(Result.ABORTED, done.getResult());
@@ -294,6 +295,84 @@ class BuildLeasesTest {
         }
         assertFalse(dir.exists(), "local copy discarded");
         assertNull(p.getBuildByNumber(1));
+    }
+
+    /** Removes what a test left in the store, which outlives it, so that later tests neither load nor sweep it. */
+    private static void forget(String... jobs) throws java.io.IOException {
+        for (String job : jobs) {
+            STORE.delete("jobs/" + job + "/running/1.xml", PersistenceStore.ANY);
+            STORE.delete("jobs/" + job + "/config.xml", PersistenceStore.ANY);
+        }
+    }
+
+    private static void awaitDiscarded(Run<?, ?> b) throws InterruptedException {
+        for (int i = 0; i < 300 && RunningBuilds.wasLost(b); i++) {
+            Thread.sleep(100);
+        }
+        assertFalse(RunningBuilds.wasLost(b), "discarded");
+    }
+
+    @Test
+    void completedCopyOfABuildLostMeanwhileIsNotRepublished() throws Exception {
+        r.buildAndAssertSuccess(r.createFreeStyleProject("seed-lapsed"));
+        byte[] record = STORE.read("jobs/seed-lapsed/builds/1/build.xml").content();
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        FreeStyleProject p = blocking(r, "lapsed", started, release);
+        QueueTaskFuture<FreeStyleBuild> f = p.scheduleBuild2(0);
+        assertTrue(started.await(60, TimeUnit.SECONDS));
+        String key = "jobs/lapsed/running/1.xml";
+        // taken over while this controller looked gone; no sweep here noticed before the build completed
+        live = Set.of("dead-controller");
+        long theirs = dead.leases().acquire(key);
+        dead.write(key, placeholder("dead-controller", 1, theirs, ""), PersistenceStore.ANY);
+        live = null;
+        release.countDown();
+        FreeStyleBuild b = f.get(60, TimeUnit.SECONDS);
+
+        // the new owner publishes it; then this controller saves its completed copy (keep forever, a plugin...)
+        byte[] theirRecord = (new String(record, StandardCharsets.UTF_8) + "<!-- by the new owner -->\n").getBytes(StandardCharsets.UTF_8);
+        synchronized (p.getLazyBuildMixIn()._getRuns()) { // the copy here is refreshed (or dropped) only after the save
+            dead.write("jobs/lapsed/builds/1/build.xml", theirRecord, PersistenceStore.ABSENT);
+            b.setDescription("changed here");
+        }
+
+        assertThat(text("jobs/lapsed/builds/1/build.xml"), containsString("by the new owner"));
+        awaitDiscarded(b);
+        forget("seed-lapsed", "lapsed");
+    }
+
+    @Test
+    void buildPublishedByItsNewOwnerBeforeTheLostCopyIsDiscardedIsKnown() throws Exception {
+        r.buildAndAssertSuccess(r.createFreeStyleProject("seed-handed"));
+        byte[] record = STORE.read("jobs/seed-handed/builds/1/build.xml").content();
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        FreeStyleProject p = blocking(r, "handed", started, release);
+        QueueTaskFuture<FreeStyleBuild> f = p.scheduleBuild2(0);
+        assertTrue(started.await(60, TimeUnit.SECONDS));
+        FreeStyleBuild b = p.getBuildByNumber(1);
+        String key = "jobs/handed/running/1.xml";
+        live = Set.of("dead-controller");
+        long theirs = dead.leases().acquire(key);
+        dead.write(key, placeholder("dead-controller", 1, theirs, ""), PersistenceStore.ANY);
+        live = null;
+        RunningBuilds.checkOwnership();
+        assertEquals(Result.ABORTED, f.get(60, TimeUnit.SECONDS).getResult());
+
+        // the new owner completes it quickly, before the stopped copy here is discarded
+        try (java.io.InputStream snapshot = BLOBS.get("jobs/seed-handed/builds/1/files.tgz")) {
+            byte[] bytes = snapshot.readAllBytes();
+            BLOBS.put("jobs/handed/builds/1/files.tgz", new java.io.ByteArrayInputStream(bytes), bytes.length);
+        }
+        dead.write("jobs/handed/builds/1/build.xml", record, PersistenceStore.ABSENT);
+        dead.delete(key, PersistenceStore.ANY);
+        awaitDiscarded(b);
+
+        FreeStyleBuild published = p.getBuildByNumber(1);
+        assertNotNull(published, "its record is known here");
+        assertEquals(Result.SUCCESS, published.getResult());
+        forget("seed-handed", "handed");
     }
 
     @TestExtension
