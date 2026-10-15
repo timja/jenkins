@@ -460,6 +460,8 @@ class BuildLeasesTest {
         assertEquals(0, RunningBuilds.removeStale());
         assertThat("it names its gone owner again, not this live controller", text(key), containsString("origin=dead-controller"));
         assertTrue(Adopter.resumed.isEmpty());
+        assertThat("nor does this controller keep the job's exclusive lease", STORE.as("third-controller").leases().acquire("jobs/unresumable/running/exclusive"),
+                greaterThan(0L));
 
         assertEquals(1, RunningBuilds.removeStale());
         assertEquals(1, Adopter.resumed.size());

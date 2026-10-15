@@ -797,6 +797,7 @@ public final class RunningBuilds {
                 version = store.writeIfHeld(key, epoch, key, mine.toBytes(), p.version);
             } catch (LeaseLostException e) {
                 adoption.abandon();
+                abandonExclusive(job); // for the controller which has it now
                 throw e;
             } catch (ConflictException e) {
                 // the previous owner recorded a newer save point while it was being fetched
@@ -821,7 +822,16 @@ public final class RunningBuilds {
             }
             return true;
         }
+        abandonExclusive(job);
         return false;
+    }
+
+    /** Gives up the job's exclusive lease taken for an adoption that did not happen, unless a build of the job runs here. */
+    private static void abandonExclusive(Job<?, ?> job) {
+        String runningKey = runningKey(job);
+        if (runningKey != null && owned.keySet().stream().noneMatch(k -> k.startsWith(runningKey + "/"))) {
+            SharedQueue.abandonExclusive(job);
+        }
     }
 
     /**
@@ -843,6 +853,7 @@ public final class RunningBuilds {
             e.addSuppressed(x); // changed since: by its next owner
         }
         invalidate(jobKeyOfRunning(runningKey(job)));
+        abandonExclusive(job);
         throw new IOException("Could not resume " + previous.key, e);
     }
 
