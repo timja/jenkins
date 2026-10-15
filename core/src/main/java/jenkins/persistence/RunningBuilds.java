@@ -38,6 +38,8 @@ import hudson.model.Result;
 import hudson.model.Run;
 import hudson.model.TaskListener;
 import hudson.model.listeners.RunListener;
+import hudson.security.ACL;
+import hudson.security.ACLContext;
 import java.io.File;
 import java.io.IOException;
 import java.io.StringReader;
@@ -459,30 +461,52 @@ public final class RunningBuilds {
         if (store.getOrigin().equals(p.origin)) {
             return true;
         }
-        BuildLeases leases = store.leases();
-        long epoch = leases == null ? p.epoch : leases.acquire(key);
-        if (epoch == 0) {
-            LOGGER.info(() -> "Another controller holds the lease on " + job.getFullName() + " #" + number + "; not resuming it here");
-            return false;
+        // as an adoption does: while this controller restarted, its exclusive lease on the job (one build at a time)
+        // may have lapsed, and another controller started a newer build; this one then waits for it
+        if (!SharedQueue.adoptExclusive(job, number)) {
+            throw new NotYet("another build of " + job.getFullName() + " runs; #" + number + " is resumed here once it is done");
         }
-        Placeholder mine = p.withOwner(store.getOrigin(), CONTROLLER_NAME, epoch, p.properties);
-        long version;
+        boolean reclaimed = false;
         try {
-            version = store.writeIfHeld(key, epoch, key, mine.toBytes(), p.version); // fenced, as an adoption is
-        } catch (LeaseLostException e) {
-            LOGGER.info(() -> "Another controller took " + job.getFullName() + " #" + number + " over while it was reclaimed after a restart; not resuming it here");
-            return false;
-        } catch (ConflictException e) {
-            LOGGER.info(() -> job.getFullName() + " #" + number + " changed while being reclaimed after a restart; not resuming it here");
-            if (leases != null) {
-                leases.release(key, epoch);
+            BuildLeases leases = store.leases();
+            long epoch = leases == null ? p.epoch : leases.acquire(key);
+            if (epoch == 0) {
+                LOGGER.info(() -> "Another controller holds the lease on " + job.getFullName() + " #" + number + "; not resuming it here");
+                return false;
             }
-            return false;
+            Placeholder mine = p.withOwner(store.getOrigin(), CONTROLLER_NAME, epoch, p.properties);
+            long version;
+            try {
+                version = store.writeIfHeld(key, epoch, key, mine.toBytes(), p.version); // fenced, as an adoption is
+            } catch (LeaseLostException e) {
+                LOGGER.info(() -> "Another controller took " + job.getFullName() + " #" + number + " over while it was reclaimed after a restart; not resuming it here");
+                return false;
+            } catch (ConflictException e) {
+                LOGGER.info(() -> job.getFullName() + " #" + number + " changed while being reclaimed after a restart; not resuming it here");
+                if (leases != null) {
+                    leases.release(key, epoch);
+                }
+                return false;
+            }
+            owned.put(key, new Placeholder(key, number, mine.origin, mine.controller, p.displayName, p.startTime, epoch, p.properties, version));
+            invalidate(jobKeyOfRunning(runningKey));
+            LOGGER.info(() -> "Reclaimed " + job.getFullName() + " #" + number + " from this controller's previous run (" + p.origin + ") with epoch " + epoch);
+            reclaimed = true;
+            return true;
+        } finally {
+            if (!reclaimed) {
+                SharedQueue.abandonExclusive(job, number); // not resumed here: the job is not blocked for it
+            } else {
+                SharedQueue.resumedExclusive(job, number); // loaded right after this: the queue here then sees it
+            }
         }
-        owned.put(key, new Placeholder(key, number, mine.origin, mine.controller, p.displayName, p.startTime, epoch, p.properties, version));
-        invalidate(jobKeyOfRunning(runningKey));
-        LOGGER.info(() -> "Reclaimed " + job.getFullName() + " #" + number + " from this controller's previous run (" + p.origin + ") with epoch " + epoch);
-        return true;
+    }
+
+    /** A build that cannot be reclaimed yet (another build of its job runs), to be looked at again later. */
+    static final class NotYet extends IOException {
+        NotYet(String message) {
+            super(message);
+        }
     }
 
     /**
@@ -870,6 +894,20 @@ public final class RunningBuilds {
         }, Math.min(30, 1L << attempt), TimeUnit.SECONDS);
     }
 
+    /** Stops a build adopted here if that was requested, looking again later if the store cannot tell now. */
+    private static void stopIfRequested(String jobKey, int number, int attempt) {
+        try {
+            stopRequested(jobKey, number);
+        } catch (IOException | RuntimeException e) {
+            if (attempt < STOP_ATTEMPTS) {
+                LOGGER.log(Level.WARNING, "Could not tell whether " + jobKey + " #" + number + " was asked to stop; looking again later", e);
+                Timer.get().schedule(() -> stopIfRequested(jobKey, number, attempt + 1), Math.min(30, 1L << attempt), TimeUnit.SECONDS);
+            } else {
+                LOGGER.log(Level.WARNING, "Could not tell whether " + jobKey + " #" + number + " was asked to stop", e);
+            }
+        }
+    }
+
     /** @return false if the build has no executor (yet) to interrupt */
     private static boolean interrupt(Run<?, ?> run, CauseOfInterruption cause) {
         Executor executor = run.getExecutor();
@@ -994,10 +1032,9 @@ public final class RunningBuilds {
                 resumeFailed(store, job, p, version, e);
             }
             SharedQueue.resumedExclusive(job, number); // loaded now (or not resumed, and let go of): the queue sees it
-            String jobKey = jobKeyOfRunning(runningKey(job));
-            if (store.read(jobKey + "/" + PREFIX + "/" + number + STOP_SUFFIX) != null) {
-                stopRequested(jobKey, number); // asked to stop while its owner was gone
-            }
+            // asked to stop while its owner was gone; it runs here now whatever this finds, so nothing below throws: a
+            // caller takes an exception for "not resumed", and releases the lease
+            stopIfRequested(jobKeyOfRunning(runningKey(job)), number, 0);
             return Adoption.ADOPTED;
         }
         // its owner kept changing it: not as gone as it seemed; a later sweep looks again
@@ -1136,22 +1173,35 @@ public final class RunningBuilds {
             }
             try {
                 return reclaim(job, buildNumber);
+            } catch (NotYet e) {
+                LOGGER.info(() -> "Not resuming a build after a restart yet: " + e.getMessage());
+                reclaimLater(job, buildNumber);
+                return false;
             } catch (IOException | RuntimeException e) {
                 // not loaded (nor resumed) without its lease: another controller may run it; looked at again later
                 LOGGER.log(Level.WARNING, "Could not reclaim " + job.getFullName() + " #" + buildNumber + " after a restart; trying again later", e);
-                reclaimLater(job);
+                reclaimLater(job, buildNumber);
                 return false;
             }
         }
 
-        /** Has the job's builds listed again, so that one not loaded because the store was unavailable is retried. */
-        private static void reclaimLater(Job<?, ?> job) {
+        /**
+         * Tries to load a build not loaded because it could not be reclaimed yet, so that a Pipeline is resumed without
+         * waiting for someone to open it. Only that build: the others of the job, perhaps running, keep their instances.
+         */
+        private static void reclaimLater(Job<?, ?> job, int number) {
             Timer.get().schedule(() -> {
                 if (job instanceof LazyBuildMixIn.LazyLoadingJob<?, ?> lazy) {
-                    lazy.getLazyBuildMixIn()._getRuns().purgeCache();
+                    try (ACLContext ctx = ACL.as2(ACL.SYSTEM2)) {
+                        lazy.getLazyBuildMixIn()._getRuns().recognizeNumber(number); // declined when listed: not indexed
+                        job.getBuildByNumber(number); // a load failing again schedules another
+                    }
                 }
-            }, 30, TimeUnit.SECONDS); // a load failing again schedules another
+            }, RECLAIM_RETRY_SECONDS, TimeUnit.SECONDS);
         }
+
+        /** How long a build not reclaimed after a restart waits before it is tried again. */
+        static /* non-final for tests */ long RECLAIM_RETRY_SECONDS = 30;
 
         @Override
         public void onStarted(Run<?, ?> run, TaskListener listener) {
