@@ -1155,6 +1155,40 @@ class BuildLeasesTest {
         }
     }
 
+    private static void awaitApplied() throws InterruptedException {
+        for (int i = 0; i < 300 && !ItemChangeApplier.isIdle(); i++) {
+            Thread.sleep(100);
+        }
+        assertTrue(ItemChangeApplier.isIdle(), "changes applied");
+    }
+
+    @Test
+    void aBuildWhoseResultWasRecordedJustBeforeItsOwnerDiedIsClosedWithIt() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("completed-orphan");
+        String key = "jobs/completed-orphan/running/1.xml";
+        long deadEpoch = dead.leases().acquire(key);
+        dead.write(key, placeholder("dead-controller", 1, deadEpoch, "x.savePoint=3\n"), PersistenceStore.ABSENT);
+        live = Set.of(STORE.getOrigin());
+        awaitApplied();
+        assertEquals(List.of(1), RunningBuilds.elsewhere(p).stream().map(RunningBuilds.Placeholder::getNumber).toList()); // as listed
+        // its owner recorded its result, then died, before this controller applied that change
+        onReadKey = key;
+        onReadThread = Thread.currentThread();
+        onRead = () -> {
+            try {
+                dead.write(key, placeholder("dead-controller", 1, deadEpoch, "x.savePoint=3\nx.result=SUCCESS\n"), PersistenceStore.ANY);
+            } catch (java.io.IOException e) {
+                throw new AssertionError(e);
+            }
+        };
+
+        assertEquals(1, RunningBuilds.removeStale());
+
+        assertNull(onRead, "looked at as stored now");
+        assertThat(text("jobs/completed-orphan/builds/1/build.xml"), containsString("<result>SUCCESS</result>"));
+        assertNull(text(key));
+    }
+
     @TestExtension
     public static class Adopter implements BuildAdopter {
         static final List<String> prepared = new CopyOnWriteArrayList<>();
