@@ -40,6 +40,7 @@ import hudson.model.queue.QueueTaskFuture;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -61,6 +62,13 @@ class RunningBuildsTest {
     /** Origins the store reports as alive; null means membership is not tracked. */
     static volatile Set<String> live;
 
+    /** If set, answers {@link PersistenceStore#liveOrigins} instead of {@link #live} on the test's thread, one answer per call (the last one from then on). */
+    static volatile Iterator<Set<String>> liveAnswers;
+
+    static volatile Set<String> lastAnswer;
+
+    static volatile Thread testThread;
+
     static final InMemoryPersistenceStore STORE = new InMemoryPersistenceStore(
             key -> key.startsWith("jobs/") && (key.endsWith("/config.xml") || key.endsWith("/nextBuildNumber")) && !key.contains("/builds/")) {
         @Override
@@ -70,7 +78,14 @@ class RunningBuildsTest {
 
         @Override
         public Set<String> liveOrigins() {
-            return live;
+            Iterator<Set<String>> answers = liveAnswers;
+            if (answers == null || Thread.currentThread() != testThread) {
+                return live;
+            }
+            if (answers.hasNext()) {
+                lastAnswer = answers.next();
+            }
+            return lastAnswer;
         }
     };
     static final InMemoryBlobStore BLOBS = new InMemoryBlobStore();
@@ -84,6 +99,8 @@ class RunningBuildsTest {
         other = STORE.as("other-controller");
         BLOBS.clear();
         live = null;
+        liveAnswers = null;
+        testThread = Thread.currentThread();
     }
 
     private static void awaitApplied() throws InterruptedException {
@@ -174,6 +191,20 @@ class RunningBuildsTest {
         assertEquals(1, RunningBuilds.removeStale());
         assertNull(STORE.read("jobs/stale/running/2.xml"));
         assertNotNull(STORE.read("jobs/stale/running/1.xml"));
+        assertEquals(List.of(1), elsewhere(p));
+    }
+
+    @Test
+    void placeholderOfControllerJoiningDuringTheSweepIsKept() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("joining");
+        other.write("jobs/joining/running/1.xml", placeholder("other-controller", "jenkins-a", 1), PersistenceStore.ABSENT);
+        awaitApplied();
+        assertEquals(List.of(1), elsewhere(p));
+
+        // the other controller (re)started while the sweep listed placeholders: alive, although the first answer missed it
+        liveAnswers = List.of(Set.of(STORE.getOrigin()), Set.of(STORE.getOrigin(), "other-controller")).iterator();
+        assertEquals(0, RunningBuilds.removeStale());
+        assertNotNull(STORE.read("jobs/joining/running/1.xml"));
         assertEquals(List.of(1), elsewhere(p));
     }
 
