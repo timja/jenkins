@@ -468,7 +468,10 @@ public final class RunningBuilds {
         Placeholder mine = p.withOwner(store.getOrigin(), CONTROLLER_NAME, epoch, p.properties);
         long version;
         try {
-            version = store.write(key, mine.toBytes(), p.version);
+            version = store.writeIfHeld(key, epoch, key, mine.toBytes(), p.version); // fenced, as an adoption is
+        } catch (LeaseLostException e) {
+            LOGGER.info(() -> "Another controller took " + job.getFullName() + " #" + number + " over while it was reclaimed after a restart; not resuming it here");
+            return false;
         } catch (ConflictException e) {
             LOGGER.info(() -> job.getFullName() + " #" + number + " changed while being reclaimed after a restart; not resuming it here");
             if (leases != null) {
@@ -1089,8 +1092,15 @@ public final class RunningBuilds {
         if (epoch == 0) {
             return false; // not released (yet), or taken by another controller
         }
+        Adoption adopted;
+        try {
+            adopted = adopt(store, job, key, epoch);
+        } catch (IOException | RuntimeException e) {
+            store.leases().release(key, epoch); // left as it was, for another attempt
+            throw e;
+        }
         // only an adoption is a takeover: a build that completed meanwhile was not taken over
-        return switch (adopt(store, job, key, epoch)) {
+        return switch (adopted) {
             case ADOPTED -> true;
             case GONE, LATER -> false; // its lease released already
             case NONE -> {
