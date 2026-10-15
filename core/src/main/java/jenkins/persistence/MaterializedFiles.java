@@ -151,17 +151,16 @@ public final class MaterializedFiles {
                 copies.put(route.key(), new Copy(c.file(), c.content(), c.version(), c.file().lastModified()));
                 return Outcome.UNCHANGED;
             }
-            byte[] written = write(route, c, mine);
+            PersistenceStore.Entry written = write(route, c, mine);
             if (written == null) {
                 return Outcome.STALE;
             }
-            if (!Arrays.equals(written, mine)) {
-                replace(c.file(), written); // merged with a change made elsewhere: the copy has both
+            if (!Arrays.equals(written.content(), mine)) {
+                replace(c.file(), written.content()); // merged with a change made elsewhere: the copy has both
             }
-            PersistenceStore.Entry now = route.peek();
-            if (now != null) {
-                materialized(route.key(), c.file(), now);
-            }
+            // what was written, at the version written: not what the store has by now (a change made elsewhere since
+            // would be taken for this copy's content, and written over by its next write-back)
+            materialized(route.key(), c.file(), written);
             LOGGER.info(() -> "Wrote " + route.key() + " back to the store: it was changed directly on disk here");
             return Outcome.WRITTEN;
         } catch (IOException | RuntimeException e) {
@@ -181,9 +180,9 @@ public final class MaterializedFiles {
         }
     }
 
-    /** @return what was written, or null if the key is no longer stored */
+    /** @return what was written, and its version, or null if the key is no longer stored */
     @CheckForNull
-    private static byte[] write(PersistenceStores.Route route, Copy c, byte[] mine) throws IOException {
+    private static PersistenceStore.Entry write(PersistenceStores.Route route, Copy c, byte[] mine) throws IOException {
         for (int attempt = 0; attempt < 5; attempt++) {
             PersistenceStore.Entry theirs = route.peek();
             if (theirs == null) {
@@ -199,8 +198,7 @@ public final class MaterializedFiles {
                 }
             }
             try {
-                route.store().write(route.key(), content, theirs.version());
-                return content;
+                return new PersistenceStore.Entry(content, route.store().write(route.key(), content, theirs.version()));
             } catch (ConflictException again) {
                 // changed again meanwhile: merge against that
             }
