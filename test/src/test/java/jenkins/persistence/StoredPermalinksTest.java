@@ -73,7 +73,11 @@ class StoredPermalinksTest {
     }
 
     private static String stored() throws Exception {
-        PersistenceStore.Entry e = STORE.read("jobs/p/builds/permalinks");
+        return stored("p");
+    }
+
+    private static String stored(String job) throws Exception {
+        PersistenceStore.Entry e = STORE.read("jobs/" + job + "/builds/permalinks");
         return e == null ? "" : new String(e.content(), StandardCharsets.UTF_8);
     }
 
@@ -111,6 +115,19 @@ class StoredPermalinksTest {
         awaitApplied();
         assertEquals(new PeepholePermalink.Cache.Some(3), cache.get(p, "lastSuccessfulBuild"));
         assertEquals(PeepholePermalink.Cache.UNKNOWN, cache.get(p, "lastFailedBuild"), "the other controller's cache knew nothing else");
+    }
+
+    @Test
+    void aPermalinkResolvedWhileItsJobIsDeletedIsNotStoredAgain() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("deleted");
+        r.buildAndAssertSuccess(p);
+        assertThat(stored("deleted"), containsString("lastSuccessfulBuild 1"));
+        PeepholePermalink.Cache cache = hudson.ExtensionList.lookupFirst(PeepholePermalink.Cache.class);
+        p.delete();
+        assertEquals("", stored("deleted"), "removed with the job's builds");
+        // a resolution which started before the deletion (or a retry) finishes after it
+        cache.put(p, "lastFailedBuild", PeepholePermalink.Cache.NONE);
+        assertEquals("", stored("deleted"), "not brought back");
     }
 
     @TestExtension

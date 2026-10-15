@@ -29,6 +29,8 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Extension;
 import hudson.ExtensionList;
 import hudson.model.Job;
+import hudson.security.ACL;
+import hudson.security.ACLContext;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
@@ -110,6 +112,11 @@ public final class StoredPermalinks implements PeepholePermalink.Cache {
                     return;
                 }
                 stored.put(id, target);
+                if (gone(job, builds, store)) {
+                    // deleted (here or elsewhere) since it was resolved: writing would bring its builds' entry back
+                    caches.remove(builds);
+                    return;
+                }
                 try {
                     store.write(key, format(stored), e == null ? PersistenceStore.ABSENT : e.version());
                     caches.put(builds, stored);
@@ -120,6 +127,14 @@ public final class StoredPermalinks implements PeepholePermalink.Cache {
             }
         } catch (IOException | RuntimeException x) {
             LOGGER.log(Level.FINE, "Could not store " + id + " of " + job + "; kept here meanwhile", x);
+        }
+        try {
+            if (gone(job, builds, store)) {
+                caches.remove(builds);
+                return;
+            }
+        } catch (IOException | RuntimeException x) {
+            // kept here, and tried again below
         }
         caches.computeIfAbsent(builds, k -> new ConcurrentHashMap<>()).put(id, target);
         // other controllers take the shared value for granted (they ignore the record's event for permalinks): try
@@ -132,6 +147,21 @@ public final class StoredPermalinks implements PeepholePermalink.Cache {
     }
 
     private static final int MAX_RETRIES = 10;
+
+    /**
+     * Whether the job was deleted: it is no longer in its parent here, or its configuration is no longer stored. A
+     * permalink resolved while a job is deleted (resolving one can take a while for a job with many builds), or a
+     * retry, would otherwise store the cache again after the job's builds were removed from the store.
+     */
+    private static boolean gone(@NonNull Job<?, ?> job, @NonNull String builds, @NonNull PersistenceStore store) throws IOException {
+        try (ACLContext ignored = ACL.as2(ACL.SYSTEM2)) { // whether it exists, whoever asks
+            if (job.getParent().getItem(job.getName()) != job) {
+                return true;
+            }
+        }
+        String config = builds.substring(0, builds.length() - "builds".length()) + "config.xml";
+        return store.owns(config) && store.read(config) == null;
+    }
 
     /** The cache of a job changed (or went) elsewhere: read it again when next needed. */
     static void changedElsewhere(@NonNull String builds) {
