@@ -321,15 +321,16 @@ public final class BuildRecords {
         PersistenceStore store = PersistenceStores.get();
         try {
             byte[] published = Files.readAllBytes(record);
-            PersistenceStore.Entry stored = filesChanged && !recordChanged ? store.read(base + "/" + RECORD) : null;
-            if (filesChanged && !recordChanged && stored == null) {
+            PersistenceStore.Entry stored = filesChanged ? store.read(base + "/" + RECORD) : null;
+            if (filesChanged && stored == null) {
                 // deleted elsewhere, which this controller has not applied yet: not brought back for files added here
+                // (nor for its record saved here with them)
                 discardSnapshot(base);
                 recentlyPublished.remove(base);
                 LOGGER.fine(() -> "Not publishing files added to " + run + ": deleted elsewhere");
                 return;
             }
-            if (stored != null) {
+            if (stored != null && !recordChanged) {
                 // only the files changed: mark the stored record (telling other controllers to fetch the snapshot again),
                 // rather than writing this controller's copy over an edit made elsewhere since
                 byte[] marked = (new String(stored.content(), StandardCharsets.UTF_8).replaceAll("\n<!-- files updated \\d+ -->$", "")
