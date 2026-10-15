@@ -48,7 +48,18 @@ class ItemFilesTest {
 
     static final InMemoryPersistenceStore STORE = new InMemoryPersistenceStore(
             key -> (key.startsWith("jobs/") || key.startsWith("users/")) && key.endsWith("/config.xml") && !key.contains("/builds/"));
-    static final InMemoryBlobStore BLOBS = new InMemoryBlobStore();
+    static final InMemoryBlobStore BLOBS = new InMemoryBlobStore() {
+        @Override
+        public java.io.InputStream get(String key) {
+            if (key.equals(failGet)) {
+                failGet = null;
+                throw new java.io.UncheckedIOException(new java.io.IOException("the blob store is unreachable, this time"));
+            }
+            return super.get(key);
+        }
+    };
+    /** A blob whose next read fails. */
+    static volatile String failGet;
 
     @BeforeEach
     void enable() {
@@ -205,6 +216,26 @@ class ItemFilesTest {
         long version = STORE.read("jobs/restarted/item-files.json").version();
         ItemFiles.publish(p);
         assertEquals(version, STORE.read("jobs/restarted/item-files.json").version(), "nor shared over v2");
+    }
+
+    @Test
+    void aChangeThatCouldNotBeTakenIsTakenLater(JenkinsRule r) throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("retried");
+        Path state = p.getRootDir().toPath().resolve("state.txt");
+        Files.writeString(state, "v1");
+        ItemFiles.publish(p);
+        byte[] v2 = "v2".getBytes(StandardCharsets.UTF_8);
+        BLOBS.put("jobs/retried/item-files/" + sha256(v2), new java.io.ByteArrayInputStream(v2), v2.length);
+        failGet = "jobs/retried/item-files/" + sha256(v2);
+        // (with this controller's origin, so the store listener does not take it too; it is applied below as if elsewhere)
+        STORE.write("jobs/retried/item-files.json",
+                manifest("jobs/retried/item-files.json").replace(sha256("v1".getBytes(StandardCharsets.UTF_8)), sha256(v2)).getBytes(StandardCharsets.UTF_8),
+                PersistenceStore.ANY);
+        ItemFiles.changedElsewhere("jobs/retried/item-files.json");
+        assertNull(failGet, "it could not be taken");
+        assertEquals("v1", Files.readString(state));
+        new ItemFiles.Publisher().execute(hudson.model.TaskListener.NULL);
+        assertEquals("v2", Files.readString(state), "taken with the next publication");
     }
 
     @TestExtension

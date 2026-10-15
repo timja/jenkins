@@ -34,6 +34,8 @@ import hudson.model.AsyncPeriodicWork;
 import hudson.model.Item;
 import hudson.model.TaskListener;
 import hudson.model.listeners.ItemListener;
+import hudson.security.ACL;
+import hudson.security.ACLContext;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -359,25 +361,29 @@ public final class ItemFiles {
         if (!enabled()) {
             return;
         }
-        File userDir = userDirOfManifest(key);
-        if (userDir != null) {
-            try {
-                take(userDir);
-            } catch (IOException | RuntimeException e) {
-                LOGGER.log(Level.WARNING, "Could not take the shared files of " + key, e);
+        File dir = userDirOfManifest(key);
+        if (dir == null) {
+            String fullName = itemOfManifest(key);
+            Item item;
+            try (ACLContext ctx = ACL.as2(ACL.SYSTEM2)) { // whoever may see it
+                item = fullName == null ? null : Jenkins.get().getItemByFullName(fullName);
             }
-            return;
+            if (item == null) {
+                return;
+            }
+            dir = item.getRootDir();
         }
-        String fullName = itemOfManifest(key);
-        Item item = fullName == null ? null : Jenkins.get().getItemByFullName(fullName);
-        if (item != null) {
-            try {
-                take(item);
-            } catch (IOException | RuntimeException e) {
-                LOGGER.log(Level.WARNING, "Could not take the shared files of " + fullName, e);
-            }
+        try {
+            take(dir);
+            failed.remove(dir);
+        } catch (IOException | RuntimeException e) {
+            LOGGER.log(Level.WARNING, "Could not take the shared files of " + key + "; trying again with the next publication", e);
+            failed.add(dir);
         }
     }
+
+    /** Directories whose shared files could not be taken when they changed elsewhere: taken again by the {@link Publisher}. */
+    private static final Set<File> failed = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     /** A fresh home takes every item's shared files. */
     @Initializer(after = InitMilestone.JOB_LOADED)
@@ -488,6 +494,14 @@ public final class ItemFiles {
         protected void execute(TaskListener listener) {
             if (!enabled() || PersistenceStores.get() == null) {
                 return;
+            }
+            for (File dir : Set.copyOf(failed)) {
+                try {
+                    take(dir);
+                    failed.remove(dir);
+                } catch (IOException | RuntimeException e) {
+                    LOGGER.log(Level.FINE, "Still cannot take the shared files of " + dir, e);
+                }
             }
             for (Item item : Jenkins.get().allItems()) {
                 if (item instanceof AbstractItem) {
