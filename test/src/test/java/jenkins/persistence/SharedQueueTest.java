@@ -841,6 +841,22 @@ class SharedQueueTest {
     }
 
     @Test
+    void anItemWithALocalIdBuildsHereUnshared() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("local-id");
+        // as when the cluster sequence was unreachable: an id from the local range, which another controller may have too
+        SharedQueue.Ids.MIRRORED.set(SharedQueue.Ids.LOCAL_RANGE + 7);
+        QueueTaskFuture<FreeStyleBuild> f;
+        try {
+            f = p.scheduleBuild2(0);
+        } finally {
+            SharedQueue.Ids.MIRRORED.remove();
+        }
+        r.assertBuildStatusSuccess(f);
+        assertEquals(SharedQueue.Ids.LOCAL_RANGE + 7, p.getLastBuild().getQueueId());
+        assertNull(STORE.clusterQueue().get(SharedQueue.Ids.LOCAL_RANGE + 7), "never shared");
+    }
+
+    @Test
     void anItemOneMayNotSeeIsNotFound() throws Exception {
         r.createFreeStyleProject("hidden");
         r.jenkins.setSecurityRealm(r.createDummySecurityRealm());
