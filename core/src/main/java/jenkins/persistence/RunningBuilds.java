@@ -1140,6 +1140,16 @@ public final class RunningBuilds {
     @Restricted(Beta.class)
     public static boolean followElsewhere(@NonNull Job<?, ?> job, int number, boolean follow, @NonNull java.io.OutputStream out)
             throws IOException, InterruptedException {
+        return followElsewhere(job, number, follow, out, -1);
+    }
+
+    /**
+     * {@link #followElsewhere(Job, int, boolean, java.io.OutputStream)} from its last {@code lines} lines (as
+     * {@code console -n}), or all of it if negative.
+     */
+    @Restricted(Beta.class)
+    public static boolean followElsewhere(@NonNull Job<?, ?> job, int number, boolean follow, @NonNull java.io.OutputStream out, int lines)
+            throws IOException, InterruptedException {
         if (runningKey(job) == null) {
             return false; // no builds of it run elsewhere (no store, or one not sharing its builds): "no such build"
         }
@@ -1152,9 +1162,7 @@ public final class RunningBuilds {
             }
             Run<?, ?> done = job.getBuildByNumber(number);
             if (done != null && !done.isLogUpdated()) {
-                try (InputStream in = done.getLogInputStream()) {
-                    in.transferTo(out);
-                }
+                copyRecorded(done, 0, lines, out);
                 out.flush();
                 return true;
             }
@@ -1162,9 +1170,23 @@ public final class RunningBuilds {
             invalidate(jobKeyOfRunning(runningKey(job)));
         }
         long offset = 0;
+        boolean tail = lines >= 0; // until the first part is written
         while (true) {
             long next = -1;
             for (RemoteLog l : ExtensionList.lookup(RemoteLog.class)) {
+                if (tail) {
+                    // the last lines of what was shipped so far, from where they start
+                    java.io.ByteArrayOutputStream shipped = new java.io.ByteArrayOutputStream();
+                    next = l.copy(job, number, offset, shipped);
+                    if (next >= 0) {
+                        byte[] b = shipped.toByteArray();
+                        int from = (int) hudson.cli.ConsoleCommand.tailOffset(new java.io.ByteArrayInputStream(b), lines);
+                        out.write(b, from, b.length - from);
+                        tail = false;
+                        break;
+                    }
+                    continue;
+                }
                 next = l.copy(job, number, offset, out);
                 if (next >= 0) {
                     break;
@@ -1193,17 +1215,28 @@ public final class RunningBuilds {
             if (next < 0 || !isRunningElsewhere(job, number)) {
                 Run<?, ?> done = awaitRecord(job, number, 60);
                 if (done != null) {
-                    try (InputStream in = done.getLogInputStream()) {
-                        in.skipNBytes(Math.min(offset, done.getLogText().length()));
-                        in.transferTo(out);
-                    } catch (java.io.EOFException e) {
-                        // the record's log is shorter than what was shipped (e.g. a lost build's)
-                    }
+                    copyRecorded(done, offset, tail ? lines : -1, out);
                 }
                 out.flush();
                 return true;
             }
             Thread.sleep(1000);
+        }
+    }
+
+    /** Copies the log of a completed build from {@code offset}, or if {@code lines} is not negative its last lines. */
+    private static void copyRecorded(Run<?, ?> done, long offset, int lines, java.io.OutputStream out) throws IOException {
+        long from = offset;
+        if (lines >= 0) {
+            try (InputStream in = done.getLogInputStream()) {
+                from = hudson.cli.ConsoleCommand.tailOffset(in, lines);
+            }
+        }
+        try (InputStream in = done.getLogInputStream()) {
+            in.skipNBytes(Math.min(from, done.getLogText().length()));
+            in.transferTo(out);
+        } catch (java.io.EOFException e) {
+            // the record's log is shorter than what was shipped (e.g. a lost build's)
         }
     }
 

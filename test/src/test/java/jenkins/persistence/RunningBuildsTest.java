@@ -427,6 +427,28 @@ class RunningBuildsTest {
         }
     }
 
+    @Test
+    void theConsoleOfABuildElsewhereShowsItsLastLinesWhenAsked() throws Exception {
+        r.createFreeStyleProject("tailed");
+        other.write("jobs/tailed/running/1.xml", placeholder("other-controller", "jenkins-a", 1), PersistenceStore.ABSENT);
+        awaitApplied();
+        hudson.cli.CLICommandInvoker.Result result = new hudson.cli.CLICommandInvoker(r, "console")
+                .authorizedTo(jenkins.model.Jenkins.READ, hudson.model.Item.READ).invokeWithArgs("tailed", "1", "-n", "2");
+        assertThat(result, hudson.cli.CLICommandInvoker.Matcher.succeeded());
+        assertEquals("two\nthree\n", result.stdout());
+        other.delete("jobs/tailed/running/1.xml", PersistenceStore.ANY); // the store outlives this test
+    }
+
+    @TestExtension("theConsoleOfABuildElsewhereShowsItsLastLinesWhenAsked")
+    public static class ThreeLines implements RunningBuilds.RemoteLog {
+        @Override
+        public long copy(Job<?, ?> job, int number, long offset, java.io.OutputStream out) throws java.io.IOException {
+            byte[] log = "one\ntwo\nthree\n".getBytes(StandardCharsets.UTF_8);
+            out.write(log, (int) offset, log.length - (int) offset);
+            return log.length;
+        }
+    }
+
     @TestExtension("followingABuildElsewhereEndsWithTheRestOfItsRecord")
     public static class ShippedLog implements RunningBuilds.RemoteLog {
         static byte[] prefix;
