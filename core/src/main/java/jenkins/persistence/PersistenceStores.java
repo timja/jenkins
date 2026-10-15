@@ -738,6 +738,22 @@ public final class PersistenceStores {
     }
 
     /**
+     * Records that an object loaded from the store is in sync with it, unless that is known already (it was saved or
+     * reloaded since), so that a change then made to it in memory is recognised as unsaved. For objects loaded at startup.
+     */
+    @Restricted(NoExternalUse.class)
+    public static void loaded(@NonNull XmlFile file, @NonNull Object o) {
+        String key = keyFor(file.getPath());
+        if (key != null && !snapshots.containsKey(key)) {
+            try {
+                snapshots.putIfAbsent(key, serialise(file, o));
+            } catch (RuntimeException e) {
+                LOGGER.log(Level.FINE, e, () -> "Cannot take a snapshot of " + key);
+            }
+        }
+    }
+
+    /**
      * Whether an object has changed in memory since it was last saved or reloaded, so that a save of it is pending
      * (a setter changes a field, then saves). Reloading it now would lose that change, and the save would then write
      * the old value as of the new version; left alone, the save conflicts and is merged instead.
@@ -778,6 +794,7 @@ public final class PersistenceStores {
         versions.keySet().removeIf(k -> k.startsWith(prefix + "/"));
         elements.keySet().removeIf(k -> k.startsWith(prefix + "/"));
         bases.keySet().removeIf(k -> k.startsWith(prefix + "/"));
+        snapshots.keySet().removeIf(k -> k.startsWith(prefix + "/"));
     }
 
     /**
