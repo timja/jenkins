@@ -545,6 +545,8 @@ public final class RunningBuilds {
             invalidate(jobKeyOfRunning(runningKey));
             LOGGER.info(() -> "Reclaimed " + job.getFullName() + " #" + number + " from this controller's previous run (" + p.origin + ") with epoch " + epoch);
             reclaimed = true;
+            // e.g. a downstream build completed while this controller was down: its delivery's event was not received
+            pendingDeliveriesOf(jobKeyOfRunning(runningKey), number, 0);
             return true;
         } finally {
             if (!reclaimed) {
@@ -783,6 +785,8 @@ public final class RunningBuilds {
                     BuildRecords.completeLater(run);
                     continue;
                 }
+                // a delivery stored before it was registered was not taken as ours (it is not looked at again)
+                pendingDeliveriesOf(jobKeyOfRunning(runningKey(run.getParent())), run.getNumber(), 0);
                 LOGGER.info(() -> "Recorded " + run + " as running, after the store was back");
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.FINE, "Still cannot record " + run + " as running", e);
