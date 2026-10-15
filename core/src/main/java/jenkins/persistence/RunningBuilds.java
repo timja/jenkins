@@ -1078,6 +1078,20 @@ public final class RunningBuilds {
     }
 
     /** Deliveries stored for a build while nobody owned it (its owner died). */
+    /** {@link #pendingDeliveries} of a build adopted here, looking again later if the store cannot tell now. */
+    private static void pendingDeliveriesOf(String jobKey, int number, int attempt) {
+        try {
+            pendingDeliveries(jobKey, number);
+        } catch (IOException | RuntimeException e) {
+            if (attempt < STOP_ATTEMPTS) {
+                LOGGER.log(Level.WARNING, "Could not list what was delivered to " + jobKey + " #" + number + "; looking again later", e);
+                Timer.get().schedule(() -> pendingDeliveriesOf(jobKey, number, attempt + 1), Math.min(30, 1L << attempt), TimeUnit.SECONDS);
+            } else {
+                LOGGER.log(Level.WARNING, "Could not list what was delivered to " + jobKey + " #" + number, e);
+            }
+        }
+    }
+
     private static void pendingDeliveries(String jobKey, int number) throws IOException {
         for (String name : PersistenceStores.get().children(jobKey + "/" + PREFIX)) {
             if (name.startsWith(number + DELIVER_INFIX)) {
@@ -1475,7 +1489,7 @@ public final class RunningBuilds {
             // caller takes an exception for "not resumed", and releases the lease
             String jobKey = jobKeyOfRunning(runningKey(job));
             stopIfRequested(jobKey, number, 0);
-            pendingDeliveries(jobKey, number); // e.g. a downstream build completed while its owner was gone
+            pendingDeliveriesOf(jobKey, number, 0); // e.g. a downstream build completed while its owner was gone
             return Adoption.ADOPTED;
         }
         // its owner kept changing it: not as gone as it seemed; a later sweep looks again
