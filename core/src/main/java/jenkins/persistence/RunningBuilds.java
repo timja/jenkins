@@ -891,7 +891,9 @@ public final class RunningBuilds {
                     if (now != null && (leases == null || leases.holds(p.key, epoch))) {
                         LOGGER.info(() -> "Removing placeholder of " + job.getFullName() + " #" + p.number + " left by " + p.controller + " (" + p.origin + "), which is gone");
                         try {
-                            String completed = p.properties.get(RESULT);
+                            // its result as stored now: the placeholder listed may be older than its owner's last write
+                            Placeholder fresh = Placeholder.fromBytes(p.key, p.number, now.content(), now.version());
+                            String completed = (fresh != null ? fresh : p).properties.get(RESULT);
                             if (completed != null) {
                                 // it completed, but its owner was gone before publishing its record: publish it with its result
                                 BuildRecords.publishLost(job, p.number, p.startTime,
