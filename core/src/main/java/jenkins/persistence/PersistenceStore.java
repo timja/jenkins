@@ -138,6 +138,17 @@ public interface PersistenceStore {
     }
 
     /**
+     * Whether confidential keys are shared through this store, as {@code secrets/<id>}, so that every controller uses
+     * the same ones (see {@link jenkins.security.ConfidentialStore}): a key created at runtime is looked up there, and
+     * created there by the first controller to need it. They stay encrypted with the master key, which is never shared
+     * (each controller is seeded with the same one). They are read and written directly, never routed, so a store must
+     * not {@linkplain #owns own} those keys; and a store not meant to hold key material, even encrypted, does not opt in.
+     */
+    default boolean storesConfidentialKeys() {
+        return false;
+    }
+
+    /**
      * The {@linkplain #getOrigin origins} of the store instances (controllers) currently alive, including this one.
      * Used to clean up state left behind by a controller which died, such as {@linkplain RunningBuilds running build placeholders}.
      *

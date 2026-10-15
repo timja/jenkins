@@ -29,7 +29,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
+import hudson.Functions;
 import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -52,8 +54,14 @@ class SharedConfidentialKeysTest {
     /** The key whose first read finds it absent while another controller creates it, and that controller's value. */
     static volatile String racing;
     static volatile byte[] theirs;
+    static volatile boolean storesKeys = true;
 
     static final InMemoryPersistenceStore STORE = new InMemoryPersistenceStore(key -> false) {
+        @Override
+        public boolean storesConfidentialKeys() {
+            return storesKeys;
+        }
+
         @Override
         public Entry read(String key) {
             Entry e = super.read(key);
@@ -120,11 +128,9 @@ class SharedConfidentialKeysTest {
     }
 
     @Test
-    void onlyKeysAreShared(JenkinsRule r, @TempDir Path elsewhere) throws Exception {
+    void onlyKeysAreShared(JenkinsRule r) throws Exception {
         Files.writeString(localFile(r, "initialAdminPassword").toPath(), "letmein"); // plain text, as the setup wizard writes
         Files.createDirectories(localFile(r, "some.d").toPath());
-        Path target = Files.writeString(elsewhere.resolve("file"), "outside");
-        Files.createSymbolicLink(localFile(r, "linked").toPath(), target);
         new HexStringConfidentialKey("test.shared.k8", 32).get();
         STORE.delete("secrets/test.shared.k8", PersistenceStore.ANY);
 
@@ -132,8 +138,33 @@ class SharedConfidentialKeysTest {
 
         assertNull(STORE.read("secrets/initialAdminPassword"));
         assertNull(STORE.read("secrets/some.d"));
-        assertNull(STORE.read("secrets/linked"));
         assertNotNull(STORE.read("secrets/test.shared.k8"), "a key still is");
+    }
+
+    @Test
+    void linksAreNotShared(JenkinsRule r, @TempDir Path elsewhere) throws Exception {
+        assumeFalse(Functions.isWindows(), "symbolic links need a privilege on Windows");
+        Path target = Files.writeString(elsewhere.resolve("file"), "outside");
+        Files.createSymbolicLink(localFile(r, "linked").toPath(), target);
+
+        DefaultConfidentialStore.reconcile();
+
+        assertNull(STORE.read("secrets/linked"));
+    }
+
+    @Test
+    void aStoreNotOptingInGetsNoKeys(JenkinsRule r) throws Exception {
+        storesKeys = false;
+        try {
+            String mac = new HMACConfidentialKey("test.shared.k9").mac("x");
+            new HexStringConfidentialKey("test.shared.k10", 32).get();
+            DefaultConfidentialStore.reconcile();
+            assertNull(STORE.read("secrets/test.shared.k9"), "not created in the store");
+            assertNull(STORE.read("secrets/test.shared.k10"), "nor published by reconciling");
+            assertEquals(mac, new HMACConfidentialKey("test.shared.k9").mac("x"), "kept locally, as without a store");
+        } finally {
+            storesKeys = true;
+        }
     }
 
     @TestExtension

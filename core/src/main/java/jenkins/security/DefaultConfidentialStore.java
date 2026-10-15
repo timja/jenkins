@@ -156,7 +156,8 @@ public class DefaultConfidentialStore extends ConfidentialStore {
     }
 
     /**
-     * Shares keys created at runtime with other controllers using the same {@link PersistenceStore} (the master key must be
+     * Shares keys created at runtime with other controllers using the same {@link PersistenceStore}, when it
+     * {@linkplain PersistenceStore#storesConfidentialKeys stores confidential keys} (the master key must be
      * the same on all of them, e.g. seeded): a key not found locally is looked up in the store as {@code secrets/<id>},
      * and a new one is created there with a create-only write, so that the first controller to use a key decides its value
      * for all of them. Keys used before the store is available stay local, as before.
@@ -168,7 +169,7 @@ public class DefaultConfidentialStore extends ConfidentialStore {
             return local;
         }
         PersistenceStore store = PersistenceStores.get();
-        if (store == null) {
+        if (store == null || !store.storesConfidentialKeys()) {
             return super.loadOrCreate(key, generator);
         }
         String storeKey = SHARED_PREFIX + key.getId();
@@ -203,7 +204,7 @@ public class DefaultConfidentialStore extends ConfidentialStore {
     @Restricted(NoExternalUse.class)
     public static void reconcile() throws IOException {
         PersistenceStore store = PersistenceStores.get();
-        if (store == null || !(ConfidentialStore.get() instanceof DefaultConfidentialStore cs)) {
+        if (store == null || !store.storesConfidentialKeys() || !(ConfidentialStore.get() instanceof DefaultConfidentialStore cs)) {
             return;
         }
         File[] files = cs.rootDir.listFiles((d, n) -> !n.equals("master.key") && !n.endsWith(".tmp"));
