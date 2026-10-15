@@ -1822,6 +1822,13 @@ public class Queue extends ResourceController implements Saveable {
                 if (p.task instanceof FlyweightTask) {
                     Runnable r = makeFlyWeightTaskBuildable(new BuildableItem(p));
                     if (r != null) {
+                        // e.g. it entered the buildables to have a node provisioned, so the gate has not seen it yet
+                        CauseOfBlockage gated = QueueStartGate.check(p);
+                        if (gated != null) {
+                            LOGGER.log(Level.FINER, "{0} may not start here: {1}", new Object[] {p, gated});
+                            p.transientCausesOfBlockage = List.of(gated);
+                            continue;
+                        }
                         p.leave(this);
                         LOGGER.log(Level.FINEST, "Executing flyweight task {0}", taskDisplayName);
                         r.run();

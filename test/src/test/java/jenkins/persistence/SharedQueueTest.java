@@ -34,15 +34,22 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import hudson.model.AbstractProject;
 import hudson.model.Action;
+import hudson.model.Build;
 import hudson.model.Cause;
 import hudson.model.CauseAction;
 import hudson.model.FreeStyleBuild;
 import hudson.model.FreeStyleProject;
+import hudson.model.ItemGroup;
+import hudson.model.Label;
 import hudson.model.ParametersAction;
 import hudson.model.PasswordParameterValue;
+import hudson.model.Project;
 import hudson.model.Queue;
 import hudson.model.StringParameterValue;
+import hudson.model.TopLevelItem;
+import hudson.model.TopLevelItemDescriptor;
 import hudson.model.queue.QueueTaskFuture;
 import java.util.Calendar;
 import java.util.List;
@@ -385,6 +392,63 @@ class SharedQueueTest {
         assertEquals(2, local.getActions(ParametersAction.class).size());
         assertNull(local.getActions(ParametersAction.class).stream().map(pa -> pa.getParameter("gone")).filter(Objects::nonNull).findAny().orElse(null));
         other.cancel(rec.id()); // the store outlives this test
+    }
+
+    @Test
+    void flyweightWaitingForItsNodeStartsOnlyWhereClaimed() throws Exception {
+        long grace = SharedQueue.ORIGIN_GRACE_MILLIS;
+        SharedQueue.ORIGIN_GRACE_MILLIS = 60_000;
+        try {
+            FlyweightProject p = r.jenkins.createProject(FlyweightProject.class, "flyweight");
+            p.setAssignedLabel(Label.get("later"));
+            ClusterQueue.Record rec = publishElsewhere("flyweight", 0, "judy");
+            // no node has its label yet: it waits among the buildables for one to be provisioned
+            for (int i = 0; i < 100 && !(Queue.getInstance().getItem(rec.id()) instanceof Queue.BuildableItem); i++) {
+                Thread.sleep(100);
+            }
+            assertThat(Queue.getInstance().getItem(rec.id()), instanceOf(Queue.BuildableItem.class));
+            r.createOnlineSlave(Label.get("later"));
+            Thread.sleep(3_000);
+            assertNull(p.getLastBuild(), "left to the controller it was scheduled on, which has not let it go");
+            other.cancel(rec.id()); // the store outlives this test
+        } finally {
+            SharedQueue.ORIGIN_GRACE_MILLIS = grace;
+        }
+    }
+
+    /** A job run without an executor of its own, as Pipelines are. */
+    public static class FlyweightProject extends Project<FlyweightProject, FlyweightBuild> implements TopLevelItem, Queue.FlyweightTask {
+        public FlyweightProject(ItemGroup<?> parent, String name) {
+            super(parent, name);
+        }
+
+        @Override
+        protected Class<FlyweightBuild> getBuildClass() {
+            return FlyweightBuild.class;
+        }
+
+        @Override
+        public TopLevelItemDescriptor getDescriptor() {
+            return (TopLevelItemDescriptor) Jenkins.get().getDescriptorOrDie(FlyweightProject.class);
+        }
+
+        @TestExtension("flyweightWaitingForItsNodeStartsOnlyWhereClaimed")
+        public static class DescriptorImpl extends AbstractProject.AbstractProjectDescriptor {
+            @Override
+            public TopLevelItem newInstance(ItemGroup parent, String name) {
+                return new FlyweightProject(parent, name);
+            }
+        }
+    }
+
+    public static class FlyweightBuild extends Build<FlyweightProject, FlyweightBuild> {
+        public FlyweightBuild(FlyweightProject project) throws java.io.IOException {
+            super(project);
+        }
+
+        public FlyweightBuild(FlyweightProject project, java.io.File dir) throws java.io.IOException {
+            super(project, dir);
+        }
     }
 
     @TestExtension
