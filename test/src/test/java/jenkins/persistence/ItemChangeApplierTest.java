@@ -30,6 +30,7 @@ import static org.hamcrest.Matchers.sameInstance;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -331,6 +332,25 @@ class ItemChangeApplierTest {
         assertNotNull(again);
         assertEquals("made again here", again.getDescription());
         assertTrue(again.getRootDir().isDirectory());
+    }
+
+    @Test
+    void anItemDeletedAndMadeAgainElsewhereIsAnotherOne() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("remade");
+        r.buildAndAssertSuccess(p);
+        pauseApplier();
+        try {
+            other.delete("jobs/remade/config.xml", PersistenceStore.ANY);
+            other.write("jobs/remade/config.xml", project("made again elsewhere"), PersistenceStore.ABSENT);
+        } finally {
+            resumeApplier();
+        }
+        awaitApplied();
+        FreeStyleProject again = r.jenkins.getItemByFullName("remade", FreeStyleProject.class);
+        assertNotNull(again);
+        assertEquals("made again elsewhere", again.getDescription());
+        assertNotSame(p, again, "not the deleted job reloaded");
+        assertTrue(again.getBuilds().isEmpty(), "without the deleted job's builds");
     }
 
     @Test
