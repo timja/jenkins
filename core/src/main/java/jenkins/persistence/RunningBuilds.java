@@ -33,6 +33,7 @@ import hudson.model.AsyncPeriodicWork;
 import hudson.model.Executor;
 import hudson.model.Item;
 import hudson.model.Job;
+import hudson.model.Queue;
 import hudson.model.Result;
 import hudson.model.Run;
 import hudson.model.TaskListener;
@@ -318,9 +319,47 @@ public final class RunningBuilds {
      */
     @NonNull
     public static List<Placeholder> elsewhere(@NonNull Job<?, ?> job) {
+        return elsewhere(job, all(job));
+    }
+
+    /** Jobs whose placeholders are being loaded for {@link #elsewhereCached}, by job key. */
+    private static final Set<String> loading = ConcurrentHashMap.newKeySet();
+
+    /**
+     * {@link #elsewhere}, without asking the store, for callers under the queue lock: from what is cached, or null if
+     * nothing is. The job's placeholders are then loaded off the lock, and the queue looked at again.
+     */
+    @CheckForNull
+    static List<Placeholder> elsewhereCached(@NonNull Job<?, ?> job) {
+        String runningKey = runningKey(job);
+        if (PersistenceStores.get() == null || runningKey == null) {
+            return List.of();
+        }
+        String jobKey = jobKeyOfRunning(runningKey);
+        List<Placeholder> cached = cache.get(jobKey);
+        if (cached != null) {
+            return elsewhere(job, cached);
+        }
+        if (loading.add(jobKey)) {
+            Timer.get().submit(() -> {
+                try {
+                    all(job);
+                } finally {
+                    loading.remove(jobKey);
+                }
+                if (cache.containsKey(jobKey)) { // else not loaded (the store is unreachable): asked again at the next maintenance
+                    Queue.getInstance().scheduleMaintenance();
+                }
+            });
+        }
+        return null;
+    }
+
+    @NonNull
+    private static List<Placeholder> elsewhere(@NonNull Job<?, ?> job, @NonNull List<Placeholder> all) {
         PersistenceStore store = PersistenceStores.get();
         List<Placeholder> result = new ArrayList<>();
-        for (Placeholder p : all(job)) {
+        for (Placeholder p : all) {
             if (store != null && p.origin.equals(store.getOrigin())) {
                 continue; // running here, so a real build
             }
