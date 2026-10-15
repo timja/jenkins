@@ -130,6 +130,25 @@ class StoredPermalinksTest {
         assertEquals("", stored("deleted"), "not brought back");
     }
 
+    @Test
+    void aTargetCompletedElsewhereButNotPublishedYetIsKept() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("completing");
+        r.buildAndAssertSuccess(p);
+        // #2 completed on another controller, which set the permalink; its record is not published yet (its log is
+        // closed, its snapshot uploaded), and its placeholder is still there
+        PersistenceStore other = STORE.as("other-controller");
+        other.write("jobs/completing/running/2.xml", "origin=other-controller\ncontroller=c\ndisplayName=#2\nstartTime=1700000000000\n"
+                .getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+        other.write("jobs/completing/builds/permalinks", "lastSuccessfulBuild 2\n".getBytes(StandardCharsets.UTF_8),
+                STORE.read("jobs/completing/builds/permalinks").version());
+        awaitApplied();
+        // this controller cannot load #2 yet, so resolves the permalink to #1
+        PeepholePermalink.Cache cache = hudson.ExtensionList.lookupFirst(PeepholePermalink.Cache.class);
+        cache.put(p, "lastSuccessfulBuild", new PeepholePermalink.Cache.Some(1));
+        assertThat("not moved back", stored("completing"), containsString("lastSuccessfulBuild 2"));
+        other.delete("jobs/completing/running/2.xml", PersistenceStore.ANY);
+    }
+
     @TestExtension
     public static class Provider implements PersistenceStoreProvider {
         @Override

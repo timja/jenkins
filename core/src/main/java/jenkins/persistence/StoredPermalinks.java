@@ -105,7 +105,7 @@ public final class StoredPermalinks implements PeepholePermalink.Cache {
                     return;
                 }
                 if (current instanceof Some(int n) && (target instanceof None || target instanceof Some(int m) && m < n)
-                        && store.read(builds + "/" + n + "/" + BuildRecords.RECORD) != null) {
+                        && exists(store, builds, n)) {
                     // this controller has not seen #n yet (or a deletion moved the target back without us): keep it
                     LOGGER.fine(() -> "Keeping " + id + " of " + job + " at #" + n + " (not " + target + ")");
                     caches.put(builds, stored);
@@ -147,6 +147,19 @@ public final class StoredPermalinks implements PeepholePermalink.Cache {
     }
 
     private static final int MAX_RETRIES = 10;
+
+    /**
+     * Whether a build is stored: its record, or until that is published its running placeholder. The controller
+     * completing a build sets permalinks to it before it publishes the record (which takes a while: the log is closed,
+     * the snapshot uploaded), and the placeholder goes only once the record is there.
+     */
+    private static boolean exists(@NonNull PersistenceStore store, @NonNull String builds, int n) throws IOException {
+        if (store.read(builds + "/" + n + "/" + BuildRecords.RECORD) != null) {
+            return true;
+        }
+        String job = builds.substring(0, builds.length() - "builds".length());
+        return store.read(job + RunningBuilds.PREFIX + "/" + n + ".xml") != null;
+    }
 
     /**
      * Whether the job was deleted: it is no longer in its parent here, or its configuration is no longer stored. A
