@@ -299,6 +299,9 @@ public final class ItemChangeApplier {
             return;
         }
         if (!e.key().startsWith("jobs/")) {
+            if (e.version() <= PersistenceStores.lastSeen(e.key())) {
+                return; // deleted before what this controller has: saved here since (a deletion it then overwrote), say
+            }
             PersistenceStores.seen(e.key(), PersistenceStore.ABSENT);
             if (StaticStateApplier.apply(e.key(), true)) {
                 applied.incrementAndGet();
