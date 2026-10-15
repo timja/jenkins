@@ -117,15 +117,32 @@ public final class ItemFiles {
             @Override
             public FileVisitResult visitFile(Path f, BasicFileAttributes attrs) throws IOException {
                 String rel = root.relativize(f).toString().replace(File.separatorChar, '/');
-                String key = itemKey + "/" + rel;
-                if (attrs.isRegularFile() && attrs.size() <= MAX_SIZE && !rel.equals(MANIFEST) && !rel.endsWith(".tmp")
-                        && !store.owns(key) && !PersistenceStores.declaredLocal(key)) {
+                if (attrs.isRegularFile() && attrs.size() <= MAX_SIZE && shared(rel, itemKey, store)) {
                     files.put(rel, sha256(f));
                 }
                 return FileVisitResult.CONTINUE;
             }
         });
         return files;
+    }
+
+    /**
+     * Whether a file of an item's directory, by its path relative to it, is one shared this way: what {@link #scan}
+     * shares, and all that {@link #take} writes, whatever a manifest names.
+     */
+    static boolean shared(@NonNull String rel, @NonNull String itemKey, @NonNull PersistenceStore store) {
+        String[] segments = rel.split("/");
+        for (String segment : segments) {
+            if (segment.isEmpty() || segment.equals(".") || segment.equals("..") || segment.indexOf('\\') >= 0) {
+                return false;
+            }
+        }
+        if (segments.length > 1 && (SKIPPED.contains(segments[0]) || segments[0].startsWith("workspace"))) {
+            return false;
+        }
+        String key = itemKey + "/" + rel;
+        return !rel.equals(MANIFEST) && !rel.endsWith(".tmp") && !store.owns(key) && !PersistenceStores.declaredLocal(key)
+                && !PersistenceStores.isKeptLocal(key);
     }
 
     /** Shares what changed in one item's directory since it was last shared or taken here. */
@@ -206,8 +223,11 @@ public final class ItemFiles {
             boolean unchangedHere = here == null ? !last.containsKey(f.getKey()) : here.equals(last.get(f.getKey()));
             if (!f.getValue().equals(here) && unchangedHere) {
                 Path target = dir.toPath().resolve(f.getKey()).normalize();
-                if (!target.startsWith(dir.toPath())) {
-                    continue; // never outside the item's directory
+                if (!target.startsWith(dir.toPath()) || !shared(f.getKey(), itemKey, store) || throughLink(dir.toPath(), target)) {
+                    // never outside the item's directory, nor a file that is not shared this way (its configuration, a
+                    // build's), nor through a link
+                    LOGGER.warning(() -> "Not taking " + f.getKey() + " of " + itemKey + ": not a file shared this way");
+                    continue;
                 }
                 Files.createDirectories(target.getParent());
                 Path tmp = Files.createTempFile(target.getParent(), ".item-file", ".tmp");
@@ -231,6 +251,16 @@ public final class ItemFiles {
             }
         }
         known.put(itemKey, synced);
+    }
+
+    /** Whether a directory between an item's directory and a file in it is a link (or something else than a directory). */
+    private static boolean throughLink(Path root, Path target) {
+        for (Path d = target.getParent(); d != null && !d.equals(root); d = d.getParent()) {
+            if (Files.isSymbolicLink(d) || Files.exists(d, java.nio.file.LinkOption.NOFOLLOW_LINKS) && !Files.isDirectory(d, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static Map<String, String> parse(@CheckForNull PersistenceStore.Entry e) {

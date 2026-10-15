@@ -36,6 +36,7 @@ import java.nio.file.Path;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.TestExtension;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
@@ -117,6 +118,52 @@ class ItemFilesTest {
         ItemFiles.forgetForTests();
         ItemFiles.changedElsewhere(key);
         assertEquals(7, Files.size(avatar));
+    }
+
+    private static String sha256(byte[] content) throws Exception {
+        return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(content));
+    }
+
+    private static String manifest(String key) {
+        PersistenceStore.Entry e = STORE.read(key);
+        return e == null ? null : new String(e.content(), StandardCharsets.UTF_8);
+    }
+
+    @PerController
+    public static final class Counts {}
+
+    @Test
+    void onlyFilesSharedThisWayAreSharedOrTaken(JenkinsRule r, @TempDir Path elsewhere) throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("q");
+        Path root = p.getRootDir().toPath();
+        PersistenceStores.declare(root.resolve("stats.xml").toFile(), new Counts());
+        Files.writeString(root.resolve("stats.xml"), "<counts/>");
+        Files.writeString(root.resolve("shared.txt"), "s");
+        ItemFiles.publish(p);
+        assertTrue(manifest("jobs/q/item-files.json").contains("shared.txt"));
+        assertFalse(manifest("jobs/q/item-files.json").contains("stats.xml"), "kept per controller");
+
+        // a manifest naming files not shared this way is not taken for them
+        byte[] other = "from elsewhere".getBytes(StandardCharsets.UTF_8);
+        String sha = sha256(other);
+        BLOBS.put("jobs/q/item-files/" + sha, new java.io.ByteArrayInputStream(other), other.length);
+        boolean links = !hudson.Functions.isWindows();
+        if (links) {
+            Files.createSymbolicLink(root.resolve("linked"), elsewhere);
+        }
+        net.sf.json.JSONObject m = new net.sf.json.JSONObject();
+        for (String path : java.util.List.of("ok.txt", "config.xml", "builds/1/build.xml", "../escaped.txt", "stats.xml", "linked/x.txt")) {
+            m.put(path, sha);
+        }
+        STORE.write("jobs/q/item-files.json", m.toString().getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        ItemFiles.take(p);
+        assertEquals("from elsewhere", Files.readString(root.resolve("ok.txt")), "a file shared this way is taken");
+        assertFalse(Files.exists(root.resolve("config.xml")) && Files.readString(root.resolve("config.xml")).equals("from elsewhere"),
+                "not its configuration");
+        assertFalse(Files.exists(root.resolve("builds/1/build.xml")), "nor a build's");
+        assertFalse(Files.exists(root.resolve("../escaped.txt")));
+        assertEquals("<counts/>", Files.readString(root.resolve("stats.xml")), "nor a file kept per controller");
+        assertFalse(Files.exists(elsewhere.resolve("x.txt")), "nor through a link");
     }
 
     @TestExtension
