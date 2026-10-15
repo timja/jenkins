@@ -394,10 +394,13 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
                 File newRoot = this.getRootDir();
 
                 boolean success = false;
+                boolean storeMoved = false;
 
                 try { // rename data files
                     // stored state first: fails if something else already exists at the new name
+                    // (this item's saves wait on its monitor until it is renamed; its children's, in a folder, do not)
                     PersistenceStores.move(oldRoot, newRoot);
+                    storeMoved = true;
 
                     boolean interrupted = false;
                     boolean renamed = false;
@@ -453,6 +456,15 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
                     }
 
                     success = true;
+                } catch (IOException | RuntimeException | Error e) {
+                    if (storeMoved) {
+                        try {
+                            PersistenceStores.move(newRoot, oldRoot); // put the stored entries back with the old name
+                        } catch (IOException | RuntimeException x) {
+                            e.addSuppressed(x);
+                        }
+                    }
+                    throw e;
                 } finally {
                     // if failed, back out the rename.
                     if (!success)

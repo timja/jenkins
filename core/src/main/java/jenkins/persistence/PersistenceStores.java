@@ -250,12 +250,19 @@ public final class PersistenceStores {
         if (fromKey == null || toKey == null || fromKey.equals(toKey)) {
             return;
         }
+        if (toKey.startsWith(fromKey + "/") || fromKey.startsWith(toKey + "/")) {
+            // the entries would be moved below themselves (or over what holds them), and could not be moved back
+            throw new IllegalArgumentException("Cannot move " + fromKey + " to " + toKey);
+        }
         List<PersistenceStore.Moved> moved = store.move(fromKey, toKey);
         // the moved entries have new versions: take them as seen where this JVM had seen the entry as it was moved, so
         // that the moved item's next save is still checked for conflicts; where it had seen an older version (changed
         // elsewhere since), keep that older one, so that the next save conflicts and merges as it would have unmoved
         for (PersistenceStore.Moved m : moved) {
-            Long last = versions.remove(m.from());
+            Long last = versions.get(m.from());
+            // nothing is at the old key now: a write made there from an object loaded before (a save resolving the old
+            // name) conflicts with something created there elsewhere since, rather than replacing it
+            seen(m.from(), PersistenceStore.ABSENT);
             if (last != null) {
                 seen(m.to(), last == m.fromVersion() ? m.version() : last);
             }
