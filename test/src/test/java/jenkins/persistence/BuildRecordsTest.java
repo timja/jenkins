@@ -57,6 +57,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
@@ -100,10 +101,20 @@ class BuildRecordsTest {
             }
             return e;
         }
+
+        @Override
+        public long write(String key, byte[] content, long expectedVersion) throws ConflictException {
+            Consumer<String> hook = beforeWrite;
+            if (hook != null) {
+                hook.accept(key);
+            }
+            return super.write(key, content, expectedVersion);
+        }
     };
     static volatile Consumer<String> afterRead;
     /** Origins the store reports as alive; null means membership is not tracked. */
     static volatile Set<String> live;
+    static volatile Consumer<String> beforeWrite;
     static final InMemoryBlobStore BLOBS = new InMemoryBlobStore() {
         @Override
         public void move(String fromPrefix, String toPrefix) {
@@ -308,6 +319,52 @@ class BuildRecordsTest {
         BuildRecords.publish(b);
         assertNull(record("jobs/discarded/builds/1/build.xml"), "not brought back by a late publication");
         assertThat(BLOBS.keys(), org.hamcrest.Matchers.not(org.hamcrest.Matchers.hasItem("jobs/discarded/builds/1/files.tgz")));
+    }
+
+    @Test
+    void buildDeletedWhileItsRecordIsWrittenAgainStaysDeleted() throws Exception {
+        FreeStyleProject p = project(r, "saved");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p);
+        String key = "jobs/saved/builds/1/build.xml";
+        File local = new File(b.getRootDir(), "build.xml");
+        AtomicInteger writes = new AtomicInteger();
+        beforeWrite = k -> {
+            if (k.equals(key)) {
+                try {
+                    if (writes.incrementAndGet() == 1) {
+                        // saved here while being published: the record is written again, with the change
+                        Files.writeString(local.toPath(), Files.readString(local.toPath()) + "<!-- saved -->");
+                    } else {
+                        // and the build is discarded just before that second write
+                        beforeWrite = null;
+                        BuildRecords.delete(b);
+                    }
+                } catch (IOException x) {
+                    throw new UncheckedIOException(x);
+                }
+            }
+        };
+        try {
+            BuildRecords.publish(b);
+        } finally {
+            beforeWrite = null;
+        }
+        assertEquals(2, writes.get(), "written again");
+        assertNull(record(key), "not brought back by the second write");
+        assertThat(BLOBS.keys(), org.hamcrest.Matchers.not(org.hamcrest.Matchers.hasItem("jobs/saved/builds/1/files.tgz")));
+    }
+
+    @Test
+    void aBuildOfAJobMadeAgainUnderTheNameOfOneWhoseBuildWasDeletedIsPublished() throws Exception {
+        FreeStyleProject p = project(r, "reused");
+        r.buildAndAssertSuccess(p);
+        p.getBuildByNumber(1).delete();
+        p.renameTo("moved"); // takes its next build number along
+        FreeStyleProject again = project(r, "reused");
+        FreeStyleBuild b = r.buildAndAssertSuccess(again);
+        assertEquals(1, b.getNumber(), "the deleted build's number again");
+        assertNotNull(record("jobs/reused/builds/1/build.xml"), "published: not the build deleted");
+        assertThat(BLOBS.keys(), hasItem("jobs/reused/builds/1/files.tgz"));
     }
 
     @Test
