@@ -92,6 +92,41 @@ class LocalStateTest {
     }
 
     @Test
+    void aCopyBeingRefreshedIsNotWrittenBack(JenkinsRule r) throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("refreshed");
+        String key = "jobs/refreshed/config.xml";
+        PersistenceStore other = STORE.as("other-controller");
+        List<String> writtenHere = new java.util.concurrent.CopyOnWriteArrayList<>();
+        AutoCloseable subscription = STORE.subscribe(e -> {
+            if (e.key().equals(key) && e.origin().equals(STORE.getOrigin())) {
+                writtenHere.add(e.toString());
+            }
+        });
+        java.util.concurrent.atomic.AtomicBoolean done = new java.util.concurrent.atomic.AtomicBoolean();
+        Thread writeBack = new Thread(() -> {
+            while (!done.get()) {
+                hudson.model.AsyncPeriodicWork.all().get(MaterializedFiles.WriteBack.class).execute(hudson.model.TaskListener.NULL);
+            }
+        });
+        writeBack.start();
+        try {
+            long end = System.currentTimeMillis() + 2000;
+            for (int i = 0; System.currentTimeMillis() < end; i++) {
+                // changed elsewhere, then the copy refreshed here: nothing is changed here, so nothing is written back
+                String description = String.valueOf((char) ('a' + i % 3)).repeat(100_000);
+                other.write(key, ("<?xml version='1.1' encoding='UTF-8'?><project><description>" + description + "</description></project>")
+                        .getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+                p.getConfigFile().getFile();
+            }
+        } finally {
+            done.set(true);
+            writeBack.join();
+            subscription.close();
+        }
+        assertEquals(List.of(), writtenHere);
+    }
+
+    @Test
     void declaredFilesStayLocal(JenkinsRule r) throws Exception {
         assertTrue(PersistenceStores.declaredLocal("queue.xml"), "core's own");
         assertTrue(PersistenceStores.declaredLocal("jenkins.install.InstallUtil.lastExecVersion"));
