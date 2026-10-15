@@ -71,6 +71,12 @@ public class InMemoryPersistenceStore implements PersistenceStore {
     private final Map<String, String> leaseOwners;
     private final Map<Long, ClusterQueue.Record> queueRecords;
     private final List<Consumer<ClusterQueue.Record>> queueListeners;
+    /** Queue changes made but not yet delivered, in the order they were made: added to under the data lock. */
+    private final Queue<ClusterQueue.Record> queueOutbox;
+    /** Held while delivering queue changes, as {@link #delivering} is for the others. */
+    private final Object deliveringQueue;
+    /** The thread delivering queue changes, guarded by {@link #deliveringQueue}. */
+    private Thread drainingQueue;
     /** Versions come from one counter, so a key that is deleted and recreated never repeats a version. */
     private long clock;
 
@@ -89,6 +95,8 @@ public class InMemoryPersistenceStore implements PersistenceStore {
         this.leaseOwners = new TreeMap<>();
         this.queueRecords = new TreeMap<>();
         this.queueListeners = new CopyOnWriteArrayList<>();
+        this.queueOutbox = new ArrayDeque<>();
+        this.deliveringQueue = new Object();
     }
 
     private InMemoryPersistenceStore(InMemoryPersistenceStore root, String origin) {
@@ -103,6 +111,8 @@ public class InMemoryPersistenceStore implements PersistenceStore {
         this.leaseOwners = root.leaseOwners;
         this.queueRecords = root.queueRecords;
         this.queueListeners = root.queueListeners;
+        this.queueOutbox = root.queueOutbox;
+        this.deliveringQueue = root.deliveringQueue;
     }
 
     /**
@@ -159,16 +169,41 @@ public class InMemoryPersistenceStore implements PersistenceStore {
         }
     }
 
+    /** Delivers the queue changes made so far in the order they were made, as {@link ClusterQueue#subscribe} promises. */
+    private void deliverQueue() {
+        synchronized (deliveringQueue) {
+            if (root.drainingQueue == Thread.currentThread()) {
+                return; // a listener made a change: the loop below delivers it once every listener had the current one
+            }
+            root.drainingQueue = Thread.currentThread();
+            try {
+                while (true) {
+                    ClusterQueue.Record r;
+                    synchronized (root) {
+                        r = queueOutbox.poll();
+                    }
+                    if (r == null) {
+                        return;
+                    }
+                    for (Consumer<ClusterQueue.Record> l : queueListeners) {
+                        l.accept(r);
+                    }
+                }
+            } finally {
+                root.drainingQueue = null;
+            }
+        }
+    }
+
     /**
      * A shared queue held in memory, for tests. Not returned by {@link #queue} unless a subclass does so.
      */
     @NonNull
     public ClusterQueue clusterQueue() {
         return new ClusterQueue() {
+            /** Under the data lock: queues a change for delivery, in commit order, once the lock is released. */
             private void fire(Record r) {
-                for (Consumer<Record> l : queueListeners) {
-                    l.accept(r);
-                }
+                queueOutbox.add(r);
             }
 
             private Record with(Record r, State state, String claimedBy, int buildNumber, String actions, long dueAt) {
@@ -198,8 +233,9 @@ public class InMemoryPersistenceStore implements PersistenceStore {
                     }
                     stored = item;
                     queueRecords.put(item.id(), item);
+                    fire(stored);
                 }
-                fire(stored);
+                deliverQueue();
                 return stored;
             }
 
@@ -216,8 +252,9 @@ public class InMemoryPersistenceStore implements PersistenceStore {
                         return;
                     }
                     queueRecords.put(id, next);
+                    fire(next);
                 }
-                fire(next);
+                deliverQueue();
             }
 
             @Override
@@ -233,8 +270,9 @@ public class InMemoryPersistenceStore implements PersistenceStore {
                         return true;
                     }
                     queueRecords.put(id, next);
+                    fire(next);
                 }
-                fire(next);
+                deliverQueue();
                 return true;
             }
 
@@ -248,8 +286,9 @@ public class InMemoryPersistenceStore implements PersistenceStore {
                     }
                     next = with(r, State.CLAIMED, origin, 0, r.actions(), r.dueAt());
                     queueRecords.put(id, next);
+                    fire(next);
                 }
-                fire(next);
+                deliverQueue();
                 return true;
             }
 
@@ -263,8 +302,9 @@ public class InMemoryPersistenceStore implements PersistenceStore {
                     }
                     next = with(r, State.STARTED, origin, buildNumber, r.actions(), r.dueAt());
                     queueRecords.put(id, next);
+                    fire(next);
                 }
-                fire(next);
+                deliverQueue();
             }
 
             @Override
@@ -277,8 +317,9 @@ public class InMemoryPersistenceStore implements PersistenceStore {
                     }
                     next = with(r, State.CANCELLED, null, 0, r.actions(), r.dueAt());
                     queueRecords.put(id, next);
+                    fire(next);
                 }
-                fire(next);
+                deliverQueue();
                 return true;
             }
 
