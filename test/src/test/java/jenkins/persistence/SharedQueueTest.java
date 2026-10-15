@@ -77,9 +77,15 @@ class SharedQueueTest {
             key -> key.startsWith("jobs/") && (key.endsWith("/config.xml") || key.endsWith("/nextBuildNumber")) && !key.contains("/builds/")) {
         @Override
         public ClusterQueue queue() {
-            return slowFor(clusterQueue());
+            return noQueue ? null : slowFor(clusterQueue());
         }
     };
+
+    /** While set, the store has no queue (each controller has its own). */
+    static volatile boolean noQueue;
+
+    /** Ids taken one at a time, as when the pool of ids taken ahead ran dry. */
+    static final java.util.concurrent.atomic.AtomicInteger singleIds = new java.util.concurrent.atomic.AtomicInteger();
 
     /** While set, publishing an item of a job named "slow…" waits for it: a store answering slowly. */
     static volatile java.util.concurrent.CountDownLatch slowPublish;
@@ -91,7 +97,13 @@ class SharedQueueTest {
         return new ClusterQueue() {
             @Override
             public long nextId() throws java.io.IOException {
+                singleIds.incrementAndGet();
                 return cq.nextId();
+            }
+
+            @Override
+            public long[] nextIds(int n) throws java.io.IOException {
+                return cq.nextIds(n);
             }
 
             @Override
@@ -614,6 +626,42 @@ class SharedQueueTest {
         @Override
         public void foldIntoExisting(Queue.Item item, Queue.Task owner, List<Action> otherActions) {
             item.addAction(this);
+        }
+    }
+
+    @Test
+    void aBurstOfItemsTakesItsIdsFromThoseTakenAhead() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("burst");
+        Thread.sleep(1_000); // ids are taken ahead at startup, off the queue lock
+        singleIds.set(0);
+        for (int i = 0; i < 30; i++) {
+            p.scheduleBuild2(60, new KeptApart("burst-" + i));
+        }
+        assertEquals(30, Queue.getInstance().getItems().length);
+        assertEquals(0, singleIds.get(), "no id was taken from the store with the queue lock held");
+        Queue.getInstance().clear();
+    }
+
+    @Test
+    void anotherIdStrategyIsUsedWithoutASharedQueue() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("unshared");
+        noQueue = true;
+        try {
+            p.scheduleBuild2(60);
+            assertEquals(1_000_001, Queue.getInstance().getItems()[0].getId(), "as if the shared queue's strategy were not there");
+            Queue.getInstance().clear();
+        } finally {
+            noQueue = false;
+        }
+    }
+
+    @TestExtension("anotherIdStrategyIsUsedWithoutASharedQueue")
+    public static class OtherIds extends jenkins.model.queue.QueueIdStrategy {
+        private long next = 1_000_000;
+
+        @Override
+        public synchronized long generateIdFor(Queue.Task project, List<Action> actions) {
+            return ++next;
         }
     }
 

@@ -69,6 +69,20 @@ public interface ClusterQueue {
     long nextId() throws IOException;
 
     /**
+     * New unique ids, taken ahead of need (those never used are skipped numbers); stores should take them in one call.
+     *
+     * @param n how many, at least one
+     */
+    @NonNull
+    default long[] nextIds(int n) throws IOException {
+        long[] ids = new long[n];
+        for (int i = 0; i < n; i++) {
+            ids[i] = nextId();
+        }
+        return ids;
+    }
+
+    /**
      * Adds an item, unless an item with the same dedup key is waiting already.
      *
      * @return the stored record: the new one, or the existing one this item should fold into

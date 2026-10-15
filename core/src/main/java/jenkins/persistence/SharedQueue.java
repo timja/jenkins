@@ -265,6 +265,7 @@ public final class SharedQueue {
      * The queue lock is held while items are scheduled and while the queue is maintained (QueueStartGate), so nothing
      * here talks to the store with it held: a slow store would stop the whole queue. Publishing goes through an outbox,
      * the gate decides from the records this controller knows (fed by the mirror), and claims are made off the lock.
+     * One exception: a new item's id, when the pool of ids taken ahead ran dry (see Ids.nextId).
      */
 
     /** The records of items in this controller's queue, as last read or delivered. */
@@ -624,22 +625,47 @@ public final class SharedQueue {
                     LOGGER.log(Level.WARNING, "Cannot get a cluster-wide queue id; using a local one", e);
                 }
             }
-            return LOCAL.generateIdFor(project, actions);
+            return withoutSharedQueue().generateIdFor(project, actions);
+        }
+
+        /** The strategy used when there is no shared queue: whichever would have been used without this one. */
+        private QueueIdStrategy withoutSharedQueue() {
+            for (QueueIdStrategy other : hudson.ExtensionList.lookup(QueueIdStrategy.class)) {
+                if (other != this) {
+                    return other;
+                }
+            }
+            return LOCAL;
         }
 
         /** Ids taken from the cluster sequence ahead of need, off the queue lock (unused ones are skipped numbers). */
-        private static final BlockingQueue<Long> spare = new LinkedBlockingQueue<>();
-        private static final int SPARE = 16;
+        private record Pool(PersistenceStore store, BlockingQueue<Long> ids) {}
+
+        private static volatile Pool pool;
+        private static final int SPARE = 64;
         private static final java.util.concurrent.atomic.AtomicBoolean filling = new java.util.concurrent.atomic.AtomicBoolean();
 
-        /** An id from the pool (refilled in the background), or from the store if the pool ran dry. */
-        private static long nextId(ClusterQueue cq) throws IOException {
-            Long id = spare.poll();
-            if (spare.size() < SPARE / 2 && filling.compareAndSet(false, true)) {
+        private static Pool pool() {
+            PersistenceStore store = PersistenceStores.get();
+            Pool p = pool;
+            if (p == null || p.store() != store) {
+                p = new Pool(store, new LinkedBlockingQueue<>()); // ids of another store's sequence are no use
+                pool = p;
+            }
+            return p;
+        }
+
+        /** Off the lock: tops the pool up, with ids taken in one store call; at startup, and once it is half used. */
+        static void fill(ClusterQueue cq) {
+            Pool p = pool();
+            if (p.ids().size() < SPARE / 2 && filling.compareAndSet(false, true)) {
                 claims.submit(() -> {
                     try {
-                        while (spare.size() < SPARE) {
-                            spare.add(cq.nextId());
+                        int n = SPARE - p.ids().size();
+                        if (n > 0) {
+                            for (long id : cq.nextIds(n)) {
+                                p.ids().add(id);
+                            }
                         }
                     } catch (IOException | RuntimeException e) {
                         LOGGER.log(Level.FINE, "Cannot take queue ids ahead", e);
@@ -648,17 +674,29 @@ public final class SharedQueue {
                     }
                 });
             }
-            return id != null ? id : cq.nextId();
+        }
+
+        /** An id from the pool (refilled in the background), or from the store if the pool ran dry. */
+        private static long nextId(ClusterQueue cq) throws IOException {
+            Long id = pool().ids().poll();
+            fill(cq);
+            if (id != null) {
+                return id;
+            }
+            // the pool ran dry (a burst of items larger than it, before it was refilled): the one store call made under
+            // the queue lock, as an exception (an id is needed now, and one from a local range would leave the item
+            // unshared)
+            return cq.nextId();
         }
 
         @Override
         public void persist(@NonNull Queue.State queueState) {
-            LOCAL.persist(queueState);
+            (queue() != null ? LOCAL : withoutSharedQueue()).persist(queueState);
         }
 
         @Override
         public void load(@NonNull Queue.State queueState) {
-            LOCAL.load(queueState);
+            (queue() != null ? LOCAL : withoutSharedQueue()).load(queueState);
         }
     }
 
@@ -693,6 +731,7 @@ public final class SharedQueue {
                 instance.changes.add(r);
             }
             instance.worker.start();
+            Ids.fill(cq); // so that the first items do not wait for the store with the queue lock held
         }
 
         @Terminator
