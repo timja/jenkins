@@ -471,12 +471,18 @@ public class Nodes implements PersistenceRoot {
                     if (onlyHere) {
                         PersistenceStores.keepLocal(key, true);
                     }
-                    Node n = load(subdir, newNodes);
-                    if (onlyHere && !(n instanceof AbstractCloudSlave)) {
-                        PersistenceStores.keepLocal(key, false); // a permanent node: shared from its next save
+                    Node n = null;
+                    try {
+                        n = load(subdir, newNodes);
+                    } finally {
+                        if (onlyHere && !(n instanceof AbstractCloudSlave)) {
+                            // a permanent node, or nothing loadable (e.g. an empty directory left behind): shared from its next save
+                            PersistenceStores.keepLocal(key, false);
+                        }
                     }
-                    if (n != null && !local && launchedElsewhere(n, subdir)) {
-                        newNodes.remove(n.getNodeName()); // only in the store: another controller's cloud agent
+                    if (n != null && launchedElsewhere(n, subdir)) {
+                        // from the store, even with a directory here: another controller's cloud agent
+                        newNodes.remove(n.getNodeName());
                     }
                 } catch (IOException e) {
                     LOGGER.log(Level.WARNING, "could not load " + subdir, e);
