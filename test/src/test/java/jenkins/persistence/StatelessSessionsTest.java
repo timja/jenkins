@@ -31,6 +31,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import hudson.model.User;
 import hudson.security.HudsonPrivateSecurityRealm;
 import hudson.security.TokenBasedRememberMeServices2;
+import hudson.util.Protector;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
+import java.util.Base64;
+import javax.crypto.Cipher;
+import jenkins.security.CryptoConfidentialKey;
 import org.htmlunit.html.HtmlForm;
 import org.htmlunit.http.Cookie;
 import org.junit.jupiter.api.Test;
@@ -45,15 +51,20 @@ import org.springframework.security.web.authentication.rememberme.AbstractRememb
 @WithJenkins
 class StatelessSessionsTest {
 
-    static final InMemoryPersistenceStore STORE = new InMemoryPersistenceStore(key -> false);
+    static final InMemoryPersistenceStore STORE = new InMemoryPersistenceStore(key -> false) {
+        @Override
+        public boolean storesConfidentialKeys() {
+            return true;
+        }
+    };
 
     @Test
     void loginAlwaysIssuesTheSignedCookie(JenkinsRule r) throws Exception {
         boolean old = TokenBasedRememberMeServices2.ALWAYS_REMEMBER;
-        TokenBasedRememberMeServices2.ALWAYS_REMEMBER = true;
         try {
             HudsonPrivateSecurityRealm realm = new HudsonPrivateSecurityRealm(false, false, null);
-            r.jenkins.setSecurityRealm(realm); // components are created with the setting
+            r.jenkins.setSecurityRealm(realm);
+            TokenBasedRememberMeServices2.ALWAYS_REMEMBER = true; // set from the script console, after the realm
             realm.createAccount("alice", "alice-password-1");
             JenkinsRule.WebClient wc = r.createWebClient().login("alice", "alice-password-1"); // without "Keep me signed in"
             Cookie remember = wc.getCookieManager().getCookie(AbstractRememberMeServices.SPRING_SECURITY_REMEMBER_ME_COOKIE_KEY);
@@ -89,6 +100,18 @@ class StatelessSessionsTest {
         r.submit(form);
         assertEquals(hash, User.getById("bob", false).getProperty(HudsonPrivateSecurityRealm.Details.class).getPassword(), "kept the existing password");
         r.createWebClient().login("bob", "bob-password-1"); // still works
+    }
+
+    @Test
+    void protectedValuesUseAKeyEveryControllerHas(JenkinsRule r) throws Exception {
+        String protectedValue = Protector.protect("a value");
+        assertEquals("a value", Protector.unprotect(protectedValue));
+        assertNotNull(STORE.read("secrets/hudson.util.Protector.shared"), "the key is shared with the other controllers");
+        // as another controller, whose JVM has a key of its own, reads it: with the shared key
+        byte[] value = Base64.getDecoder().decode(protectedValue);
+        Cipher cipher = new CryptoConfidentialKey(Protector.class, "shared").decrypt(Arrays.copyOfRange(value, 0, 16));
+        String plain = new String(cipher.doFinal(Arrays.copyOfRange(value, 16, value.length)), StandardCharsets.UTF_8);
+        assertTrue(plain.startsWith("a value"), plain);
     }
 
     @TestExtension
