@@ -193,6 +193,65 @@ public final class PersistenceStores {
         return conflicts.get();
     }
 
+    /** Files being created afresh, by key (see {@link #creating}). */
+    private static final Map<String, Creation> creations = new ConcurrentHashMap<>();
+
+    /**
+     * Starts creating a file afresh, such as the configuration of a new item.
+     * Until the creation is closed, the first write of the file expects it to be absent from the store, and throws a
+     * {@link ConflictException} if it is not, whatever the conflict policy: something stored under that name by another
+     * controller, or not loaded by this one, is not replaced.
+     *
+     * @return the creation, to close once done; null if the file is not served by the store
+     */
+    @CheckForNull
+    @Restricted(NoExternalUse.class)
+    public static Creation creating(@NonNull File file) {
+        Route route = route(file);
+        if (route == null) {
+            return null;
+        }
+        Creation creation = new Creation(route);
+        creations.put(route.key(), creation);
+        return creation;
+    }
+
+    /**
+     * A file being created afresh (see {@link #creating}).
+     */
+    @Restricted(NoExternalUse.class)
+    public static final class Creation implements AutoCloseable {
+        private final Route route;
+        /** The version this creation last wrote, or {@link PersistenceStore#ABSENT} while it wrote nothing. */
+        private volatile long written = PersistenceStore.ABSENT;
+
+        private Creation(Route route) {
+            this.route = route;
+        }
+
+        /**
+         * Deletes what this creation wrote, if anything, as of the version it wrote: never something it did not write,
+         * nor a change made to it elsewhere since.
+         */
+        public void undo() throws IOException {
+            long version = written;
+            if (version == PersistenceStore.ABSENT) {
+                return;
+            }
+            try {
+                route.store().delete(route.key(), version);
+                seen(route.key(), PersistenceStore.ABSENT);
+            } catch (ConflictException e) {
+                LOGGER.log(Level.WARNING, e.getMessage() + "; not deleting what was changed elsewhere since");
+            }
+        }
+
+        @Override
+        public void close() {
+            creations.remove(route.key(), this);
+        }
+    }
+
     @Restricted(NoExternalUse.class)
     public static void setForTesting(@CheckForNull PersistenceStore store) {
         testingStore = store;
@@ -217,17 +276,22 @@ public final class PersistenceStores {
         }
 
         public long write(@NonNull byte[] content) throws IOException {
-            long expected = lastSeen(key);
+            Creation creation = creations.get(key);
+            boolean createOnly = creation != null && creation.written == PersistenceStore.ABSENT;
+            long expected = createOnly ? PersistenceStore.ABSENT : lastSeen(key);
             long version;
             try {
                 version = store.write(key, content, expected);
             } catch (ConflictException e) {
                 conflicts.incrementAndGet();
-                if ("fail".equals(CONFLICTS)) {
+                if (createOnly || "fail".equals(CONFLICTS)) {
                     throw e;
                 }
                 LOGGER.log(Level.WARNING, e.getMessage() + "; overwriting (last writer wins)");
                 version = store.write(key, content, PersistenceStore.ANY);
+            }
+            if (creation != null) {
+                creation.written = version;
             }
             seen(key, version);
             return version;
@@ -244,7 +308,9 @@ public final class PersistenceStores {
                 LOGGER.log(Level.WARNING, e.getMessage() + "; deleting anyway");
                 store.delete(key, PersistenceStore.ANY);
             }
-            versions.remove(key);
+            // absent is a version: a write made from an object loaded before (a late save, a new item of that name)
+            // then conflicts with the key having been created again elsewhere meanwhile, rather than replacing it
+            seen(key, PersistenceStore.ABSENT);
         }
     }
 }

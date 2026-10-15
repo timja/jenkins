@@ -46,6 +46,8 @@ import javax.xml.transform.TransformerException;
 import javax.xml.transform.stream.StreamResult;
 import javax.xml.transform.stream.StreamSource;
 import jenkins.model.Jenkins;
+import jenkins.persistence.ConflictException;
+import jenkins.persistence.PersistenceStores;
 import jenkins.security.ExtendedReadRedaction;
 import jenkins.util.xml.XMLUtils;
 import org.kohsuke.stapler.StaplerRequest;
@@ -281,12 +283,18 @@ public abstract class ItemGroupMixIn {
         // place it as config.xml
         final File dir = getRootDirFor(name);
         final XmlFile configXml = Items.getConfigFile(dir);
+        // in a persistence store, an item of that name this controller has not loaded is not replaced
+        final PersistenceStores.Creation creation = PersistenceStores.creating(new File(dir, "config.xml"));
         boolean success = false;
         try {
             Util.createDirectories(dir.toPath());
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
             XMLUtils.safeTransform(new StreamSource(xml), new StreamResult(buf));
-            configXml.writeRaw(buf.toByteArray());
+            try {
+                configXml.writeRaw(buf.toByteArray());
+            } catch (ConflictException e) {
+                throw alreadyExists(name);
+            }
 
             // load it
             TopLevelItem result = Items.callWhileUpdatingByXml(() -> (TopLevelItem) Items.load(parent, dir));
@@ -317,12 +325,23 @@ public abstract class ItemGroupMixIn {
             success = false;
             throw e;
         } finally {
+            if (creation != null) {
+                creation.close();
+            }
             if (!success) {
                 // if anything fails, delete the config file to avoid further confusion
-                configXml.delete();
+                // (in a persistence store, only what was written here)
+                if (creation != null) {
+                    creation.undo();
+                }
                 Util.deleteRecursive(dir);
             }
         }
+    }
+
+    /** Something of that name is stored, by another controller sharing the persistence store or not loaded here. */
+    private static Failure alreadyExists(String name) {
+        return new Failure(Messages.Hudson_JobAlreadyExists(name));
     }
 
     @NonNull
@@ -338,7 +357,11 @@ public abstract class ItemGroupMixIn {
 
         TopLevelItem item = type.newInstance(parent, name);
         item.onCreatedFromScratch();
-        item.save();
+        try (PersistenceStores.Creation creation = PersistenceStores.creating(new File(item.getRootDir(), "config.xml"))) {
+            item.save();
+        } catch (ConflictException e) {
+            throw alreadyExists(name);
+        }
         add(item);
         Jenkins.get().rebuildDependencyGraphAsync();
 

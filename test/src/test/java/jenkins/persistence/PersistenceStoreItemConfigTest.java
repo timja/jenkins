@@ -29,6 +29,7 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.not;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -36,6 +37,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import hudson.model.Failure;
 import hudson.model.FreeStyleProject;
 import hudson.model.Items;
 import java.io.ByteArrayInputStream;
@@ -160,6 +162,45 @@ class PersistenceStoreItemConfigTest {
         STORE.write(key, "<project/>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
         PersistenceStores.CONFLICTS = "fail";
         assertThrows(ConflictException.class, () -> route.write("<project><description>here</description></project>".getBytes(StandardCharsets.UTF_8)));
+    }
+
+    @Test
+    void creatingAnItemDoesNotReplaceOneStoredElsewhere() throws Exception {
+        // stored by another controller, not (yet) loaded here: create-only, whatever the conflict policy
+        String key = "jobs/taken/config.xml";
+        byte[] theirs = "<project><description>elsewhere</description></project>".getBytes(StandardCharsets.UTF_8);
+        STORE.write(key, theirs, PersistenceStore.ANY);
+        assertThrows(Failure.class, () -> r.jenkins.createProject(FreeStyleProject.class, "taken"));
+        assertArrayEquals(theirs, STORE.read(key).content());
+        String xml = "<?xml version='1.1' encoding='UTF-8'?><project><description>mine</description></project>";
+        assertThrows(Failure.class, () -> r.jenkins.createProjectFromXML("taken", new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8))));
+        assertArrayEquals(theirs, STORE.read(key).content());
+        assertNull(r.jenkins.getItem("taken"));
+    }
+
+    @Test
+    void failedCreationFromXmlDeletesOnlyWhatItWrote() throws Exception {
+        String key = "jobs/taken2/config.xml";
+        byte[] theirs = "<project><description>elsewhere</description></project>".getBytes(StandardCharsets.UTF_8);
+        STORE.write(key, theirs, PersistenceStore.ANY);
+        assertThrows(IOException.class, () -> r.jenkins.createProjectFromXML("taken2", new ByteArrayInputStream("<project".getBytes(StandardCharsets.UTF_8))));
+        assertArrayEquals(theirs, STORE.read(key).content());
+        // what a failed creation wrote itself is deleted (the type is not an item)
+        String bad = "<?xml version='1.1' encoding='UTF-8'?><hudson.model.Failure/>";
+        assertThrows(Exception.class, () -> r.jenkins.createProjectFromXML("broken", new ByteArrayInputStream(bad.getBytes(StandardCharsets.UTF_8))));
+        assertThat(STORE.versions(), not(hasKey("jobs/broken/config.xml")));
+    }
+
+    @Test
+    void recreatedElsewhereAfterDeletingIsAConflict() throws Exception {
+        String key = "jobs/gone/config.xml";
+        PersistenceStores.Route route = PersistenceStores.route(PersistenceStores.fileFor(key));
+        route.write("<project/>".getBytes(StandardCharsets.UTF_8));
+        route.delete();
+        // another controller creates it again; a late save from the object loaded before must not replace that
+        STORE.write(key, "<project><description>elsewhere</description></project>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        PersistenceStores.CONFLICTS = "fail";
+        assertThrows(ConflictException.class, () -> route.write("<project><description>late</description></project>".getBytes(StandardCharsets.UTF_8)));
     }
 
     @Test
