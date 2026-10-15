@@ -38,6 +38,9 @@ import hudson.model.listeners.ItemListener;
 import hudson.security.ACL;
 import hudson.security.ACLContext;
 import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -47,6 +50,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.stream.Stream;
 import jenkins.model.DirectlyModifiableTopLevelItemGroup;
 import jenkins.model.Jenkins;
 import jenkins.persistence.PersistenceStore.ChangeEvent;
@@ -89,7 +93,9 @@ public final class ItemChangeApplier {
         });
     }
 
-    @Initializer(after = InitMilestone.EXTENSIONS_AUGMENTED, before = InitMilestone.JOB_LOADED)
+    // before global configuration is loaded, which item loading (requiring SYSTEM_CONFIG_ADAPTED) follows: an item read
+    // before subscribing could miss a change made in between, never delivered and newer than what was read
+    @Initializer(after = InitMilestone.EXTENSIONS_AUGMENTED, before = InitMilestone.SYSTEM_CONFIG_LOADED)
     public static synchronized void subscribe() {
         stop();
         PersistenceStore store = PersistenceStores.get();
@@ -133,6 +139,11 @@ public final class ItemChangeApplier {
             a = instance;
         }
         return a == null ? 0 : a.applied.get();
+    }
+
+    /** Whether this controller listens to changes made elsewhere, for tests. */
+    static synchronized boolean isSubscribed() {
+        return instance != null;
     }
 
     /**
@@ -189,6 +200,9 @@ public final class ItemChangeApplier {
         String fullName = String.join("/", names);
         Item item = jenkins.getItemByFullName(fullName);
         if (item instanceof AbstractItem existing) {
+            if (!existing.getConfigFile().exists()) {
+                return; // moved or deleted since; that change follows, and reloads it at its new name if moved
+            }
             LOGGER.fine(() -> "Reloading " + fullName + " changed elsewhere");
             // under the item's lock, as AbstractItem.save is: a save while the object is half reloaded would write a mix
             // of the two versions, as of the version just read, so nobody would notice (lost trigger, ET11 scenario 3)
@@ -207,13 +221,19 @@ public final class ItemChangeApplier {
             return;
         }
         File dir = PersistenceStores.fileFor(e.key()).getParentFile();
+        if (!Items.getConfigFile(dir).exists()) {
+            return; // moved or deleted since; that change follows
+        }
         Util.createDirectories(dir.toPath());
         LOGGER.fine(() -> "Loading " + fullName + " created elsewhere");
         if (parent == jenkins) {
             jenkins.putItem((TopLevelItem) Items.load(jenkins, dir));
         } else if (parent instanceof AbstractItem folder) {
-            // reloading the folder loads children which so far exist only in the store
-            folder.load();
+            // reloading the folder loads children which so far exist only in the store; under its lock, as items are
+            // reloaded above, so that a save of the folder meanwhile does not store a mix of the two versions
+            synchronized (folder) {
+                folder.load();
+            }
             Item created = jenkins.getItemByFullName(fullName);
             if (created == null) {
                 LOGGER.warning(() -> "Reloaded " + folder.getFullName() + " but " + fullName + " did not appear");
@@ -235,8 +255,8 @@ public final class ItemChangeApplier {
 
     private void deleted(ChangeEvent e) throws Exception {
         List<String> names = itemPath(e.key());
-        if (names == null) {
-            return;
+        if (names == null || e.version() <= PersistenceStores.lastSeen(e.key())) {
+            return; // not an item, or deleted before what this controller has: an item it made again since, say
         }
         PersistenceStores.seen(e.key(), PersistenceStore.ABSENT);
         Item item = jenkins.getItemByFullName(String.join("/", names));
@@ -253,21 +273,63 @@ public final class ItemChangeApplier {
         if (to == null || from == null) {
             return;
         }
-        Item item = jenkins.getItemByFullName(String.join("/", from));
-        if (!(item instanceof AbstractItem existing)) {
-            return; // e.g. moved along with an ancestor already
+        if (PersistenceStores.lastSeen(e.oldKey()) < e.version()) {
+            // nothing is stored at the old name now (unless made there since: kept), also for children moved along
+            PersistenceStores.seen(e.oldKey(), PersistenceStore.ABSENT);
         }
-        LOGGER.fine(() -> "Moving " + existing.getFullName() + " to " + String.join("/", to) + " as done elsewhere");
-        if (from.subList(0, from.size() - 1).equals(to.subList(0, to.size() - 1))) {
-            Items.renameToMatchStore(existing, to.get(to.size() - 1));
-        } else if (parentOf(to) instanceof DirectlyModifiableTopLevelItemGroup destination) {
-            move(existing, destination);
-        } else {
-            LOGGER.warning(() -> "Cannot move " + existing.getFullName() + " to " + String.join("/", to));
+        Item item = jenkins.getItemByFullName(String.join("/", from));
+        if (item instanceof AbstractItem existing) {
+            LOGGER.fine(() -> "Moving " + existing.getFullName() + " to " + String.join("/", to) + " as done elsewhere");
+            ItemGroup<?> destination = parentOf(to);
+            if (destination != null && destination.getItem(to.get(to.size() - 1)) instanceof AbstractItem placeholder && placeholder != existing) {
+                dropPlaceholder(destination, placeholder);
+            }
+            if (from.subList(0, from.size() - 1).equals(to.subList(0, to.size() - 1))) {
+                Items.renameToMatchStore(existing, to.get(to.size() - 1));
+            } else if (destination instanceof DirectlyModifiableTopLevelItemGroup d) {
+                move(existing, d);
+            } else {
+                LOGGER.warning(() -> "Cannot move " + existing.getFullName() + " to " + String.join("/", to));
+                return;
+            }
+            applied.incrementAndGet();
+        }
+        // else moved along with an ancestor already, or never loaded here
+        // whatever is at the new name now is reloaded (or loaded) from the store, recording the version read: a change
+        // made just before the move was not applied to the old name, and a child moved along has its version recorded
+        written(new ChangeEvent(ChangeEvent.Kind.WRITTEN, e.key(), null, e.version(), e.origin()));
+    }
+
+    /**
+     * Takes out of its parent an item loaded at the destination of a move from the store before the move was applied
+     * (with a folder created elsewhere just before), so that the item being moved, with its builds, takes its place.
+     * Nothing is deleted from the store: that is the moved item's configuration.
+     */
+    private void dropPlaceholder(ItemGroup<?> parent, AbstractItem placeholder) throws Exception {
+        if (!(parent instanceof DirectlyModifiableTopLevelItemGroup group) || !(placeholder instanceof TopLevelItem item)) {
             return;
         }
-        PersistenceStores.seen(e.key(), e.version());
-        applied.incrementAndGet();
+        LOGGER.fine(() -> "Dropping " + placeholder.getFullName() + ", loaded before the move that brings it here was applied");
+        group.remove(item);
+        File dir = placeholder.getRootDir();
+        if (onlyWhatLoadingMakes(dir)) {
+            Util.deleteRecursive(dir);
+        } else {
+            File aside = new File(dir.getParentFile(), dir.getName() + ".aside-" + System.currentTimeMillis());
+            LOGGER.warning(() -> "Moving " + dir + " aside to " + aside + ": an item moved here elsewhere takes its place");
+            Files.move(dir.toPath(), aside.toPath());
+        }
+    }
+
+    /** Whether a directory holds no files but those loading an item may have made. */
+    private static boolean onlyWhatLoadingMakes(File dir) throws IOException {
+        if (!dir.isDirectory()) {
+            return true;
+        }
+        try (Stream<Path> files = Files.walk(dir.toPath())) {
+            return files.filter(Files::isRegularFile).map(f -> f.getFileName().toString())
+                    .allMatch(n -> n.equals("config.xml") || n.equals("nextBuildNumber") || n.equals("legacyIds") || n.equals("permalinks"));
+        }
     }
 
     @SuppressWarnings("unchecked")

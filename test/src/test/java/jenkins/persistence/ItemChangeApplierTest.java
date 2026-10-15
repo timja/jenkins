@@ -31,12 +31,23 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import hudson.XmlFile;
+import hudson.init.InitMilestone;
+import hudson.init.Initializer;
 import hudson.model.FreeStyleProject;
+import hudson.model.Item;
 import hudson.model.Items;
+import hudson.model.Saveable;
+import hudson.model.listeners.ItemListener;
+import hudson.model.listeners.SaveableListener;
 import java.io.File;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -158,6 +169,206 @@ class ItemChangeApplierTest {
         awaitApplied();
         assertNull(r.jenkins.getItem("traveller"));
         assertNotNull(r.jenkins.getItemByFullName("dest/traveller"));
+    }
+
+    /** While set, the applier waits for it when it applies a change to item "pause". */
+    static volatile CountDownLatch paused;
+    static volatile CountDownLatch pausing;
+
+    /** Holds the applier up: changes made elsewhere meanwhile queue up until {@link #resumeApplier}. */
+    private void pauseApplier() throws Exception {
+        if (r.jenkins.getItem("pause") == null) {
+            r.createFreeStyleProject("pause");
+        }
+        paused = new CountDownLatch(1);
+        pausing = new CountDownLatch(1);
+        other.write("jobs/pause/config.xml", project("pause " + System.nanoTime()), PersistenceStore.ANY);
+        assertTrue(pausing.await(30, TimeUnit.SECONDS));
+    }
+
+    private static void resumeApplier() {
+        CountDownLatch l = paused;
+        paused = null;
+        l.countDown();
+    }
+
+    @TestExtension
+    public static class Pause extends ItemListener {
+        @Override
+        public void onUpdated(Item item) {
+            CountDownLatch l = paused;
+            if (l != null && item.getName().equals("pause")) {
+                pausing.countDown();
+                try {
+                    l.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+    }
+
+    @Test
+    void aDeletionOlderThanTheItemMadeHereSinceIsNotApplied() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("again");
+        pauseApplier();
+        try {
+            other.delete("jobs/again/config.xml", PersistenceStore.ANY);
+            p.delete();
+            r.createFreeStyleProject("again").setDescription("made again here");
+        } finally {
+            resumeApplier();
+        }
+        awaitApplied();
+        FreeStyleProject again = r.jenkins.getItemByFullName("again", FreeStyleProject.class);
+        assertNotNull(again);
+        assertEquals("made again here", again.getDescription());
+        assertTrue(again.getRootDir().isDirectory());
+    }
+
+    @Test
+    void aChildOfAFolderRenamedElsewhereIsStillCheckedForConflicts() throws Exception {
+        MockFolder f = r.createFolder("rf");
+        FreeStyleProject c = f.createProject(FreeStyleProject.class, "c");
+        other.move("jobs/rf", "jobs/rf2");
+        awaitApplied();
+        assertThat(r.jenkins.getItemByFullName("rf2/c"), sameInstance(c));
+        pauseApplier();
+        PersistenceStores.CONFLICTS = "fail";
+        try {
+            other.write("jobs/rf2/jobs/c/config.xml", project("changed elsewhere"), PersistenceStore.ANY);
+            assertThrows(ConflictException.class, () -> c.setDescription("here"));
+        } finally {
+            PersistenceStores.CONFLICTS = "warn";
+            resumeApplier();
+        }
+    }
+
+    @Test
+    void aChangeMadeElsewhereJustBeforeARenameIsApplied() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("edited");
+        pauseApplier();
+        try {
+            other.write("jobs/edited/config.xml", project("edited elsewhere"), PersistenceStore.ANY);
+            other.move("jobs/edited", "jobs/edited-renamed");
+        } finally {
+            resumeApplier();
+        }
+        awaitApplied();
+        assertThat(r.jenkins.getItem("edited-renamed"), sameInstance(p));
+        assertEquals("edited elsewhere", p.getDescription());
+    }
+
+    @Test
+    void anItemCreatedAndRenamedElsewhereAppears() throws Exception {
+        pauseApplier();
+        try {
+            other.write("jobs/born/config.xml", project("born elsewhere"), PersistenceStore.ABSENT);
+            other.move("jobs/born", "jobs/born-renamed");
+        } finally {
+            resumeApplier();
+        }
+        awaitApplied();
+        assertNull(r.jenkins.getItem("born"));
+        assertEquals("born elsewhere", r.jenkins.getItemByFullName("born-renamed", FreeStyleProject.class).getDescription());
+    }
+
+    @Test
+    void aJobMovedIntoAFolderJustCreatedElsewhereKeepsItsIdentityAndBuilds() throws Exception {
+        byte[] folderXml = Items.getConfigFile(r.createFolder("template2")).readRawBytes();
+        FreeStyleProject j = r.createFreeStyleProject("j");
+        r.buildAndAssertSuccess(j);
+        pauseApplier();
+        try {
+            other.write("jobs/newf/config.xml", folderXml, PersistenceStore.ABSENT);
+            other.move("jobs/j", "jobs/newf/jobs/j");
+        } finally {
+            resumeApplier();
+        }
+        awaitApplied();
+        assertNull(r.jenkins.getItem("j"));
+        MockFolder newf = r.jenkins.getItemByFullName("newf", MockFolder.class);
+        assertEquals(1, newf.getItems().size());
+        assertThat(newf.getItem("j"), sameInstance(j));
+        assertNotNull(j.getLastBuild());
+    }
+
+    @Test
+    void theOldNameOfAnItemRenamedElsewhereIsFree() throws Exception {
+        r.createFreeStyleProject("vacated");
+        other.move("jobs/vacated", "jobs/vacated-renamed");
+        awaitApplied();
+        assertEquals(PersistenceStore.ABSENT, PersistenceStores.lastSeen("jobs/vacated/config.xml"));
+        PersistenceStores.CONFLICTS = "fail";
+        try {
+            r.createFreeStyleProject("vacated");
+        } finally {
+            PersistenceStores.CONFLICTS = "warn";
+        }
+    }
+
+    /** While set, saves of folder "lockf" wait for it once written. */
+    static volatile CountDownLatch saving;
+    static volatile CountDownLatch savingEntered;
+
+    @TestExtension("aFolderIsReloadedForAChildCreatedElsewhereOnlyBetweenItsSaves")
+    public static class BlockFolderSave extends SaveableListener {
+        @Override
+        public void onChange(Saveable o, XmlFile file) {
+            CountDownLatch l = saving;
+            if (l != null && o instanceof MockFolder f && f.getName().equals("lockf")) {
+                savingEntered.countDown();
+                try {
+                    l.await();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+    }
+
+    @Test
+    void aFolderIsReloadedForAChildCreatedElsewhereOnlyBetweenItsSaves() throws Exception {
+        MockFolder f = r.createFolder("lockf");
+        saving = new CountDownLatch(1);
+        savingEntered = new CountDownLatch(1);
+        Thread saver = new Thread(() -> {
+            try {
+                f.setDescription("saved here");
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        });
+        try {
+            saver.start();
+            assertTrue(savingEntered.await(30, TimeUnit.SECONDS));
+            other.write("jobs/lockf/jobs/c/config.xml", project("child"), PersistenceStore.ABSENT);
+            Thread.sleep(500);
+            assertNull(r.jenkins.getItemByFullName("lockf/c"), "the folder was reloaded during its save");
+        } finally {
+            CountDownLatch l = saving;
+            saving = null;
+            l.countDown();
+        }
+        saver.join();
+        awaitApplied();
+        assertNotNull(r.jenkins.getItemByFullName("lockf/c"));
+    }
+
+    @TestExtension("subscribesBeforeItemsAreLoaded")
+    public static class SubscribedCheck {
+        volatile Boolean subscribedBeforeGlobalConfiguration;
+
+        @Initializer(after = InitMilestone.SYSTEM_CONFIG_LOADED, before = InitMilestone.SYSTEM_CONFIG_ADAPTED)
+        public void check() {
+            subscribedBeforeGlobalConfiguration = ItemChangeApplier.isSubscribed();
+        }
+    }
+
+    @Test
+    void subscribesBeforeItemsAreLoaded() {
+        // item loading requires SYSTEM_CONFIG_ADAPTED
+        assertEquals(Boolean.TRUE, r.jenkins.getExtensionList(SubscribedCheck.class).getFirst().subscribedBeforeGlobalConfiguration);
     }
 
     @TestExtension
