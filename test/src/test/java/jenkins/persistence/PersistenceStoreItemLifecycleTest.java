@@ -132,6 +132,26 @@ class PersistenceStoreItemLifecycleTest {
     }
 
     @Test
+    void renameOfAnItemRenamedElsewhereFails() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("twice");
+        // another controller renamed it to "twice-a"; this one has not applied that yet
+        STORE.move("jobs/twice", "jobs/twice-a");
+        assertThrows(ConflictException.class, () -> p.renameTo("twice-b"));
+        assertEquals("twice", p.getName());
+        assertThat(STORE.versions(), hasKey("jobs/twice-a/config.xml"));
+        assertThat(STORE.versions(), not(hasKey("jobs/twice-b/config.xml")));
+        MockFolder f = r.createFolder("twice-f");
+        assertThrows(ConflictException.class, () -> Items.move(p, f));
+        assertThat(STORE.versions(), not(hasKey("jobs/twice-f/jobs/twice/config.xml")));
+        assertEquals(p, r.jenkins.getItem("twice"));
+        JenkinsRule.WebClient wc = r.createWebClient().withThrowExceptionOnFailingStatusCode(false);
+        WebResponse rsp = wc.getPage(wc.addCrumb(new WebRequest(new URL(r.getURL(), "job/twice/confirmRename?newName=twice-c"), HttpMethod.POST))).getWebResponse();
+        assertEquals(400, rsp.getStatusCode());
+        assertThat(rsp.getContentAsString(), containsString(hudson.model.Messages.AbstractItem_MovedElsewhere()));
+        assertThat(STORE.versions(), not(hasKey("jobs/twice-c/config.xml")));
+    }
+
+    @Test
     void renamedItemIsStillCheckedForConflicts() throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("checked-before");
         p.renameTo("checked-after");

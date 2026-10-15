@@ -71,6 +71,7 @@ import jenkins.model.Jenkins;
 import jenkins.model.Loadable;
 import jenkins.model.queue.ItemDeletion;
 import jenkins.persistence.ConflictException;
+import jenkins.persistence.PersistenceStore;
 import jenkins.persistence.PersistenceStores;
 import jenkins.security.ExtendedReadRedaction;
 import jenkins.security.XStreamNotDeserializable;
@@ -266,6 +267,10 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
         try {
             renameTo(newName);
         } catch (ConflictException e) {
+            if (e.getActualVersion() == PersistenceStore.ABSENT) {
+                // this item is gone from where it was stored (another controller sharing the store)
+                throw new Failure(Messages.AbstractItem_MovedElsewhere());
+            }
             // made elsewhere since the check above (another controller sharing the store)
             throw new Failure(Messages.AbstractItem_NewNameInUse(newName));
         }
