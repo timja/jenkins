@@ -32,6 +32,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import hudson.model.FreeStyleProject;
+import hudson.util.TextFile;
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
@@ -165,6 +166,19 @@ class StoredBuildNumberAssignerTest {
         FreeStyleProject q = r.createFreeStyleProject("new");
         assertEquals(1, q.assignBuildNumber());
         assertEquals("2", stored("jobs/new/nextBuildNumber"));
+    }
+
+    @Test
+    void storedNumberIsReadThroughEveryTextFileMethod() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("text");
+        STORE.as("other").write("jobs/text/nextBuildNumber", "1234\n".getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        File local = new File(p.getRootDir(), "nextBuildNumber");
+        TextFile f = new TextFile(local);
+        assertEquals("12", f.head(2));
+        assertEquals("1234\n", f.head(10));
+        assertEquals("4\n", f.fastTail(2, StandardCharsets.UTF_8));
+        assertEquals("1234\n", f.fastTail(10));
+        assertFalse(local.exists(), "not written locally");
     }
 
     @TestExtension
