@@ -92,6 +92,40 @@ class LocalStateTest {
     }
 
     @Test
+    void aChangeMadeElsewhereJustAfterAWriteBackIsNotWrittenOver(JenkinsRule r) throws Exception {
+        String key = "write-back-test.xml";
+        XmlFile xf = new XmlFile(new File(r.jenkins.getRootDir(), key));
+        xf.write("original");
+        File f = xf.getFile();
+        Files.writeString(f.toPath(), "<?xml version='1.1' encoding='UTF-8'?>\n<string>here</string>");
+        f.setLastModified(System.currentTimeMillis() + 2000);
+        PersistenceStore other = STORE.as("other-controller");
+        java.util.concurrent.atomic.AtomicBoolean armed = new java.util.concurrent.atomic.AtomicBoolean(true);
+        // another controller writes just after this one wrote the copy back
+        AutoCloseable subscription = STORE.subscribe(e -> {
+            if (e.key().equals(key) && e.origin().equals(STORE.getOrigin()) && armed.getAndSet(false)) {
+                try {
+                    other.write(key, "<?xml version='1.1' encoding='UTF-8'?>\n<string>elsewhere</string>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+                } catch (java.io.IOException x) {
+                    throw new AssertionError(x);
+                }
+            }
+        });
+        try {
+            // with the copy's lock, so that it is not refreshed from the change made elsewhere meanwhile
+            synchronized (MaterializedFiles.lockFor(key)) {
+                hudson.model.AsyncPeriodicWork.all().get(MaterializedFiles.WriteBack.class).execute(hudson.model.TaskListener.NULL);
+                assertFalse(armed.get());
+                assertThat(stored(key), containsString("elsewhere"));
+                hudson.model.AsyncPeriodicWork.all().get(MaterializedFiles.WriteBack.class).execute(hudson.model.TaskListener.NULL);
+            }
+        } finally {
+            subscription.close();
+        }
+        assertThat("not written over: the copy is what was written back, not what was stored after", stored(key), containsString("elsewhere"));
+    }
+
+    @Test
     void aCopyBeingRefreshedIsNotWrittenBack(JenkinsRule r) throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("refreshed");
         String key = "jobs/refreshed/config.xml";
