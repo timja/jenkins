@@ -1189,6 +1189,43 @@ class BuildLeasesTest {
         assertNull(text(key));
     }
 
+    @Test
+    void aDeliveryStoredBeforeItsBuildIsRegisteredReachesIt() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        FreeStyleProject p = blocking(r, "registered-late", started, release);
+        String key = "jobs/registered-late/running/1.xml";
+        failWrites = k -> k.equals(key); // not registered as it starts
+        QueueTaskFuture<FreeStyleBuild> f = p.scheduleBuild2(0);
+        assertTrue(started.await(60, TimeUnit.SECONDS));
+        failWrites = null;
+        // e.g. a downstream build completed on another controller meanwhile: not for this one, which does not own it yet
+        STORE.as("other-controller").write("jobs/registered-late/running/1.deliver-x", "done".getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+        awaitApplied();
+        Thread.sleep(1000);
+        assertEquals(List.of(), Deliveries.got);
+
+        RunningBuilds.registerPending();
+
+        for (int i = 0; i < 100 && Deliveries.got.isEmpty(); i++) {
+            Thread.sleep(100);
+        }
+        assertEquals(List.of("registered-late #1 x=done"), Deliveries.got);
+        release.countDown();
+        r.assertBuildStatusSuccess(f);
+    }
+
+    @TestExtension("aDeliveryStoredBeforeItsBuildIsRegisteredReachesIt")
+    public static class Deliveries implements RunningBuilds.Delivery {
+        static final List<String> got = new CopyOnWriteArrayList<>();
+
+        @Override
+        public boolean deliver(Run<?, ?> run, String id, String payload) {
+            got.add(run.getParent().getName() + " #" + run.getNumber() + " " + id + "=" + payload);
+            return true;
+        }
+    }
+
     @TestExtension
     public static class Adopter implements BuildAdopter {
         static final List<String> prepared = new CopyOnWriteArrayList<>();
