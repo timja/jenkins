@@ -44,6 +44,10 @@ public interface RemoteChangeHandler extends ExtensionPoint {
 
     /**
      * Brings this controller up to date.
+     * Changes are delivered at least once, so this may be called again for a change already applied, and must be
+     * idempotent. Reading the key through {@link hudson.XmlFile} (or another file {@link PersistenceStores#route}
+     * routes) records the version this controller holds: a repeated change is then skipped, and a later save here is
+     * checked against that version, so it conflicts with a change made meanwhile instead of overwriting it.
      *
      * @param deleted whether the key was deleted
      */

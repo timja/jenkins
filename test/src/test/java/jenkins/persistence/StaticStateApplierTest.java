@@ -26,6 +26,7 @@ package jenkins.persistence;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -40,7 +41,9 @@ import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import jenkins.model.GlobalConfiguration;
+import jenkins.model.JenkinsLocationConfiguration;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
@@ -92,6 +95,20 @@ class StaticStateApplierTest {
         assertEquals("set elsewhere", r.jenkins.getSystemMessage());
         assertEquals(5, r.jenkins.getNumExecutors());
         assertEquals(5, r.jenkins.toComputer().getNumExecutors(), "computers updated");
+
+        // a field cleared elsewhere has no element in the file: it is cleared here too, and stays so when saved here
+        writeElsewhere("config.xml", text("config.xml").replaceAll("<systemMessage>[^<]*</systemMessage>", ""));
+        assertNull(r.jenkins.getSystemMessage());
+        r.jenkins.save();
+        assertFalse(text("config.xml").contains("<systemMessage>"));
+    }
+
+    @Test
+    void agentPortChangedElsewhere() throws Exception {
+        writeElsewhere("config.xml", text("config.xml").replaceAll("<slaveAgentPort>[^<]*</slaveAgentPort>", "<slaveAgentPort>0</slaveAgentPort>"));
+        assertNotNull(r.jenkins.getTcpSlaveAgentListener(), "listening on a port chosen");
+        writeElsewhere("config.xml", text("config.xml").replaceAll("<slaveAgentPort>[^<]*</slaveAgentPort>", "<slaveAgentPort>-1</slaveAgentPort>"));
+        assertNull(r.jenkins.getTcpSlaveAgentListener(), "no longer listening");
     }
 
     @Test
@@ -101,6 +118,12 @@ class StaticStateApplierTest {
         demo.save();
         writeElsewhere("jenkins.persistence.StaticStateApplierTest$Demo.xml", text("jenkins.persistence.StaticStateApplierTest$Demo.xml").replace("here", "elsewhere"));
         assertEquals("elsewhere", demo.value);
+
+        JenkinsLocationConfiguration location = JenkinsLocationConfiguration.get();
+        location.setAdminAddress("admin@example.com");
+        String locationKey = JenkinsLocationConfiguration.class.getName() + ".xml";
+        writeElsewhere(locationKey, text(locationKey).replaceAll("<adminAddress>[^<]*</adminAddress>", ""));
+        assertNotEquals("admin@example.com", location.getAdminAddress(), "cleared elsewhere");
     }
 
     @Test
@@ -111,17 +134,56 @@ class StaticStateApplierTest {
         String aliceKey = STORE.children("users").stream().map(d -> "users/" + d + "/config.xml").findFirst().orElseThrow();
         writeElsewhere(aliceKey, text(aliceKey).replace("<fullName>Alice</fullName>", "<fullName>Alice Changed</fullName>"));
         assertEquals("Alice Changed", User.getById("alice", false).getFullName());
+        alice.setDescription("about Alice");
+        alice.save();
+        writeElsewhere(aliceKey, text(aliceKey).replaceAll("<description>[^<]*</description>", ""));
+        assertNull(alice.getDescription(), "cleared elsewhere");
 
         Method folder = User.class.getDeclaredMethod("getUserFolderNameFor", String.class);
         folder.setAccessible(true);
         String bobKey = "users/" + folder.invoke(null, "bob") + "/config.xml";
         writeElsewhere(bobKey, text(aliceKey).replace("<id>alice</id>", "<id>bob</id>").replace("Alice Changed", "Bob"));
         assertEquals("Bob", User.getById("bob", false).getFullName(), "created elsewhere");
+        assertNotNull(User.getById("bob", false).getUserFolder(), "has a folder here, as a user made here has");
 
         other.delete(aliceKey, PersistenceStore.ANY);
         awaitApplied();
         assertNull(User.getById("alice", false), "deleted elsewhere");
         assertFalse(new File(r.jenkins.getRootDir(), aliceKey).exists(), "and its local copy");
+    }
+
+    @Test
+    void aUserSavedHereAfterItsDeletionElsewhereIsKept() throws Exception {
+        User dave = User.getById("dave", true);
+        dave.save();
+        String daveKey = STORE.children("users").stream().filter(d -> d.startsWith("dave_")).map(d -> "users/" + d + "/config.xml").findFirst().orElseThrow();
+        other.write("blocker.xml", new byte[] {'x'}, PersistenceStore.ANY); // holds the applier until released
+        Blocker.holding.await();
+        other.delete(daveKey, PersistenceStore.ANY);
+        dave.setFullName("Dave Again");
+        dave.save(); // after the deletion elsewhere, which it overwrites (last writer wins)
+        Blocker.release.countDown();
+        awaitApplied();
+        assertNotNull(STORE.read(daveKey), "stored again");
+        assertEquals("Dave Again", User.getById("dave", false).getFullName(), "the deletion, older than the save, is not applied");
+        assertTrue(new File(r.jenkins.getRootDir(), daveKey).getParentFile().isDirectory());
+    }
+
+    @TestExtension("aUserSavedHereAfterItsDeletionElsewhereIsKept")
+    public static class Blocker implements RemoteChangeHandler {
+        static final CountDownLatch holding = new CountDownLatch(1);
+        static final CountDownLatch release = new CountDownLatch(1);
+
+        @Override
+        public boolean handles(String key) {
+            return key.equals("blocker.xml");
+        }
+
+        @Override
+        public void changed(String key, boolean deleted) throws Exception {
+            holding.countDown();
+            release.await();
+        }
     }
 
     @Test

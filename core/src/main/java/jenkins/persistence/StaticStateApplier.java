@@ -26,6 +26,7 @@ package jenkins.persistence;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.ExtensionList;
+import hudson.XmlFile;
 import hudson.model.Descriptor;
 import hudson.model.User;
 import java.util.logging.Logger;
@@ -86,7 +87,10 @@ final class StaticStateApplier {
             Descriptor<?> d = j.getDescriptor(r.group(1));
             if (d != null && !deleted) {
                 LOGGER.fine(() -> "Reloading " + r.group(1) + " changed elsewhere");
-                d.load();
+                synchronized (d) { // as Descriptor.load and save are
+                    PersistenceStores.clearRemovedFields(new XmlFile(PersistenceStores.fileFor(key)), d);
+                    d.load();
+                }
             }
             return true;
         }

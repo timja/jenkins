@@ -209,7 +209,8 @@ public interface PersistenceStore {
      * @param kind what happened
      * @param key the key changed; for {@link Kind#MOVED} the new key
      * @param oldKey for {@link Kind#MOVED} the previous key, else null
-     * @param version the version after the change
+     * @param version the version after the change; for {@link Kind#DELETED} too. A key's versions increase across its
+     *     deletion and re-creation, so that a subscriber can tell a change older than the version it last read or wrote
      * @param origin {@link #getOrigin} of the store instance which made the change
      */
     record ChangeEvent(@NonNull Kind kind, @NonNull String key, @CheckForNull String oldKey, long version, @NonNull String origin) {

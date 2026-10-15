@@ -1246,6 +1246,11 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
                 }
             }
         } else if (known != null) {
+            try {
+                PersistenceStores.clearRemovedFields(known.getConfigFile(), known); // a description cleared, say
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "Failed to read user " + dirName + ", changed elsewhere", e);
+            }
             known.load();
         } else {
             XmlFile xml = new XmlFile(XSTREAM, new File(new File(getUsersDirectory(), dirName), CONFIG_XML));
@@ -1254,6 +1259,7 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
                     User user = new User();
                     xml.unmarshal(user);
                     if (user.id != null && dirName.equals(getUserFolderNameFor(user.id))) {
+                        Util.createDirectories(new File(getUsersDirectory(), dirName).toPath()); // as at startup (scanAll)
                         user.fixUpAfterLoad();
                         AllUsers.put(user.id, user);
                     }
