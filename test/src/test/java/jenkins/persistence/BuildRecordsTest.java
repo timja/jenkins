@@ -475,6 +475,50 @@ class BuildRecordsTest {
     }
 
     @Test
+    void lateFilesDoNotBringBackABuildDeletedElsewhere() throws Exception {
+        FreeStyleProject p = project(r, "deleted-late");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p);
+        String key = "jobs/deleted-late/builds/1/build.xml";
+        // another controller deletes the build, and this one has not applied that yet (deleted as this controller, so
+        // that it is never applied here)
+        STORE.delete(key, PersistenceStore.ANY);
+        Files.writeString(new File(b.getRootDir(), "late.txt").toPath(), "added later");
+        hudson.model.AsyncPeriodicWork.all().get(BuildRecords.LateFiles.class).execute(hudson.model.TaskListener.NULL);
+        assertNull(record(key), "not brought back");
+        assertNull(BLOBS.get("jobs/deleted-late/builds/1/files.tgz"));
+    }
+
+    @Test
+    void aBuildClosedByTwoControllersAtOnceKeepsItsConsole() throws Exception {
+        FreeStyleProject p = project(r, "lost-twice");
+        r.buildAndAssertSuccess(p);
+        String key = "jobs/lost-twice/builds/2/build.xml";
+        long start = System.currentTimeMillis();
+        String reason = "It was running on a controller which is gone.";
+        // another controller closes it too, its record written once this one found none
+        afterRead = k -> {
+            if (k.equals(key)) {
+                afterRead = null;
+                try {
+                    BuildRecords.publishLost(p, 2, start, reason);
+                } catch (IOException e) {
+                    throw new AssertionError(e);
+                }
+            }
+        };
+        try {
+            BuildRecords.publishLost(p, 2, start, reason);
+        } finally {
+            afterRead = null;
+        }
+        assertNotNull(BLOBS.get("jobs/lost-twice/builds/2/lost.tgz"), "the stand-in of the record that stands is kept");
+        wipeAndReload(r);
+        FreeStyleBuild lost = r.jenkins.getItemByFullName("lost-twice", FreeStyleProject.class).getBuildByNumber(2);
+        assertEquals(hudson.model.Result.ABORTED, lost.getResult());
+        assertThat(lost.getLog(), containsString("a controller which is gone"));
+    }
+
+    @Test
     void renameMovesRecordsAndSnapshots() throws Exception {
         FreeStyleProject p = project(r, "before");
         r.buildAndAssertSuccess(p);
