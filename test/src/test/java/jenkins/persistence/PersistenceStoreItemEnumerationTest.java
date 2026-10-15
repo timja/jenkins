@@ -32,9 +32,12 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Util;
 import hudson.model.FreeStyleProject;
 import java.io.File;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -50,7 +53,18 @@ import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 class PersistenceStoreItemEnumerationTest {
 
     static final InMemoryPersistenceStore STORE = new InMemoryPersistenceStore(
-            key -> key.startsWith("jobs/") && key.endsWith("/config.xml") && !key.contains("/builds/"));
+            key -> key.startsWith("jobs/") && key.endsWith("/config.xml") && !key.contains("/builds/")) {
+        @Override
+        public Entry read(@NonNull String key) {
+            if (key.equals(unreadable)) {
+                throw new UncheckedIOException(new IOException("cannot read " + key));
+            }
+            return super.read(key);
+        }
+    };
+
+    /** A key whose reads fail. */
+    static volatile String unreadable;
 
     private JenkinsRule r;
 
@@ -102,6 +116,23 @@ class PersistenceStoreItemEnumerationTest {
 
         assertNull(r.jenkins.getItem("gone"));
         assertFalse(new File(r.jenkins.getRootDir(), "jobs/gone").exists());
+    }
+
+    @Test
+    void oneUnreadableItemDoesNotHideTheOthers() throws Exception {
+        STORE.write("jobs/a/config.xml", "<?xml version='1.1' encoding='UTF-8'?><project/>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+        STORE.write("jobs/b/config.xml", "<?xml version='1.1' encoding='UTF-8'?><project/>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+        STORE.write("jobs/c/config.xml", "<?xml version='1.1' encoding='UTF-8'?><project/>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+        unreadable = "jobs/b/config.xml";
+        try {
+            r.jenkins.reload();
+        } finally {
+            unreadable = null;
+        }
+
+        assertNotNull(r.jenkins.getItem("a"));
+        assertNull(r.jenkins.getItem("b"));
+        assertNotNull(r.jenkins.getItem("c"));
     }
 
     @TestExtension

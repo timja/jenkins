@@ -177,7 +177,16 @@ public final class PersistenceStores {
                 String config = parent + "/" + name + "/config.xml";
                 // children() also names directories with only deeper keys left (e.g. a deleted item's sub-items): an
                 // item is there only if its configuration is
-                if (store.owns(config) && store.read(config) != null) {
+                if (!store.owns(config)) {
+                    continue;
+                }
+                try {
+                    if (store.read(config) != null) {
+                        names.add(name);
+                    }
+                } catch (IOException | RuntimeException e) {
+                    // one entry which cannot be read does not hide the others: loading it reports its own failure
+                    LOGGER.log(Level.WARNING, "Failed to read " + config + "; listing it as an item anyway", e);
                     names.add(name);
                 }
             }
