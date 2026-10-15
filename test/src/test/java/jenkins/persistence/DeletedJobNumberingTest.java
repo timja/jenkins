@@ -25,16 +25,25 @@
 package jenkins.persistence;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import hudson.Util;
+import hudson.XmlFile;
 import hudson.model.FreeStyleBuild;
 import hudson.model.FreeStyleProject;
+import hudson.model.Saveable;
+import hudson.model.listeners.SaveableListener;
+import java.io.ByteArrayInputStream;
 import java.io.File;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.Set;
+import jenkins.model.queue.ItemDeletion;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
@@ -64,6 +73,7 @@ class DeletedJobNumberingTest {
     void setUp(JenkinsRule rule) {
         r = rule;
         BLOBS.clear();
+        whileDeleting = null;
     }
 
     private static String stored(String key) {
@@ -137,6 +147,89 @@ class DeletedJobNumberingTest {
         STORE.write("jobs/occupied/config.xml", "<project/>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
         FreeStyleProject p = r.createFreeStyleProject("mover");
         assertThrows(ConflictException.class, () -> PersistenceStores.move(p.getRootDir(), new File(r.jenkins.getRootDir(), "jobs/occupied")));
+    }
+
+    /** Run once by {@link RecreateWhileDeleting} after a job's directory is deleted here, before its builds are cleaned up. */
+    static volatile Runnable whileDeleting;
+
+    @Test
+    void jobRecreatedElsewhereWhileDeletingHereKeepsItsBuilds() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("remade");
+        r.buildAndAssertSuccess(p);
+        r.buildAndAssertSuccess(p);
+        byte[] config = STORE.read("jobs/remade/config.xml").content();
+        byte[] record = STORE.read("jobs/remade/builds/2/build.xml").content();
+        PersistenceStore other = STORE.as("other-controller");
+        whileDeleting = () -> {
+            try {
+                // the other controller makes the job again, and runs a build, while the directory is deleted here
+                other.write("jobs/remade/config.xml", config, PersistenceStore.ABSENT);
+                other.write("jobs/remade/nextBuildNumber", "4\n".getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+                BLOBS.put("jobs/remade/builds/3/files.tgz", new ByteArrayInputStream(new byte[] {1}), 1);
+                other.write("jobs/remade/builds/3/build.xml", record, PersistenceStore.ABSENT);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        };
+        p.delete();
+        awaitApplied();
+
+        assertEquals(List.of("3"), builds("remade"), "the new job's build kept, the deleted job's removed");
+        assertEquals(Set.of("jobs/remade/builds/3/files.tgz"), Set.copyOf(BLOBS.keys()));
+        STORE.delete("jobs/remade/config.xml", PersistenceStore.ANY); // not loaded by the next tests
+    }
+
+    @Test
+    void deletionAppliedAfterRecreationRemovesOnlyTheDeletedJobsBuilds() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("late");
+        r.buildAndAssertSuccess(p);
+        r.buildAndAssertSuccess(p);
+        byte[] config = STORE.read("jobs/late/config.xml").content();
+        byte[] record = STORE.read("jobs/late/builds/2/build.xml").content();
+        PersistenceStore other = STORE.as("other-controller");
+        synchronized (p) { // this controller finishes applying the deletion only once all of this happened
+            // deleted elsewhere, which cleans up build 1; build 2 is published late from here
+            other.delete("jobs/late/config.xml", PersistenceStore.ANY);
+            other.delete("jobs/late/builds/1/build.xml", PersistenceStore.ANY);
+            // the deletion is being applied here (waiting for this lock) when the job is made again elsewhere
+            for (int i = 0; i < 500 && !ItemDeletion.isRegistered(p); i++) {
+                Thread.sleep(10);
+            }
+            assertTrue(ItemDeletion.isRegistered(p), "deletion under way");
+            other.write("jobs/late/config.xml", config, PersistenceStore.ABSENT);
+            BLOBS.put("jobs/late/builds/3/files.tgz", new ByteArrayInputStream(new byte[] {1}), 1);
+            other.write("jobs/late/builds/3/build.xml", record, PersistenceStore.ABSENT);
+        }
+        awaitApplied();
+
+        assertEquals(List.of("3"), builds("late"), "the late build of the deleted job removed, the new job's kept");
+        assertTrue(BLOBS.keys().contains("jobs/late/builds/3/files.tgz"));
+        assertFalse(BLOBS.keys().contains("jobs/late/builds/2/files.tgz"));
+        STORE.delete("jobs/late/config.xml", PersistenceStore.ANY); // not loaded by the next tests
+    }
+
+    /** The numbers of the builds of a job stored. */
+    private static List<String> builds(String job) {
+        return STORE.children("jobs/" + job + "/builds").stream().filter(n -> n.matches("[0-9]+")).sorted().toList();
+    }
+
+    private static void awaitApplied() throws InterruptedException {
+        for (int i = 0; i < 500 && !ItemChangeApplier.isIdle(); i++) {
+            Thread.sleep(10);
+        }
+        assertTrue(ItemChangeApplier.isIdle(), "changes applied");
+    }
+
+    @TestExtension
+    public static class RecreateWhileDeleting extends SaveableListener {
+        @Override
+        public void onDeleted(Saveable o, XmlFile file) {
+            Runnable r = whileDeleting;
+            if (r != null && o instanceof FreeStyleProject) {
+                whileDeleting = null;
+                r.run();
+            }
+        }
     }
 
     @TestExtension
