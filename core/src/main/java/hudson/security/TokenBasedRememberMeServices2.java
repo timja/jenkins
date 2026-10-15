@@ -114,7 +114,11 @@ public class TokenBasedRememberMeServices2 extends AbstractRememberMeServices {
     @SuppressWarnings("deprecation")
     public TokenBasedRememberMeServices2(UserDetailsService userDetailsService) {
         super(Jenkins.get().getSecretKey(), new ImpersonatingUserDetailsService2(userDetailsService));
-        setAlwaysRemember(ALWAYS_REMEMBER);
+    }
+
+    @Override
+    protected boolean rememberMeRequested(HttpServletRequest request, String parameter) {
+        return ALWAYS_REMEMBER || super.rememberMeRequested(request, parameter); // read on each login, not once
     }
 
     /**
