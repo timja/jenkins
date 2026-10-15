@@ -56,7 +56,8 @@ import org.w3c.dom.Node;
  * <p>The unit of merging is a direct child of the root element, by name (all children of one name together, so lists
  * merge as wholes): a unit only one side changed takes that side's version; a unit both changed takes mine and counts as a
  * conflict, unless it is a single element with the same attributes on every side whose children are all distinctly
- * named: those children are then merged the same way, recursively. The root's attributes are one more unit.
+ * named, and the sides agree on their order (neither reordered the children both have, nor added any where the other
+ * did): those children are then merged the same way, recursively, in that order. The root's attributes are one more unit.
  */
 @Restricted(NoExternalUse.class)
 public final class XmlMerge {
@@ -106,10 +107,14 @@ public final class XmlMerge {
         if (bu == null || mu == null || tu == null) {
             return null;
         }
-        List<String> names = new ArrayList<>(mu.keySet());
-        for (String name : tu.keySet()) {
-            if (!names.contains(name)) {
-                names.add(name);
+        List<String> names = order(List.copyOf(bu.keySet()), List.copyOf(mu.keySet()), List.copyOf(tu.keySet()));
+        if (names == null) {
+            // the sides ordered the children differently; only reached for the root, whose children are fields (any order)
+            names = new ArrayList<>(mu.keySet());
+            for (String name : tu.keySet()) {
+                if (!names.contains(name)) {
+                    names.add(name);
+                }
             }
         }
         for (String name : bu.keySet()) {
@@ -131,8 +136,10 @@ public final class XmlMerge {
             } else if (Objects.equals(tv, bv) || Objects.equals(mv, tv)) {
                 chosen = verbatim(me);
             } else if (single(be) && single(me) && single(te) && sameAttributes(be.get(0), me.get(0), te.get(0))
-                    && structured(be.get(0)) && structured(me.get(0)) && structured(te.get(0))) {
-                // changed on both sides, but made of distinctly named parts (e.g. <properties>): merge those
+                    && structured(be.get(0)) && structured(me.get(0)) && structured(te.get(0))
+                    && order(names(be.get(0)), names(me.get(0)), names(te.get(0))) != null) {
+                // changed on both sides, but made of distinctly named parts (e.g. <properties>, or <builders> of distinct
+                // kinds, whose order matters): merge those, keeping each side's order
                 Element me0 = me.get(0);
                 String inner = mergeChildren(be.get(0), me0, te.get(0), indent + "  ", conflicts);
                 String open = "<" + me0.getTagName() + attributes(me0);
@@ -167,6 +174,52 @@ public final class XmlMerge {
             }
         }
         return result;
+    }
+
+    private static List<String> names(Element e) {
+        return List.copyOf(children(e).keySet());
+    }
+
+    /**
+     * The order of the merged children, by name, keeping each side's: mine's, with the names only theirs added inserted
+     * after the name they follow there.
+     *
+     * @return null if the two sides do not agree on it: they ordered the names both have differently, or both added
+     *     names at the same place
+     */
+    @CheckForNull
+    static List<String> order(List<String> base, List<String> mine, List<String> theirs) {
+        if (!mine.stream().filter(theirs::contains).toList().equals(theirs.stream().filter(mine::contains).toList())) {
+            return null;
+        }
+        List<String> merged = new ArrayList<>(mine);
+        String previous = null; // the last of theirs placed so far
+        for (int i = 0; i < theirs.size(); i++) {
+            String name = theirs.get(i);
+            if (merged.contains(name)) {
+                previous = name;
+                continue;
+            }
+            if (base.contains(name)) {
+                continue; // mine removed it: nothing of it is written
+            }
+            int from = previous == null ? 0 : merged.indexOf(previous) + 1;
+            int to = merged.size();
+            for (int j = i + 1; j < theirs.size(); j++) {
+                if (mine.contains(theirs.get(j))) {
+                    to = merged.indexOf(theirs.get(j));
+                    break;
+                }
+            }
+            for (String between : merged.subList(from, to)) {
+                if (!base.contains(between) && !theirs.contains(between)) {
+                    return null; // mine added something there too: which comes first is not known
+                }
+            }
+            merged.add(from, name);
+            previous = name;
+        }
+        return merged;
     }
 
     private static boolean single(@CheckForNull List<Element> elements) {
