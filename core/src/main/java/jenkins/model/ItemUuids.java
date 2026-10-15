@@ -31,6 +31,8 @@ import hudson.Extension;
 import hudson.model.AbstractItem;
 import hudson.model.Item;
 import hudson.model.listeners.ItemListener;
+import hudson.security.ACL;
+import hudson.security.ACLContext;
 import java.io.IOException;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -84,26 +86,42 @@ public final class ItemUuids {
         @Override
         public void onCreated(Item item) {
             String id = item.getItemUuid();
-            String other = id == null ? null : fullNames.get(id);
-            // only where it was created: the other controllers of a cluster take what it saves
-            boolean clash = other != null && !other.equals(item.getFullName()) && Jenkins.get().getItemByFullName(other) != null;
             // created from configuration without one: derived from its name, it would be a deleted item's of that name
             boolean derived = id != null && id.equals(AbstractItem.legacyItemUuid(item.getFullName()));
-            if ((clash || derived) && item instanceof AbstractItem ai && !PersistenceStores.isApplyingRemoteChange()) {
-                LOGGER.fine(() -> item.getFullName() + " was created without an identity of its own; giving it one");
+            claim(item, derived);
+        }
+
+        @Override
+        public void onUpdated(Item item) {
+            claim(item, false); // e.g. configuration posted with another item's identity
+        }
+
+        /** Indexes an item, after giving it an identity of its own if it has another item's (or must not keep its own). */
+        private static void claim(Item item, boolean renew) {
+            String id = item.getItemUuid();
+            String other = id == null ? null : fullNames.get(id);
+            boolean clash;
+            try (ACLContext ctx = ACL.as2(ACL.SYSTEM2)) {
+                // whoever made the change, and whatever they may see: the identity of an item hidden from them is not theirs
+                clash = other != null && !other.equals(item.getFullName()) && Jenkins.get().getItemByFullName(other) != null;
+            }
+            if (!clash && !renew) {
+                index(item);
+                return;
+            }
+            if (item instanceof AbstractItem ai && !PersistenceStores.isApplyingRemoteChange()) {
+                // only where it was made: the other controllers of a cluster take what it saves
+                LOGGER.fine(() -> item.getFullName() + " has no identity of its own; giving it one");
                 ai.newItemUuid();
                 try {
                     ai.save();
                 } catch (IOException e) {
                     LOGGER.log(Level.WARNING, "Could not save the new identity of " + item.getFullName(), e);
                 }
-            }
-            index(item);
-        }
-
-        @Override
-        public void onUpdated(Item item) {
-            index(item);
+                index(item);
+            } else if (!clash) {
+                index(item);
+            } // else not taken from the item that has it
         }
 
         @Override
