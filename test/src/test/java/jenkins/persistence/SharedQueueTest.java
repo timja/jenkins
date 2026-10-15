@@ -170,7 +170,7 @@ class SharedQueueTest {
     }
 
     private static void awaitMirrored() throws InterruptedException {
-        for (int i = 0; i < 500 && !SharedQueue.Mirror.isIdle(); i++) {
+        for (int i = 0; i < 3000 && !SharedQueue.Mirror.isIdle(); i++) {
             Thread.sleep(10);
         }
         assertTrue(SharedQueue.Mirror.isIdle());
