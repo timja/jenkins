@@ -26,11 +26,14 @@ package jenkins.persistence;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.hasKey;
+import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import hudson.model.FreeStyleProject;
 import java.io.File;
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
@@ -147,6 +150,21 @@ class StoredBuildNumberAssignerTest {
         p.renameTo("after");
         assertThat(STORE.versions(), hasKey("jobs/after/nextBuildNumber"));
         assertEquals(3, r.buildAndAssertSuccess(p).getNumber());
+    }
+
+    @Test
+    void jobRenamedElsewhereIsNotNumberedAgainUnderItsOldName() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("stale");
+        // another controller renamed it and built #1 there; this one has not applied the rename yet
+        STORE.move("jobs/stale", "jobs/fresh");
+        STORE.as("other").write("jobs/fresh/nextBuildNumber", "2\n".getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+        assertThrows(IOException.class, p::assignBuildNumber);
+        assertThat(STORE.versions(), not(hasKey("jobs/stale/nextBuildNumber")));
+        assertEquals("2", stored("jobs/fresh/nextBuildNumber"));
+        // a job whose configuration is stored starts its sequence as before
+        FreeStyleProject q = r.createFreeStyleProject("new");
+        assertEquals(1, q.assignBuildNumber());
+        assertEquals("2", stored("jobs/new/nextBuildNumber"));
     }
 
     @TestExtension
