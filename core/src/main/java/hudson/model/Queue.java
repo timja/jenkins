@@ -673,7 +673,7 @@ public class Queue extends ResourceController implements Saveable {
             if (queueUpdated) scheduleMaintenance();
 
             for (Item item : duplicatesInQueue) {
-                Listeners.notify(QueueListener.class, true, l -> l.onFolded(item));
+                Listeners.notify(QueueListener.class, true, l -> l.onFolded(item, actions));
             }
 
             // REVISIT: when there are multiple existing items in the queue that matches the incoming one,

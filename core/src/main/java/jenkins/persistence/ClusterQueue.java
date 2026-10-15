@@ -77,24 +77,19 @@ public interface ClusterQueue {
     Record publish(@NonNull Record item) throws IOException;
 
     /**
-     * Updates the actions and due time of a waiting item after another schedule folded into it.
-     */
-    void update(long id, @NonNull String actions, long dueAt) throws IOException;
-
-    /**
      * Updates the actions and due time of a waiting item if its actions are still {@code expectedActions}: a fold
-     * merges its causes into what it read, and two folds at once must not lose one another's. Stores should compare
-     * and update atomically; this default compares, then updates.
+     * merges its causes into what it read, and two folds at once must not lose one another's. Stores must compare and
+     * update atomically. The due time only moves earlier.
      *
+     * @param pinTo if not null, pins the item to this origin, unless it is pinned already (a request folded into it
+     *     must run where it was made)
      * @return false if the item is not waiting, or its actions changed meanwhile (read it again and merge again)
      */
+    boolean update(long id, @NonNull String expectedActions, @NonNull String actions, long dueAt, @CheckForNull String pinTo) throws IOException;
+
+    /** {@link #update(long, String, String, long, String)}, pinning nothing. */
     default boolean update(long id, @NonNull String expectedActions, @NonNull String actions, long dueAt) throws IOException {
-        Record r = get(id);
-        if (r == null || r.state() != State.WAITING || !r.actions().equals(expectedActions)) {
-            return false;
-        }
-        update(id, actions, dueAt);
-        return true;
+        return update(id, expectedActions, actions, dueAt, null);
     }
 
     /**
