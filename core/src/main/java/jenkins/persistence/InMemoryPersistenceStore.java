@@ -61,6 +61,8 @@ public class InMemoryPersistenceStore implements PersistenceStore {
     private final Queue<ChangeEvent> outbox;
     /** Held while delivering, so that changes are delivered one at a time, in order, but not under the data lock. */
     private final Object delivering;
+    /** The thread delivering changes, guarded by {@link #delivering}. */
+    private Thread draining;
     /** Versions come from one counter, so a key that is deleted and recreated never repeats a version. */
     private long clock;
 
@@ -113,17 +115,25 @@ public class InMemoryPersistenceStore implements PersistenceStore {
      */
     private void deliver() {
         synchronized (delivering) {
-            while (true) {
-                ChangeEvent e;
-                synchronized (root) {
-                    e = outbox.poll();
+            if (root.draining == Thread.currentThread()) {
+                return; // a listener made a change: the loop below delivers it once every listener had the current one
+            }
+            root.draining = Thread.currentThread();
+            try {
+                while (true) {
+                    ChangeEvent e;
+                    synchronized (root) {
+                        e = outbox.poll();
+                    }
+                    if (e == null) {
+                        return;
+                    }
+                    for (Consumer<ChangeEvent> l : listeners) {
+                        l.accept(e);
+                    }
                 }
-                if (e == null) {
-                    return;
-                }
-                for (Consumer<ChangeEvent> l : listeners) {
-                    l.accept(e);
-                }
+            } finally {
+                root.draining = null;
             }
         }
     }
