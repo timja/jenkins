@@ -41,8 +41,12 @@ import java.io.File;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
@@ -62,7 +66,24 @@ class RemoteBuildEventsTest {
             return !jobKey.equals("jobs/unshared");
         }
     };
-    static final InMemoryBlobStore BLOBS = new InMemoryBlobStore();
+    static final InMemoryBlobStore BLOBS = new InMemoryBlobStore() {
+        @Override
+        public InputStream get(String key) {
+            CountDownLatch blocked = blockGet;
+            if (blocked != null) {
+                getStarted.countDown();
+                try {
+                    blocked.await();
+                } catch (InterruptedException e) {
+                    throw new AssertionError(e);
+                }
+            }
+            return super.get(key);
+        }
+    };
+    /** While set, blob reads wait for it. */
+    static volatile CountDownLatch blockGet;
+    static volatile CountDownLatch getStarted;
 
     private JenkinsRule r;
     private PersistenceStore other;
@@ -181,6 +202,43 @@ class RemoteBuildEventsTest {
         awaitApplied();
         assertEquals(applied, ItemChangeApplier.getAppliedCount());
         assertThat(record("own", 1), containsString("local edit"));
+    }
+
+    @Test
+    void recordChangedElsewhereWhileBeingMaterializedIsRefreshed() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("racing");
+        r.buildAndAssertSuccess(p);
+        publishElsewhere("racing", 1, 2, record("racing", 1));
+        blockGet = new CountDownLatch(1);
+        getStarted = new CountDownLatch(1);
+        AtomicReference<FreeStyleBuild> opened = new AtomicReference<>();
+        Thread opener = new Thread(() -> opened.set(p.getBuildByNumber(2))); // first materialization, holding the RunMap
+        try {
+            opener.start();
+            assertTrue(getStarted.await(30, TimeUnit.SECONDS));
+            // the record is changed elsewhere after the materialization read it, before it wrote it out
+            other.write("jobs/racing/builds/2/build.xml", record("racing", 2).replaceFirst("<build>", "<build>\n  <description>set elsewhere</description>")
+                    .getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+            long deadline = System.currentTimeMillis() + 30_000;
+            while (!applierWaitsForBuilds() && System.currentTimeMillis() < deadline) {
+                Thread.sleep(10);
+            }
+            assertTrue(applierWaitsForBuilds(), "the change is being applied");
+        } finally {
+            blockGet.countDown();
+            blockGet = null;
+        }
+        opener.join();
+        assertNotNull(opened.get());
+        awaitApplied();
+        assertEquals("set elsewhere", p.getBuildByNumber(2).getDescription());
+        assertThat(Files.readString(new File(p.getBuildDir(), "2/build.xml").toPath()), containsString("set elsewhere"));
+    }
+
+    /** Whether the thread applying changes waits on a job's builds, held by a materialization. */
+    private static boolean applierWaitsForBuilds() {
+        return Thread.getAllStackTraces().entrySet().stream().anyMatch(e -> e.getKey().getState() == Thread.State.BLOCKED
+                && Arrays.stream(e.getValue()).anyMatch(f -> f.getClassName().equals(BuildRecords.class.getName())));
     }
 
     @TestExtension

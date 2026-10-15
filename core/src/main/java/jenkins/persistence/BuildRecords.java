@@ -361,18 +361,22 @@ public final class BuildRecords {
             return;
         }
         File dir = new File(job.getBuildDir(), String.valueOf(number));
-        if (new File(dir, RECORD).isFile()) {
-            PersistenceStore.Entry record = PersistenceStores.get().read(builds + "/" + number + "/" + RECORD);
-            if (record == null) {
-                return; // deleted since; the deletion event follows
+        // under the lock materialization holds (RunMap.retrieve): one in progress is waited for and then refreshed,
+        // rather than taken for not there yet and left with the record it read before this change
+        synchronized (runs) {
+            if (new File(dir, RECORD).isFile()) {
+                PersistenceStore.Entry record = PersistenceStores.get().read(builds + "/" + number + "/" + RECORD);
+                if (record == null) {
+                    return; // deleted since; the deletion event follows
+                }
+                LOGGER.fine(() -> "Refreshing " + job.getFullName() + " #" + number + " changed elsewhere");
+                writeRecord(dir, record.content());
+                runs.unload(number);
+            } else {
+                LOGGER.fine(() -> "Recognizing " + job.getFullName() + " #" + number + " completed elsewhere");
+                Files.createDirectories(dir.toPath());
+                runs.recognizeNumber(number);
             }
-            LOGGER.fine(() -> "Refreshing " + job.getFullName() + " #" + number + " changed elsewhere");
-            writeRecord(dir, record.content());
-            runs.unload(number);
-        } else {
-            LOGGER.fine(() -> "Recognizing " + job.getFullName() + " #" + number + " completed elsewhere");
-            Files.createDirectories(dir.toPath());
-            runs.recognizeNumber(number);
         }
         PeepholePermalink.changedElsewhere(job, number, false);
     }
