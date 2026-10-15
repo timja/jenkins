@@ -219,6 +219,18 @@ public class InMemoryPersistenceStore implements PersistenceStore {
 
             @Override
             @NonNull
+            public long[] nextIds(int n) {
+                long[] ids = new long[n];
+                synchronized (root) {
+                    for (int i = 0; i < n; i++) {
+                        ids[i] = ++root.clock;
+                    }
+                }
+                return ids;
+            }
+
+            @Override
+            @NonNull
             public Record publish(@NonNull Record item) {
                 Record stored;
                 synchronized (root) {
