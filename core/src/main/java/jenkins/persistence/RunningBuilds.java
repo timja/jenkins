@@ -43,6 +43,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.Date;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -308,11 +309,12 @@ public final class RunningBuilds {
         if (live == null) {
             return 0;
         }
+        Set<String> gone = new HashSet<>();
         int removed = 0;
         for (Job<?, ?> job : Jenkins.get().allItems(Job.class)) {
             int removedHere = 0;
             for (Placeholder p : all(job)) {
-                if (!live.contains(p.origin)) {
+                if (!live.contains(p.origin) && stillGone(store, p.origin, gone)) {
                     LOGGER.info(() -> "Removing placeholder of " + job.getFullName() + " #" + p.number + " left by " + p.controller + " (" + p.origin + "), which is gone");
                     // idempotent, so several controllers noticing at once is harmless
                     store.delete(p.key, PersistenceStore.ANY);
@@ -325,6 +327,23 @@ public final class RunningBuilds {
             }
         }
         return removed;
+    }
+
+    /**
+     * Whether the origin of a placeholder missing from the sweep's first answer is still gone when asked after the
+     * placeholder was listed: its controller may have joined since (a restart, during a rolling one) and written it.
+     * An origin found gone then is taken as gone for the rest of the sweep, so that the store is asked once per origin.
+     */
+    private static boolean stillGone(PersistenceStore store, String origin, Set<String> gone) throws IOException {
+        if (gone.contains(origin)) {
+            return true;
+        }
+        Set<String> live = store.liveOrigins();
+        if (live == null || live.contains(origin)) {
+            return false;
+        }
+        gone.add(origin);
+        return true;
     }
 
     @Restricted(NoExternalUse.class)
