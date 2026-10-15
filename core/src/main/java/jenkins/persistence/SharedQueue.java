@@ -42,6 +42,7 @@ import hudson.model.Run;
 import hudson.model.TaskListener;
 import hudson.model.listeners.RunListener;
 import hudson.model.queue.CauseOfBlockage;
+import hudson.model.queue.FoldableAction;
 import hudson.model.queue.QueueListener;
 import hudson.model.queue.ScheduleResult;
 import hudson.security.ACL;
@@ -132,28 +133,39 @@ public final class SharedQueue {
      * Items with equal keys fold into one, as the local queue does by task and {@link ParametersAction}.
      * Each parameter is encoded with explicit lengths (so no value can pass for several parameters); sensitive values
      * enter it only as a keyed hash, so that queue records reveal nothing of them.
+     * Other actions which decide or take part in folding locally ({@link Queue.QueueAction}, such as a replay's, and
+     * {@link FoldableAction}, such as a {@code build} step's) cannot be asked across controllers: they enter the key as
+     * they are stored, so that a request carrying one folds only into an item carrying an equal one.
      */
     static String dedupKey(@NonNull Queue.Task task, @NonNull List<Action> actions) {
         List<byte[]> parameters = new ArrayList<>();
+        List<byte[]> others = new ArrayList<>();
         for (Action a : actions) {
             if (a instanceof ParametersAction pa) {
                 for (ParameterValue v : pa.getParameters()) {
                     parameters.add(encode(v));
                 }
+            } else if (a instanceof Queue.QueueAction || a instanceof FoldableAction && !(a instanceof CauseAction)) {
+                others.add(encode(a.getClass().getName(), Queue.XSTREAM.toXML(a)));
             }
         }
         String name = ((Job<?, ?>) task).getFullName();
-        if (parameters.isEmpty()) {
+        if (parameters.isEmpty() && others.isEmpty()) {
             return name;
         }
-        parameters.sort(Arrays::compare);
+        String key = parameters.isEmpty() ? name : name + "#" + digest(parameters);
+        return others.isEmpty() ? key : key + "#actions:" + digest(others);
+    }
+
+    private static String digest(List<byte[]> parts) {
+        parts.sort(Arrays::compare);
         try {
             MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            for (byte[] p : parameters) {
+            for (byte[] p : parts) {
                 digest.update(ByteBuffer.allocate(4).putInt(p.length).array());
                 digest.update(p);
             }
-            return name + "#" + HexFormat.of().formatHex(digest.digest());
+            return HexFormat.of().formatHex(digest.digest());
         } catch (NoSuchAlgorithmException e) {
             throw new AssertionError(e);
         }
@@ -168,8 +180,12 @@ public final class SharedQueue {
         if (v.isSensitive()) {
             text = "mac:" + SENSITIVE.mac(text);
         }
+        return encode(v.getName(), v.getClass().getName(), text);
+    }
+
+    private static byte[] encode(String... fields) {
         ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        for (String field : new String[] {v.getName(), v.getClass().getName(), text}) {
+        for (String field : fields) {
             byte[] b = String.valueOf(field).getBytes(StandardCharsets.UTF_8);
             bytes.writeBytes(ByteBuffer.allocate(4).putInt(b.length).array());
             bytes.writeBytes(b);

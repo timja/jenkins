@@ -41,6 +41,7 @@ import hudson.model.Cause;
 import hudson.model.CauseAction;
 import hudson.model.FreeStyleBuild;
 import hudson.model.FreeStyleProject;
+import hudson.model.InvisibleAction;
 import hudson.model.ItemGroup;
 import hudson.model.Label;
 import hudson.model.ParametersAction;
@@ -50,6 +51,7 @@ import hudson.model.Queue;
 import hudson.model.StringParameterValue;
 import hudson.model.TopLevelItem;
 import hudson.model.TopLevelItemDescriptor;
+import hudson.model.queue.FoldableAction;
 import hudson.model.queue.QueueTaskFuture;
 import java.util.Calendar;
 import java.util.List;
@@ -375,6 +377,59 @@ class SharedQueueTest {
         assertNotEquals(secret, SharedQueue.dedupKey(p, List.of(new ParametersAction(new PasswordParameterValue("pw", "hunter3")))));
         // the same value as a plain string gives another key: the sensitive one is keyed, not hashed as is
         assertNotEquals(secret, SharedQueue.dedupKey(p, List.of(new ParametersAction(new StringParameterValue("pw", "hunter2")))));
+    }
+
+    @Test
+    void requestsTheLocalQueueKeepsApartAreNotFoldedWhenShared() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("apart");
+        p.scheduleBuild2(60, new KeptApart("one"));
+        p.scheduleBuild2(60, new KeptApart("two"));
+        assertEquals(2, Queue.getInstance().getItems().length, "kept apart here");
+        for (Queue.Item item : Queue.getInstance().getItems()) {
+            assertEquals(item.getId(), awaitShared(item.getId(), x -> true).id(), "shared as an item of its own");
+        }
+        Thread.sleep(500); // a fold would have cancelled one by now
+        assertEquals(2, Queue.getInstance().getItems().length, "both still waiting");
+        Queue.getInstance().clear();
+    }
+
+    @Test
+    void requestsWithActionsFoldedLocallyOnlyFoldIntoEqualOnesWhenShared() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("foldable");
+        String plain = SharedQueue.dedupKey(p, List.of(new CauseAction(new Cause.UserIdCause("a"))));
+        assertEquals(plain, SharedQueue.dedupKey(p, List.of(new CauseAction(new Cause.UserIdCause("b")))), "causes merge");
+        String step = SharedQueue.dedupKey(p, List.of(new CauseAction(new Cause.UserIdCause("a")), new Folds("step-1")));
+        assertNotEquals(plain, step);
+        assertNotEquals(step, SharedQueue.dedupKey(p, List.of(new Folds("step-2"))));
+        assertEquals(step, SharedQueue.dedupKey(p, List.of(new Folds("step-1"), new CauseAction(new Cause.UserIdCause("b")))));
+    }
+
+    /** Asks the local queue to keep its request apart from any other, as a replay does. */
+    public static class KeptApart extends InvisibleAction implements Queue.QueueAction {
+        private final String what;
+
+        public KeptApart(String what) {
+            this.what = what;
+        }
+
+        @Override
+        public boolean shouldSchedule(List<Action> actions) {
+            return true;
+        }
+    }
+
+    /** Folds into the item its request is folded into, as a {@code build} step's action does. */
+    public static class Folds extends InvisibleAction implements FoldableAction {
+        private final String what;
+
+        public Folds(String what) {
+            this.what = what;
+        }
+
+        @Override
+        public void foldIntoExisting(Queue.Item item, Queue.Task owner, List<Action> otherActions) {
+            item.addAction(this);
+        }
     }
 
     @Test
