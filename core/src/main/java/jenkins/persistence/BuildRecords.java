@@ -55,9 +55,12 @@ import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -298,6 +301,45 @@ public final class BuildRecords {
         }
         RunningBuilds.invalidate(builds.substring(0, builds.length() - "/builds".length()));
         LOGGER.fine(() -> "Deleted stored builds of " + job.getFullName());
+    }
+
+    /**
+     * Removes the build records, snapshots and running placeholders of a deleted job numbered below {@code below},
+     * as {@link #deleteAll} does for all of them, when a job was made again under the same name meanwhile:
+     * that job's builds are numbered from where the deleted one stopped, so they are kept.
+     */
+    private static void deleteBelow(@NonNull Job<?, ?> job, int below) throws IOException {
+        String builds = buildsKey(job);
+        if (builds == null) {
+            return;
+        }
+        PersistenceStore store = PersistenceStores.get();
+        BlobStore blobs = PersistenceStores.getBlobStore();
+        for (String number : store.children(builds)) {
+            if (numberOf(number) < below) {
+                store.delete(builds + "/" + number + "/" + RECORD, PersistenceStore.ANY);
+                if (blobs != null) {
+                    blobs.delete(builds + "/" + number);
+                }
+            }
+        }
+        String running = builds.substring(0, builds.length() - "builds".length()) + RunningBuilds.PREFIX;
+        for (String name : store.children(running)) {
+            if (numberOf(name) < below) {
+                store.delete(running + "/" + name, PersistenceStore.ANY);
+            }
+        }
+        RunningBuilds.invalidate(builds.substring(0, builds.length() - "/builds".length()));
+        LOGGER.fine(() -> "Deleted stored builds of " + job.getFullName() + " below #" + below);
+    }
+
+    /** The build number a stored name starts with ({@code 5}, {@code 5.xml}), or {@link Integer#MAX_VALUE} if none. */
+    private static int numberOf(String name) {
+        int end = 0;
+        while (end < name.length() && end < 9 && Character.isDigit(name.charAt(end))) {
+            end++;
+        }
+        return end == 0 ? Integer.MAX_VALUE : Integer.parseInt(name.substring(0, end));
     }
 
     /**
@@ -560,15 +602,33 @@ public final class BuildRecords {
     @Extension
     public static final class ItemDeleted extends ItemListener {
 
+        /**
+         * The next build number of each job as its deletion starts: a job made again elsewhere meanwhile, under the same
+         * name, may be loaded into the same object before the deletion is over, with the new job's number.
+         */
+        private final Map<Job<?, ?>, Integer> nextBuildNumbers = Collections.synchronizedMap(new WeakHashMap<>());
+
+        @Override
+        public void onCheckDelete(Item item) {
+            if (item instanceof Job<?, ?> job) {
+                nextBuildNumbers.put(job, job.getNextBuildNumber());
+            }
+        }
+
         @Override
         public void onDeleted(Item item) {
             // folders delete their children one by one, so each job gets here
             if (!(item instanceof Job<?, ?> job)) {
                 return;
             }
+            Integer next = nextBuildNumbers.remove(job);
             try {
-                if (PersistenceStores.isApplyingRemoteChange() && recreated(job)) {
-                    return; // made again since, under the same name: its builds are the new job's
+                if (recreated(job)) {
+                    // made again since, under the same name: elsewhere before this controller applied the deletion, or
+                    // there while this one deleted the job's directory. Builds the new job has are numbered from where
+                    // this one stopped: only those below are this job's (including one published late from here)
+                    deleteBelow(job, next != null ? next : job.getNextBuildNumber());
+                    return;
                 }
                 // also when the deletion was made elsewhere: a build that completed here before this controller
                 // applied it published a record after that controller had cleaned up (idempotent)
