@@ -372,7 +372,8 @@ public final class RunningBuilds {
      * nothing is. The job's placeholders are then loaded off the lock, and the queue looked at again.
      */
     @CheckForNull
-    static List<Placeholder> elsewhereCached(@NonNull Job<?, ?> job) {
+    @Restricted(NoExternalUse.class)
+    public static List<Placeholder> elsewhereCached(@NonNull Job<?, ?> job) {
         String runningKey = runningKey(job);
         if (PersistenceStores.get() == null || runningKey == null) {
             return List.of();

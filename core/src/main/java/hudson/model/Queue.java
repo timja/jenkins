@@ -1369,6 +1369,14 @@ public class Queue extends ResourceController implements Saveable {
     }
 
     /**
+     * Whether the current thread holds the queue lock: what runs under it must not wait for a remote store.
+     */
+    @Restricted(NoExternalUse.class)
+    public boolean isLockHeldByCurrentThread() {
+        return lock.isHeldByCurrentThread();
+    }
+
+    /**
      * Some operations require to be performed with the {@link Queue} lock held. Use one of these methods rather
      * than locking directly on Queue in order to allow for future refactoring.
      * @param runnable the operation to perform.
