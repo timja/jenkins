@@ -59,7 +59,6 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
-import java.util.Set;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 import org.apache.tools.tar.TarConstants;
@@ -113,11 +112,16 @@ class BuildRecordsTest {
         }
         public Set<String> children(String parentKey) {
             if (unlistable) {
-                throw new UncheckedIOException(new IOException("the store is unreachable"));
+                throw sneaky(new IOException("the store is unreachable")); // checked, as a real store throws it
             }
             return super.children(parentKey);
         }
     };
+    @SuppressWarnings("unchecked")
+    private static <T extends Throwable> RuntimeException sneaky(Throwable t) throws T {
+        throw (T) t;
+    }
+
     static volatile Consumer<String> afterRead;
     /** Origins the store reports as alive; null means membership is not tracked. */
     static volatile Set<String> live;
@@ -269,7 +273,8 @@ class BuildRecordsTest {
         assertEquals(Set.of(1), BuildRecords.listStoredNumbers(p));
         unlistable = true;
         try {
-            assertThrows(UncheckedIOException.class, () -> BuildRecords.listStoredNumbers(p));
+            assertThrows(IOException.class, () -> BuildRecords.listStoredNumbers(p));
+            assertEquals(Set.of(), BuildRecords.storedNumbers(p), "where unknown is taken as none");
         } finally {
             unlistable = false;
         }
