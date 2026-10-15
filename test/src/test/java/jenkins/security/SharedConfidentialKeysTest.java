@@ -26,6 +26,7 @@ package jenkins.security;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -34,7 +35,9 @@ import static org.junit.jupiter.api.Assumptions.assumeFalse;
 import hudson.Functions;
 import java.io.File;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.logging.Level;
 import jenkins.persistence.ConflictException;
 import jenkins.persistence.InMemoryPersistenceStore;
@@ -176,6 +179,35 @@ class SharedConfidentialKeysTest {
             assertEquals(mac, new HMACConfidentialKey("test.shared.k9").mac("x"), "kept locally, as without a store");
         } finally {
             storesKeys = true;
+        }
+    }
+
+    @Test
+    void onlyKeysAreCopiedDownFromTheStoreAndNeverThroughALink(JenkinsRule r, @TempDir Path elsewhere) throws Exception {
+        new HexStringConfidentialKey("test.shared.k12", 32).get();
+        byte[] key = STORE.read("secrets/test.shared.k12").content();
+        PersistenceStore them = STORE.as("other-controller");
+        List<String> notKeys = List.of("..\\escaped", ".hidden", "a b");
+        for (String name : notKeys) {
+            them.write("secrets/" + name, key, PersistenceStore.ABSENT);
+        }
+        them.write("secrets/test.shared.k13", key, PersistenceStore.ABSENT);
+        them.write("secrets/test.shared.k14", key, PersistenceStore.ABSENT);
+        Path target = elsewhere.resolve("written-through-a-link");
+        boolean links = !Functions.isWindows();
+        if (links) {
+            Files.createSymbolicLink(localFile(r, "test.shared.k14").toPath(), target); // dangling
+        }
+
+        DefaultConfidentialStore.reconcile();
+
+        assertArrayEquals(key, Files.readAllBytes(localFile(r, "test.shared.k13").toPath()), "a key is copied down");
+        for (String name : notKeys) {
+            assertFalse(Files.exists(localFile(r, name).toPath(), LinkOption.NOFOLLOW_LINKS), name);
+        }
+        if (links) {
+            assertFalse(Files.exists(target), "nothing written through a link");
+            assertTrue(Files.isSymbolicLink(localFile(r, "test.shared.k14").toPath()), "the link is left alone");
         }
     }
 

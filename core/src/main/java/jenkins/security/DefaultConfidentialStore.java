@@ -14,9 +14,11 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.LinkOption;
+import java.nio.file.Path;
 import java.security.GeneralSecurityException;
 import java.security.SecureRandom;
 import java.util.logging.Level;
@@ -248,13 +250,27 @@ public class DefaultConfidentialStore extends ConfidentialStore {
         // and keeps a local copy of every key the cluster has, so that a key first used here while the store is
         // unreachable (e.g. one signing pages) is still the cluster's, not a new one (Target 14)
         for (String name : store.children(SHARED_PREFIX.substring(0, SHARED_PREFIX.length() - 1))) {
-            File f = new File(cs.rootDir, name);
-            if (f.exists() || name.equals("master.key") || name.endsWith(".tmp") || name.contains("/")) {
+            if (!isKeyName(name)) {
+                LOGGER.warning(() -> "Not keeping a local copy of a key named " + name + " in the persistence store: not a key's name");
                 continue;
             }
+            Path f = cs.rootDir.toPath().resolve(name);
+            if (Files.exists(f, LinkOption.NOFOLLOW_LINKS)) {
+                continue; // a key of its own (reconciled above), or anything else, a link included: left alone
+            }
             PersistenceStore.Entry shared = store.read(SHARED_PREFIX + name);
-            if (shared != null) {
-                Files.write(f.toPath(), shared.content());
+            if (shared == null || !cs.isKey(shared.content())) {
+                continue;
+            }
+            // complete or not at all, and never through a link put there meanwhile: moved into place, not over anything
+            Path tmp = Files.createTempFile(cs.rootDir.toPath(), "shared", ".tmp");
+            try {
+                Files.write(tmp, shared.content());
+                Files.move(tmp, f);
+            } catch (FileAlreadyExistsException e) {
+                LOGGER.fine(() -> name + " appeared meanwhile; keeping it");
+            } finally {
+                Files.deleteIfExists(tmp);
             }
         }
     }
@@ -289,6 +305,15 @@ public class DefaultConfidentialStore extends ConfidentialStore {
                 throw x;
             }
         }
+    }
+
+    /**
+     * Whether a name the store lists below {@code secrets/} is that of a key, a plain file name in {@code secrets/}: key
+     * ids are made of class names and short names ({@code hudson.util.Secret}, {@code jenkins.model.Jenkins.crumbSalt}).
+     * Nothing with a separator, nor {@code .} or {@code ..}, nor a file of the store's own.
+     */
+    static boolean isKeyName(String name) {
+        return name.matches("[A-Za-z0-9_$][A-Za-z0-9_$.-]{0,254}") && !name.equals("master.key") && !name.endsWith(".tmp");
     }
 
     /** Whether a file's content is a key this store wrote: encrypted with the master key, with the trailer. */
