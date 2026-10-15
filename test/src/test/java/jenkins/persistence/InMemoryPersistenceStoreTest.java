@@ -70,6 +70,47 @@ class InMemoryPersistenceStoreTest {
     }
 
     @Test
+    void queueChangesAreDeliveredInTheOrderMade() throws Exception {
+        InMemoryPersistenceStore store = new InMemoryPersistenceStore(key -> true);
+        ClusterQueue cq = store.clusterQueue();
+        long id = cq.nextId();
+        cq.publish(new ClusterQueue.Record(id, "j", "j", "", 0, ClusterQueue.State.WAITING, store.getOrigin(), null, null, 0));
+        List<Integer> delivered = new ArrayList<>();
+        cq.subscribe(r -> {
+            synchronized (delivered) {
+                delivered.add(r.actions().length());
+            }
+        });
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Runnable folder = () -> {
+            try {
+                for (int i = 0; i < 500; ) {
+                    String read = cq.get(id).actions();
+                    if (cq.update(id, read, read + "x", 0)) {
+                        i++;
+                    }
+                }
+            } catch (Throwable t) {
+                failure.set(t);
+            }
+        };
+        Thread a = new Thread(folder, "a");
+        Thread b = new Thread(folder, "b");
+        a.start();
+        b.start();
+        a.join();
+        b.join();
+        if (failure.get() != null) {
+            throw new AssertionError(failure.get());
+        }
+        // each update made the actions one longer than the one before it
+        assertEquals(1000, delivered.size());
+        for (int i = 0; i < delivered.size(); i++) {
+            assertEquals(i + 1, delivered.get(i), "delivered out of order at " + i);
+        }
+    }
+
+    @Test
     void aChangeMadeByAListenerIsDeliveredAfterTheOneItIsHandling() throws Exception {
         InMemoryPersistenceStore store = new InMemoryPersistenceStore(key -> true);
         store.subscribe(e -> {
