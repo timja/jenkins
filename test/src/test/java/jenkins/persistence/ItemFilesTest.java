@@ -71,6 +71,7 @@ class ItemFilesTest {
                 "what the store has already is left out");
         // a fresh copy of the directory, as on another controller
         Files.delete(state);
+        Files.delete(p.getRootDir().toPath().resolve(ItemFiles.KNOWN));
         ItemFiles.forgetForTests();
         ItemFiles.take(p);
         assertEquals("v1", Files.readString(state));
@@ -116,6 +117,7 @@ class ItemFilesTest {
         assertFalse(manifest.contains("config.xml"), "what the store has already is left out");
         // a fresh copy of the directory, as on another controller, told of the manifest written elsewhere
         Files.delete(avatar);
+        Files.delete(dir.toPath().resolve(ItemFiles.KNOWN));
         ItemFiles.forgetForTests();
         ItemFiles.changedElsewhere(key);
         assertEquals(7, Files.size(avatar));
@@ -181,6 +183,28 @@ class ItemFilesTest {
         b.renameTo("a");
         ItemFiles.take(b);
         assertFalse(Files.exists(b.getRootDir().toPath().resolve("a.txt")));
+    }
+
+    @Test
+    void whatWasSharedIsKnownAfterARestart(JenkinsRule r) throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("restarted");
+        Path state = p.getRootDir().toPath().resolve("state.txt");
+        Files.writeString(state, "v1");
+        ItemFiles.publish(p);
+        assertFalse(manifest("jobs/restarted/item-files.json").contains(ItemFiles.KNOWN), "kept here only");
+        ItemFiles.forgetForTests(); // a restart, with this home
+        // meanwhile another controller shared v2
+        byte[] v2 = "v2".getBytes(StandardCharsets.UTF_8);
+        BLOBS.put("jobs/restarted/item-files/" + sha256(v2), new java.io.ByteArrayInputStream(v2), v2.length);
+        // (with this controller's origin, so the store listener does not take it too, racing with the steps below)
+        STORE.write("jobs/restarted/item-files.json",
+                manifest("jobs/restarted/item-files.json").replace(sha256("v1".getBytes(StandardCharsets.UTF_8)), sha256(v2)).getBytes(StandardCharsets.UTF_8),
+                PersistenceStore.ANY);
+        ItemFiles.take(p);
+        assertEquals("v2", Files.readString(state), "the old copy here is not taken for a change made here");
+        long version = STORE.read("jobs/restarted/item-files.json").version();
+        ItemFiles.publish(p);
+        assertEquals(version, STORE.read("jobs/restarted/item-files.json").version(), "nor shared over v2");
     }
 
     @TestExtension

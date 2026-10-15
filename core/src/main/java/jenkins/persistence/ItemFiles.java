@@ -83,6 +83,8 @@ public final class ItemFiles {
     static final long MAX_SIZE = SystemProperties.getLong(ItemFiles.class.getName() + ".maxSize", 1024L * 1024);
     static final String MANIFEST = "item-files.json";
     static final String BLOBS = "item-files";
+    /** What was last shared or taken of a directory, kept in it: the baseline of its next sync, after a restart too. */
+    static final String KNOWN = ".item-files-known.json";
     /** Directories of an item's directory never shared this way. */
     static final Set<String> SKIPPED = Set.of("builds", "workspace", "running", "jobs", "branches", "promotions", "configurations",
             "indexing", "lastStable", "lastSuccessful");
@@ -142,7 +144,7 @@ public final class ItemFiles {
             return false;
         }
         String key = itemKey + "/" + rel;
-        return !rel.equals(MANIFEST) && !rel.endsWith(".tmp") && !store.owns(key) && !PersistenceStores.declaredLocal(key)
+        return !rel.equals(MANIFEST) && !rel.equals(KNOWN) && !rel.endsWith(".tmp") && !store.owns(key) && !PersistenceStores.declaredLocal(key)
                 && !PersistenceStores.isKeptLocal(key);
     }
 
@@ -160,7 +162,7 @@ public final class ItemFiles {
             return;
         }
         Map<String, String> local = scan(dir, itemKey, store);
-        Map<String, String> last = known.getOrDefault(itemKey, Map.of());
+        Map<String, String> last = last(dir, itemKey);
         if (local.equals(last)) {
             return;
         }
@@ -191,7 +193,7 @@ public final class ItemFiles {
             }
             try {
                 store.write(itemKey + "/" + MANIFEST, toBytes(shared), e == null ? PersistenceStore.ABSENT : e.version());
-                known.put(itemKey, local);
+                remember(dir, itemKey, local);
                 LOGGER.fine(() -> "Shared the files of " + itemKey);
                 return;
             } catch (ConflictException again) {
@@ -214,11 +216,11 @@ public final class ItemFiles {
             return;
         }
         Map<String, String> shared = parse(store.read(itemKey + "/" + MANIFEST));
+        Map<String, String> last = last(dir, itemKey);
         if (shared.isEmpty() && !known.containsKey(itemKey)) {
             return; // nothing shared, nothing taken before: leave the directory as it is (or absent)
         }
         Map<String, String> local = scan(dir, itemKey, store);
-        Map<String, String> last = known.getOrDefault(itemKey, Map.of());
         // what is in sync after this: what was taken, plus what was in sync before (not what changed here meanwhile)
         Map<String, String> synced = new TreeMap<>(last);
         for (Map.Entry<String, String> f : shared.entrySet()) {
@@ -255,7 +257,45 @@ public final class ItemFiles {
                 synced.remove(path);
             }
         }
-        known.put(itemKey, synced);
+        remember(dir, itemKey, synced);
+    }
+
+    /** What was last shared or taken of a directory: as known in memory, or as kept in it (as before a restart). */
+    private static Map<String, String> last(File dir, String itemKey) {
+        Map<String, String> files = known.get(itemKey);
+        if (files != null) {
+            return files;
+        }
+        Path f = dir.toPath().resolve(KNOWN);
+        if (Files.isRegularFile(f, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+            try {
+                files = parse(new PersistenceStore.Entry(Files.readAllBytes(f), PersistenceStore.ANY));
+                known.put(itemKey, files);
+                return files;
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.FINE, "Could not read " + f, e);
+            }
+        }
+        return Map.of();
+    }
+
+    /** Records what was shared or taken of a directory, in memory and in it. */
+    private static void remember(File dir, String itemKey, Map<String, String> files) {
+        known.put(itemKey, files);
+        if (!dir.isDirectory()) {
+            return;
+        }
+        try {
+            Path tmp = Files.createTempFile(dir.toPath(), ".item-files-known", ".tmp");
+            try {
+                Files.write(tmp, toBytes(files));
+                Files.move(tmp, dir.toPath().resolve(KNOWN), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } finally {
+                Files.deleteIfExists(tmp);
+            }
+        } catch (IOException e) {
+            LOGGER.log(Level.FINE, "Could not keep what was shared of " + dir, e);
+        }
     }
 
     /** Whether a directory between an item's directory and a file in it is a link (or something else than a directory). */
