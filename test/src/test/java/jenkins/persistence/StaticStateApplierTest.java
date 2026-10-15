@@ -518,6 +518,28 @@ class StaticStateApplierTest {
     }
 
     @Test
+    void anEmptyNodeDirectoryLeftHereDoesNotHideTheNode() throws Exception {
+        assertTrue(new File(r.jenkins.getRootDir(), "nodes/ghost").mkdirs()); // e.g. left by a node deleted elsewhere
+        r.jenkins.getNodesObject().load();
+        assertFalse(PersistenceStores.isKeptLocal("nodes/ghost/config.xml"));
+        r.createSlave("n1", null, null);
+        writeElsewhere("nodes/ghost/config.xml", text("nodes/n1/config.xml").replace("<name>n1</name>", "<name>ghost</name>"));
+        assertNotNull(r.jenkins.getNode("ghost"), "a node made elsewhere under that name is seen here");
+    }
+
+    @Test
+    void anotherControllersCloudAgentIsNotLaunchedForADirectoryHere() throws Exception {
+        r.createSlave("n2", null, null);
+        String cloudXml = text("nodes/n2/config.xml").replace("<name>n2</name>", "<name>pod4</name>")
+                .replaceFirst("<slave>", "<jenkins.persistence.StaticStateApplierTest_-TestCloudAgent>")
+                .replaceFirst("</slave>\\s*$", "</jenkins.persistence.StaticStateApplierTest_-TestCloudAgent>");
+        writeElsewhere("nodes/pod4/config.xml", cloudXml);
+        new File(r.jenkins.getRootDir(), "nodes/pod4").mkdirs(); // a stray directory of that name here
+        r.jenkins.getNodesObject().load();
+        assertNull(r.jenkins.getNode("pod4"), "another controller's cloud agent is not launched here");
+    }
+
+    @Test
     void pluginStateGoesToItsHandler() throws Exception {
         writeElsewhere("custom.plugin.xml", "<x/>");
         assertEquals(List.of("custom.plugin.xml false"), Handler.seen);
