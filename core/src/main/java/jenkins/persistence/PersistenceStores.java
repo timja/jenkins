@@ -443,6 +443,10 @@ public final class PersistenceStores {
             }
             throw e;
         }
+        // this controller does not apply its own move events: placeholders cached for the old location would otherwise
+        // show for an item created there later
+        RunningBuilds.invalidateBelow(fromKey);
+        RunningBuilds.invalidateBelow(toKey);
         // the moved entries have new versions: take them as seen where this JVM had seen the entry as it was moved, so
         // that the moved item's next save is still checked for conflicts; where it had seen an older version (changed
         // elsewhere since), keep that older one, so that the next save conflicts and merges as it would have unmoved
