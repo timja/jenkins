@@ -56,6 +56,7 @@ import java.io.OutputStream;
 import java.io.StringReader;
 import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.ListIterator;
@@ -387,6 +388,10 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
             throw new IOException("Trying to rename an item that does not support this operation.");
         }
 
+        if (newName != null && !newName.equals(this.name)) {
+            keepDerivedUuids(this);
+        }
+
         // always synchronize from bigger objects first
         final ItemGroup parent = getParent();
         String oldName = this.name;
@@ -565,6 +570,37 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
             // saved before items had one: derived from its name, so every controller sharing it derives the same one
             // (and it is kept from now on, whatever the item is renamed to, once saved)
             itemUuid = legacyItemUuid(getFullName());
+            derivedUuid = true;
+        }
+    }
+
+    /** Whether {@link #itemUuid} was derived from the name this item was loaded with, and is not saved yet. */
+    private transient volatile boolean derivedUuid;
+
+    /**
+     * Saves an item about to be renamed or moved, and the items in it, whose identity was derived from their names when
+     * they were loaded and is not saved yet: it would otherwise be derived again from the new names when loaded next (on
+     * another controller, or here after a restart), and be another one.
+     */
+    @Restricted(NoExternalUse.class)
+    public static void keepDerivedUuids(@NonNull Item item) throws IOException {
+        if (PersistenceStores.isApplyingRemoteChange()) {
+            return; // moved elsewhere: that controller saved them
+        }
+        List<AbstractItem> derived = new ArrayList<>();
+        if (item instanceof AbstractItem ai && ai.derivedUuid) {
+            derived.add(ai);
+        }
+        if (item instanceof ItemGroup<?> group) {
+            for (AbstractItem child : Items.allItems2(ACL.SYSTEM2, group, AbstractItem.class)) {
+                if (child.derivedUuid) {
+                    derived.add(child);
+                }
+            }
+        }
+        for (AbstractItem ai : derived) {
+            ai.save();
+            ai.derivedUuid = false;
         }
     }
 

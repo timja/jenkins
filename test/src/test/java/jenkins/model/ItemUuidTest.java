@@ -32,6 +32,7 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 
+import hudson.model.AbstractItem;
 import hudson.model.FreeStyleProject;
 import hudson.model.Item;
 import hudson.model.User;
@@ -44,6 +45,7 @@ import javax.xml.transform.stream.StreamSource;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.MockAuthorizationStrategy;
+import org.jvnet.hudson.test.MockFolder;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 
 /** An item's identity survives renames and configuration updates, and copies get their own (Target 15). */
@@ -103,6 +105,35 @@ class ItemUuidTest {
         assertNotEquals(id, mine.getItemUuid());
         assertSame(secret, ItemUuids.get(id));
         assertSame(mine, ItemUuids.get(mine.getItemUuid()));
+    }
+
+    private static void savedBeforeItemsHadOne(Item... items) throws Exception {
+        for (Item i : items) {
+            hudson.XmlFile f = hudson.model.Items.getConfigFile(i);
+            java.nio.file.Files.writeString(f.getFile().toPath(), f.asString().replaceAll("<itemUuid>[^<]*</itemUuid>", ""));
+        }
+    }
+
+    @Test
+    void anIdentityDerivedFromANameIsKeptThroughRenamesAndMoves(JenkinsRule r) throws Exception {
+        savedBeforeItemsHadOne(r.createFreeStyleProject("a"), r.createFreeStyleProject("m"), r.createFolder("f"));
+        savedBeforeItemsHadOne(((MockFolder) r.jenkins.getItem("f")).createProject(FreeStyleProject.class, "c"));
+        r.createFolder("dest");
+        r.jenkins.reload();
+        String a = r.jenkins.getItemByFullName("a").getItemUuid();
+        String m = r.jenkins.getItemByFullName("m").getItemUuid();
+        String c = r.jenkins.getItemByFullName("f/c").getItemUuid();
+        assertEquals(AbstractItem.legacyItemUuid("f/c"), c);
+        MockFolder dest = r.jenkins.getItemByFullName("dest", MockFolder.class);
+
+        r.jenkins.getItemByFullName("a", FreeStyleProject.class).renameTo("a2");
+        hudson.model.Items.move(r.jenkins.getItemByFullName("m", FreeStyleProject.class), dest);
+        hudson.model.Items.move(r.jenkins.getItemByFullName("f", MockFolder.class), dest); // with its child
+        r.jenkins.reload(); // as another controller, or this one after a restart
+
+        assertEquals(a, r.jenkins.getItemByFullName("a2").getItemUuid());
+        assertEquals(m, r.jenkins.getItemByFullName("dest/m").getItemUuid());
+        assertEquals(c, r.jenkins.getItemByFullName("dest/f/c").getItemUuid());
     }
 
     @Test
