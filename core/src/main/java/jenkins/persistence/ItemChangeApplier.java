@@ -578,7 +578,7 @@ public final class ItemChangeApplier {
     private boolean build(ChangeEvent e) throws Exception {
         String permalinks = StoredPermalinks.buildsKeyOf(e.key());
         if (permalinks != null) {
-            StoredPermalinks.changedElsewhere(permalinks);
+            StoredPermalinks.changedElsewhere(permalinks, e.version());
             applied.incrementAndGet();
             return true;
         }
