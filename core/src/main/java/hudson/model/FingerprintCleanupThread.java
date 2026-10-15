@@ -33,6 +33,7 @@ import jenkins.fingerprints.FileFingerprintStorage;
 import jenkins.fingerprints.FingerprintStorage;
 import jenkins.fingerprints.GlobalFingerprintConfiguration;
 import jenkins.util.ClusterSingleton;
+import jenkins.util.PeriodicWorkCoordinator;
 import org.jenkinsci.Symbol;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
@@ -45,9 +46,12 @@ import org.kohsuke.accmod.restrictions.NoExternalUse;
  * A {@link Fingerprint} is removed when none of the builds that
  * it point to is available in the records.
  *
+ * <p>Runs on every controller, since each keeps its own {@link FileFingerprintStorage}. When periodic work is
+ * coordinated across controllers sharing state ({@link PeriodicWorkCoordinator}), a fingerprint storage other than
+ * files, shared by them, is cleaned by {@link Shared} instead, once per cluster.
+ *
  * @author Kohsuke Kawaguchi
  */
-@ClusterSingleton // acts on shared state: once per cluster of controllers sharing it
 @Extension @Symbol("fingerprintCleanup")
 @Restricted(NoExternalUse.class)
 public class FingerprintCleanupThread extends AsyncPeriodicWork {
@@ -67,6 +71,7 @@ public class FingerprintCleanupThread extends AsyncPeriodicWork {
         // asked for explicitly: runs here whichever controller the cluster has run the scheduled cleanup on
         try (ACLContext ignored = ACL.as2(ACL.SYSTEM2)) {
             getInstance().doRun();
+            ExtensionList.lookupSingleton(Shared.class).doRun();
         }
     }
 
@@ -84,7 +89,10 @@ public class FingerprintCleanupThread extends AsyncPeriodicWork {
             LOGGER.fine("Fingerprint cleanup is disabled. Skipping execution");
             return;
         }
-        FingerprintStorage.get().iterateAndCleanupFingerprints(listener);
+        FingerprintStorage storage = FingerprintStorage.get();
+        if (storage instanceof FileFingerprintStorage || !coordinated()) {
+            storage.iterateAndCleanupFingerprints(listener);
+        }
 
         final FileFingerprintStorage fileFingerprintStorage = ExtensionList.lookupSingleton(FileFingerprintStorage.class);
         if (!(FingerprintStorage.get() instanceof FileFingerprintStorage) &&
@@ -93,4 +101,33 @@ public class FingerprintCleanupThread extends AsyncPeriodicWork {
         }
     }
 
+    private static boolean coordinated() {
+        return !ExtensionList.lookup(PeriodicWorkCoordinator.class).isEmpty();
+    }
+
+    /**
+     * Cleans a fingerprint storage shared by controllers, once per cluster, when periodic work is coordinated.
+     */
+    @ClusterSingleton // acts on shared state: once per cluster of controllers sharing it
+    @Extension
+    @Restricted(NoExternalUse.class)
+    public static final class Shared extends AsyncPeriodicWork {
+
+        public Shared() {
+            super("Shared fingerprint cleanup");
+        }
+
+        @Override
+        public long getRecurrencePeriod() {
+            return DAY;
+        }
+
+        @Override
+        public void execute(TaskListener listener) {
+            FingerprintStorage storage = FingerprintStorage.get();
+            if (!GlobalFingerprintConfiguration.get().isFingerprintCleanupDisabled() && !(storage instanceof FileFingerprintStorage) && coordinated()) {
+                storage.iterateAndCleanupFingerprints(listener);
+            }
+        }
+    }
 }
