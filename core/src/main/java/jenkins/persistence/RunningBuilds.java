@@ -398,6 +398,9 @@ public final class RunningBuilds {
      */
     public static void update(@NonNull Run<?, ?> run, @NonNull Map<String, String> properties) throws IOException {
         String key = placeholderKey(run);
+        if (key != null && lost.contains(key)) {
+            throw new ConflictException(key, PersistenceStore.ANY, PersistenceStore.ANY); // no longer owned here (lost forgets it)
+        }
         Placeholder p = key == null ? null : owned.get(key);
         if (p == null) {
             return;
@@ -423,7 +426,7 @@ public final class RunningBuilds {
         owned.remove(key);
         LOGGER.warning(() -> "Ownership of " + run + " was lost to another controller; stopping it here");
         Executor executor = run.getExecutor();
-        if (executor != null) {
+        if (executor != null && run.isLogUpdated()) { // not once completed: only fenced then
             executor.interrupt(Result.ABORTED, new OwnershipLost());
         }
     }
@@ -478,6 +481,10 @@ public final class RunningBuilds {
             try {
                 PersistenceStores.applyingRemoteChange(() -> {
                     BuildRecords.deletedElsewhere(job, number);
+                    if (BuildRecords.isStored(job, number)) {
+                        // its new owner published it already, and this controller applied that to the copy just discarded
+                        BuildRecords.writtenElsewhere(job, number);
+                    }
                     return null;
                 });
                 if (key != null) {
