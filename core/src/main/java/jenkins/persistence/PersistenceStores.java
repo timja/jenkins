@@ -211,7 +211,8 @@ public final class PersistenceStores {
      * Moves the stored entries below one directory to another, as when an item is renamed or moved.
      * Does nothing if no store is active or the directories are outside {@code JENKINS_HOME}.
      *
-     * @throws ConflictException if something is already stored at the destination
+     * @throws ConflictException if something is already stored at the destination, or the item's configuration is no
+     *     longer stored at the source (moved or deleted elsewhere)
      */
     public static void move(@NonNull File from, @NonNull File to) throws IOException {
         PersistenceStore store = get();
@@ -228,6 +229,7 @@ public final class PersistenceStores {
             throw new IllegalArgumentException("Cannot move " + fromKey + " to " + toKey);
         }
         List<PersistenceStore.Moved> moved = store.move(fromKey, toKey);
+        checkItemMoved(store, fromKey, toKey, moved);
         // the moved entries have new versions: take them as seen where this JVM had seen the entry as it was moved, so
         // that the moved item's next save is still checked for conflicts; where it had seen an older version (changed
         // elsewhere since), keep that older one, so that the next save conflicts and merges as it would have unmoved
@@ -240,6 +242,28 @@ public final class PersistenceStores {
                 seen(m.to(), last == m.fromVersion() ? m.version() : last);
             }
         }
+    }
+
+    /**
+     * Fails a move that did not move the item's configuration: the item is no longer stored there, as it was renamed,
+     * moved or deleted on another controller, which this one has not applied yet. Going on would store it again under the
+     * new name, next to where it went. Whatever else was moved is moved back.
+     */
+    private static void checkItemMoved(PersistenceStore store, String fromKey, String toKey, List<PersistenceStore.Moved> moved)
+            throws IOException {
+        String config = fromKey + "/config.xml";
+        if (!store.owns(config) || moved.stream().anyMatch(m -> m.from().equals(config))) {
+            return;
+        }
+        ConflictException e = new ConflictException(config, PersistenceStore.ANY, PersistenceStore.ABSENT);
+        if (!moved.isEmpty()) {
+            try {
+                store.move(toKey, fromKey); // what was left at the old key
+            } catch (IOException | RuntimeException x) {
+                e.addSuppressed(x);
+            }
+        }
+        throw e;
     }
 
     /**
