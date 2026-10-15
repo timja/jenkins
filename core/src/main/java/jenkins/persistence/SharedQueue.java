@@ -273,6 +273,8 @@ public final class SharedQueue {
     static final Set<Long> sharing = ConcurrentHashMap.newKeySet();
     /** Items cancelled here while being shared, whose cancellation is shared once they are. */
     private static final Set<Long> cancelledWhileSharing = ConcurrentHashMap.newKeySet();
+    /** Items whose record is being looked up, nothing being known of it here. */
+    private static final Set<Long> reconciling = ConcurrentHashMap.newKeySet();
     /** Items with a claim under way. */
     private static final Set<Long> claiming = ConcurrentHashMap.newKeySet();
 
@@ -364,29 +366,57 @@ public final class SharedQueue {
             }
             // under the queue lock (schedule2): only prepared here, shared by the outbox; it does not start meanwhile
             List<Action> actions = List.copyOf(wi.getActions());
-            ClusterQueue.Record record = new ClusterQueue.Record(wi.getId(), ((Job<?, ?>) wi.task).getFullName(),
-                    dedupKey(wi.task, actions), toXml(actions), dueOf(wi), ClusterQueue.State.WAITING, origin(), pinnedTo(actions), null, 0);
+            ClusterQueue.Record record = record(wi, actions);
             sharing.add(wi.getId());
             outbox(wi.getId()).submit(() -> share(wi, record, actions));
         }
 
-        private static void share(Queue.WaitingItem wi, ClusterQueue.Record record, List<Action> actions) {
-            long id = wi.getId();
+        private static ClusterQueue.Record record(Queue.Item item, List<Action> actions) {
+            return new ClusterQueue.Record(item.getId(), ((Job<?, ?>) item.task).getFullName(),
+                    dedupKey(item.task, actions), toXml(actions), dueOf(item), ClusterQueue.State.WAITING, origin(), pinnedTo(actions), null, 0);
+        }
+
+        /**
+         * Off the lock: looks up the record of an item nothing is known of here (restored from before a restart, or
+         * whose publication failed, perhaps after the store had it), or publishes the item if the store has none.
+         */
+        static void reconcile(long id) {
+            try (ACLContext ctx = ACL.as2(ACL.SYSTEM2)) {
+                ClusterQueue.Record r = queue().get(id);
+                if (r != null) {
+                    know(r);
+                    return;
+                }
+                Queue.Item item = localItem(id);
+                if (item != null && sharing.add(id)) {
+                    List<Action> actions = List.copyOf(item.getActions());
+                    share(item, record(item, actions), actions);
+                }
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.FINE, "Cannot look up queue item " + id + "; not starting it for now", e);
+            } finally {
+                reconciling.remove(id);
+                Queue.getInstance().scheduleMaintenance();
+            }
+        }
+
+        private static void share(Queue.Item item, ClusterQueue.Record record, List<Action> actions) {
+            long id = item.getId();
             try (ACLContext ctx = ACL.as2(ACL.SYSTEM2)) { // to see the job when mirroring the item folded into
                 ClusterQueue cq = queue();
                 ClusterQueue.Record stored = cq.publish(record);
                 know(stored);
-                if (stored.id() != wi.getId()) {
+                if (stored.id() != item.getId()) {
                     // the same job and parameters were already waiting (scheduled elsewhere at the same time): fold into
                     // that item, then drop this one, which has not started (the gate held it)
-                    LOGGER.fine(() -> wi + " folds into queue item " + stored.id() + " from " + stored.origin());
-                    fold(cq, stored.id(), actions, dueOf(wi), record.pinnedTo());
-                    // by id: with no quiet period, wi may be blocked or buildable by now
+                    LOGGER.fine(() -> item + " folds into queue item " + stored.id() + " from " + stored.origin());
+                    fold(cq, stored.id(), actions, dueOf(item), record.pinnedTo());
+                    // by id: with no quiet period, it may be blocked or buildable by now
                     PersistenceStores.applyingRemoteChange(() -> Queue.getInstance().cancelLocal(id));
                     Mirror.mirror(stored.id());
                 }
             } catch (IOException | RuntimeException e) {
-                LOGGER.log(Level.WARNING, "Failed to share " + wi + "; it stays local", e);
+                LOGGER.log(Level.WARNING, "Failed to share " + item + "; it does not start until it is", e);
             } finally {
                 sharing.remove(id);
                 if (cancelledWhileSharing.remove(id)) {
@@ -488,7 +518,12 @@ public final class SharedQueue {
             }
             ClusterQueue.Record r = known.get(id);
             if (r == null) {
-                return null; // never shared (e.g. publishing failed)
+                // restored from before a restart, or its publication failed (perhaps after the store had it): whether
+                // it may start depends on its record, if any; during a store outage it waits rather than risk a duplicate
+                if (reconciling.add(id)) {
+                    outbox(id).submit(() -> Publisher.reconcile(id));
+                }
+                return new Blocked("Being checked with the other controllers");
             }
             String me = origin();
             if (me.equals(r.claimedBy())) {
