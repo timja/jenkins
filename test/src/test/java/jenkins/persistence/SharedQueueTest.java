@@ -27,6 +27,7 @@ package jenkins.persistence;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.instanceOf;
+import static org.hamcrest.Matchers.startsWith;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -84,7 +85,31 @@ class SharedQueueTest {
         public ClusterQueue queue() {
             return noQueue ? null : slowFor(clusterQueue());
         }
+
+        @Override
+        public Set<String> liveOrigins() {
+            return live;
+        }
+
+        @Override
+        public void delete(String key, long expectedVersion) throws ConflictException {
+            java.util.concurrent.CountDownLatch l = slowRelease;
+            if (l != null && key.startsWith("queue/reserved/")) {
+                try {
+                    l.await();
+                } catch (InterruptedException e) {
+                    throw new IllegalStateException(e);
+                }
+            }
+            super.delete(key, expectedVersion);
+        }
     };
+
+    /** The controllers known to be alive, or null if that is not known. */
+    static volatile Set<String> live;
+
+    /** While set, releasing a reservation waits for it: a store answering slowly. */
+    static volatile java.util.concurrent.CountDownLatch slowRelease;
 
     /** While set, the store has no queue (each controller has its own). */
     static volatile boolean noQueue;
@@ -401,6 +426,51 @@ class SharedQueueTest {
         } finally {
             SharedQueue.ORIGIN_GRACE_MILLIS = grace;
         }
+    }
+
+    @Test
+    void theControllerProvisioningForAnItemWhoseControllerIsGoneReservesIt() throws Exception {
+        Label cloudy = Label.get("cloudy-orphan"); // no node has it: the item stays buildable, unclaimed
+        FreeStyleProject p = r.createFreeStyleProject("cloudy-orphan");
+        p.setAssignedLabel(cloudy);
+        live = Set.of(STORE.getOrigin()); // the other controller is gone: this one provisions for its item
+        try {
+            ClusterQueue.Record rec = publishElsewhere("cloudy-orphan", 0, "gus");
+            String key = SharedQueue.Reservations.key(rec.id());
+            // which it had reserved before it went
+            STORE.write(key, ("other-controller " + System.currentTimeMillis()).getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+            for (int i = 0; i < 100 && Queue.getInstance().getBuildableItems().isEmpty(); i++) {
+                Thread.sleep(100);
+            }
+            assertEquals(1, Queue.getInstance().getBuildableItems().size());
+            new SharedQueue.Reservations().onStarted(new hudson.slaves.Cloud("test") {}, cloudy,
+                    List.of(new hudson.slaves.NodeProvisioner.PlannedNode("agent", new java.util.concurrent.CompletableFuture<>(), 1)));
+            assertThat(new String(STORE.read(key).content(), StandardCharsets.UTF_8), startsWith(STORE.getOrigin() + " "));
+        } finally {
+            live = null;
+            Queue.getInstance().clear();
+        }
+    }
+
+    @Test
+    void cancellingAReservedItemDoesNotWaitForTheStoreToReleaseIt() throws Exception {
+        r.createFreeStyleProject("reserved-cancelled");
+        ClusterQueue.Record rec = publishElsewhere("reserved-cancelled", 60_000, "hal");
+        String key = SharedQueue.Reservations.key(rec.id());
+        STORE.write(key, (STORE.getOrigin() + " " + System.currentTimeMillis()).getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        Queue.Item item = Queue.getInstance().getItem(rec.id());
+        slowRelease = new java.util.concurrent.CountDownLatch(1);
+        try {
+            assertTrue(java.util.concurrent.CompletableFuture.supplyAsync(() -> Queue.getInstance().cancel(item))
+                    .get(10, java.util.concurrent.TimeUnit.SECONDS), "not waiting for the store under the queue lock");
+        } finally {
+            slowRelease.countDown();
+            slowRelease = null;
+        }
+        for (int i = 0; i < 500 && STORE.read(key) != null; i++) {
+            Thread.sleep(10);
+        }
+        assertNull(STORE.read(key), "released afterwards");
     }
 
     @Test

@@ -558,7 +558,8 @@ public final class SharedQueue {
                 Timer.get().submit(() -> releaseExclusive(job, claimHolder(id)));
             }
             if (li.isCancelled() && shared(li.task)) {
-                Reservations.release(li.getId());
+                long id = li.getId();
+                Timer.get().submit(() -> Reservations.release(id)); // a store call: not under the queue lock
             }
             if (!li.isCancelled() || PersistenceStores.isApplyingRemoteChange() || !shared(li.task)) {
                 return;
@@ -775,6 +776,8 @@ public final class SharedQueue {
      * origin's head start; without a reservation, another controller with a free executor would take the item, and the
      * agent started for it would have nothing to do. A reservation is a store entry, {@code queue/reserved/<id>}, holding
      * the controller's origin; others wait for it while that controller is alive, for at most {@link #RESERVATION_MILLIS}.
+     * It is a hint, not a fence: a controller claiming the item at the moment it is reserved may still take it, and the
+     * agent started for it then idles until its cloud's retention removes it.
      */
     @Restricted(NoExternalUse.class)
     @Extension
@@ -835,7 +838,11 @@ public final class SharedQueue {
                 }
                 try {
                     ClusterQueue.Record r = cq.get(bi.getId());
-                    if (r == null || r.claimedBy() != null || !me.equals(r.origin()) || holder(bi.getId()) != null) {
+                    if (r == null || r.claimedBy() != null || !provisionsHere(r, System.currentTimeMillis())) {
+                        continue;
+                    }
+                    String reservedBy = holder(bi.getId());
+                    if (reservedBy != null && (me.equals(reservedBy) || !gone(reservedBy))) {
                         continue;
                     }
                     store.write(key(bi.getId()), (me + " " + System.currentTimeMillis()).getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
@@ -846,6 +853,36 @@ public final class SharedQueue {
                 }
             }
         }
+    }
+
+    /** Whether a controller which reserved an item is known to be gone (its reservation then holds nothing up). */
+    private static boolean gone(String origin) throws IOException {
+        Set<String> live = PersistenceStores.get().liveOrigins();
+        return live != null && !live.contains(origin);
+    }
+
+    /**
+     * Whether this controller provisions for an item: the one that claimed it, or it is pinned to; otherwise its origin
+     * while alive (it goes first, and may hold the agents the build needs); otherwise, any.
+     */
+    static boolean provisionsHere(@NonNull ClusterQueue.Record r, long now) throws IOException {
+        String me = origin();
+        if (r.claimedBy() != null) {
+            return me.equals(r.claimedBy());
+        }
+        if (r.pinnedTo() != null) {
+            return me.equals(r.pinnedTo());
+        }
+        if (me.equals(r.origin())) {
+            return true;
+        }
+        Set<String> live = PersistenceStores.get().liveOrigins();
+        if (live == null) {
+            // membership unknown: as the gate decides, its controller goes first, any other after a while
+            return now > r.dueAt() + ORIGIN_GRACE_MILLIS;
+        }
+        // its controller is gone: one of the others provisions, the same one whichever of them asks
+        return !live.contains(r.origin()) && me.equals(provisioner(r.id(), live));
     }
 
     /** How long a reservation holds at most (the agent may never come up). */
@@ -874,10 +911,7 @@ public final class SharedQueue {
         /** Recent provisioning answers per item id: load statistics ask for every label, every few seconds. */
         private final Map<Long, Map.Entry<Long, Boolean>> provisioning = new ConcurrentHashMap<>();
 
-        /**
-         * Only one controller provisions for an item: the one that claimed it, or it is pinned to; otherwise its origin
-         * while alive (it goes first, and may hold the agents the build needs); otherwise, any.
-         */
+        /** Only one controller provisions for an item: see {@link #provisionsHere}. */
         @Override
         public boolean countsForProvisioning(@NonNull Queue.BuildableItem item) {
             if (!shared(item.task)) {
@@ -891,27 +925,7 @@ public final class SharedQueue {
             boolean answer;
             try {
                 ClusterQueue.Record r = queue().get(item.getId());
-                String me = origin();
-                if (r == null) {
-                    answer = true;
-                } else if (r.claimedBy() != null) {
-                    answer = me.equals(r.claimedBy());
-                } else if (r.pinnedTo() != null) {
-                    answer = me.equals(r.pinnedTo());
-                } else if (me.equals(r.origin())) {
-                    answer = true;
-                } else {
-                    Set<String> live = PersistenceStores.get().liveOrigins();
-                    if (live == null) {
-                        // membership unknown: as the gate decides, its controller goes first, any other after a while
-                        answer = now > r.dueAt() + ORIGIN_GRACE_MILLIS;
-                    } else if (live.contains(r.origin())) {
-                        answer = false;
-                    } else {
-                        // its controller is gone: one of the others provisions, the same one whichever of them asks
-                        answer = me.equals(provisioner(r.id(), live));
-                    }
-                }
+                answer = r == null || provisionsHere(r, now);
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.FINE, e, () -> "Cannot tell who provisions for " + item);
                 answer = true;
@@ -982,8 +996,7 @@ public final class SharedQueue {
                 if (r != null && r.state() == ClusterQueue.State.WAITING && (r.pinnedTo() == null || me.equals(r.pinnedTo()))) {
                     String reservedBy = Reservations.holder(id);
                     if (reservedBy != null && !origin().equals(reservedBy)) {
-                        Set<String> live = PersistenceStores.get().liveOrigins();
-                        if (live == null || live.contains(reservedBy)) {
+                        if (!gone(reservedBy)) {
                             notClaimed.put(id, "Waiting for the agent the controller it was scheduled on is starting for it");
                             changed = false; // looked at again at the next maintenance, not at once
                             return;
