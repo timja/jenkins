@@ -642,6 +642,46 @@ class BuildLeasesTest {
         forget("unwritten");
     }
 
+    @Test
+    void adoptionFailingOnARetryKeepsNoExclusiveLease() throws Exception {
+        String key = orphan("retried-adoption");
+        // the first attempt conflicts with a newer save point (with the job's exclusive lease taken); the second fails
+        Adopter.interfere = () -> {
+            Adopter.interfere = null;
+            Adopter.failPrepare = 1;
+            dead.write(key, placeholder("dead-controller", 1, 1, "x.savePoint=4\n"), PersistenceStore.ANY);
+        };
+
+        RunningBuilds.removeStale();
+
+        assertThat(text(key), containsString("origin=dead-controller"));
+        PersistenceStore third = STORE.as("third-controller");
+        long epoch = third.leases().acquire("jobs/retried-adoption/running/exclusive");
+        assertThat("this controller, which runs none of its builds, does not keep the job's exclusive lease", epoch, greaterThan(0L));
+        third.leases().release("jobs/retried-adoption/running/exclusive", epoch);
+        forget("retried-adoption");
+    }
+
+    @Test
+    void adoptedBuildReleasesTheExclusiveLeaseWithoutASharedQueue() throws Exception {
+        String key = orphan("adopted-alone"); // this store has leases, but no queue
+        RunningBuilds.removeStale();
+        assertThat(text(key), containsString("origin=" + STORE.getOrigin()));
+        String exclusive = "jobs/adopted-alone/running/exclusive";
+        PersistenceStore third = STORE.as("third-controller");
+        assertEquals(0, third.leases().acquire(exclusive), "held for the adopted build");
+
+        // the test adopter loads no build: one of that number, run here, stands for the adopted build completing
+        FreeStyleProject p = r.jenkins.getItemByFullName("adopted-alone", FreeStyleProject.class);
+        r.buildAndAssertSuccess(p);
+
+        long epoch = third.leases().acquire(exclusive);
+        assertThat("released once the adopted build was finalized", epoch, greaterThan(0L));
+        third.leases().release(exclusive, epoch);
+        assertNull(text(key));
+        forget("adopted-alone");
+    }
+
     @TestExtension
     public static class Adopter implements BuildAdopter {
         static final List<String> prepared = new CopyOnWriteArrayList<>();

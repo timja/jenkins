@@ -751,6 +751,18 @@ public final class RunningBuilds {
      * @return true if it was adopted
      */
     private static boolean adopt(PersistenceStore store, Job<?, ?> job, String key, long epoch) throws IOException {
+        try {
+            return offer(store, job, key, epoch);
+        } finally {
+            if (!owned.containsKey(key)) {
+                // not resumed here (gone, left for later, nobody could, or failing): the job's exclusive lease is not
+                // kept for it, if it was taken
+                SharedQueue.abandonExclusive(job, Integer.parseInt(key.substring(key.lastIndexOf('/') + 1, key.length() - SUFFIX.length())));
+            }
+        }
+    }
+
+    private static boolean offer(PersistenceStore store, Job<?, ?> job, String key, long epoch) throws IOException {
         int number = Integer.parseInt(key.substring(key.lastIndexOf('/') + 1, key.length() - SUFFIX.length()));
         for (int attempt = 0; attempt < ADOPTION_ATTEMPTS; attempt++) {
             PersistenceStore.Entry entry = store.read(key);
@@ -779,14 +791,14 @@ public final class RunningBuilds {
             if (adoption == null) {
                 return false; // nobody can adopt it
             }
-            if (!SharedQueue.adoptExclusive(job)) {
-                // a newer build of this job (which allows one at a time) runs elsewhere: resume this one later
+            if (!SharedQueue.adoptExclusive(job, number)) {
+                // a newer build of this job (which allows one at a time) runs elsewhere, or here: resume this one later
                 adoption.abandon();
                 BuildLeases leases = store.leases();
                 if (leases != null) {
                     leases.release(key, epoch);
                 }
-                LOGGER.info(() -> "Not adopting " + job.getFullName() + " #" + number + " yet: another build of it runs elsewhere");
+                LOGGER.info(() -> "Not adopting " + job.getFullName() + " #" + number + " yet: another build of it runs");
                 return true; // nothing to remove: a later sweep adopts it
             }
             Placeholder mine = p.withOwner(store.getOrigin(), CONTROLLER_NAME, epoch, p.properties);
@@ -797,7 +809,6 @@ public final class RunningBuilds {
                 version = store.writeIfHeld(key, epoch, key, mine.toBytes(), p.version);
             } catch (LeaseLostException e) {
                 adoption.abandon();
-                abandonExclusive(job); // for the controller which has it now
                 throw e;
             } catch (ConflictException e) {
                 // the previous owner recorded a newer save point while it was being fetched
@@ -822,16 +833,7 @@ public final class RunningBuilds {
             }
             return true;
         }
-        abandonExclusive(job);
         return false;
-    }
-
-    /** Gives up the job's exclusive lease taken for an adoption that did not happen, unless a build of the job runs here. */
-    private static void abandonExclusive(Job<?, ?> job) {
-        String runningKey = runningKey(job);
-        if (runningKey != null && owned.keySet().stream().noneMatch(k -> k.startsWith(runningKey + "/"))) {
-            SharedQueue.abandonExclusive(job);
-        }
     }
 
     /**
@@ -853,7 +855,6 @@ public final class RunningBuilds {
             e.addSuppressed(x); // changed since: by its next owner
         }
         invalidate(jobKeyOfRunning(runningKey(job)));
-        abandonExclusive(job);
         throw new IOException("Could not resume " + previous.key, e);
     }
 
