@@ -169,8 +169,10 @@ public final class XmlFile {
         if (route != null) {
             // changed on disk since the last copy (Target 15): keep that change; and should writing it fail, keep the
             // copy as it is rather than replace it with the stored content
-            if (MaterializedFiles.writeBack(route) != MaterializedFiles.Outcome.FAILED) {
-                materialize(route);
+            synchronized (MaterializedFiles.lockFor(route.key())) { // not while the periodic write-back reads the copy
+                if (MaterializedFiles.writeBack(route) != MaterializedFiles.Outcome.FAILED) {
+                    materialize(route);
+                }
             }
         }
         return file;
