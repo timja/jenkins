@@ -60,6 +60,13 @@ class SharedConfidentialKeysTest {
     static volatile String racing;
     static volatile byte[] theirs;
     static volatile boolean storesKeys = true;
+    /** While set, reading a key from the store fails, as when it is unreachable. */
+    static volatile boolean unreachable;
+
+    @SuppressWarnings("unchecked")
+    private static <E extends Throwable> RuntimeException sneaky(Throwable t) throws E {
+        throw (E) t; // a checked exception, which the store's read declares, from a method of the test store which does not
+    }
 
     static final InMemoryPersistenceStore STORE = new InMemoryPersistenceStore(key -> false) {
         @Override
@@ -69,6 +76,9 @@ class SharedConfidentialKeysTest {
 
         @Override
         public Entry read(String key) {
+            if (unreachable && key.startsWith("secrets/")) {
+                throw SharedConfidentialKeysTest.<RuntimeException>sneaky(new java.io.IOException("the store is unreachable"));
+            }
             Entry e = super.read(key);
             if (e == null && key.equals(racing)) {
                 racing = null;
@@ -180,6 +190,24 @@ class SharedConfidentialKeysTest {
         } finally {
             storesKeys = true;
         }
+    }
+
+    @Test
+    void aTemporaryKeyBecomesTheClustersOnceTheStoreIsBack(JenkinsRule r) throws Exception {
+        String mac;
+        unreachable = true;
+        try {
+            mac = new HMACConfidentialKey("test.shared.k11").mac("x");
+            assertEquals(mac, new HMACConfidentialKey("test.shared.k11").mac("x"), "the same temporary key for every use meanwhile");
+        } finally {
+            unreachable = false;
+        }
+        assertEquals(mac, new HMACConfidentialKey("test.shared.k11").mac("x"), "and after, until it is offered to the store");
+        ((DefaultConfidentialStore) ConfidentialStore.get()).publishTemporary(new HMACConfidentialKey("test.shared.k11")); // as the retry does
+        assertNotNull(STORE.read("secrets/test.shared.k11"), "the cluster's key now");
+        assertEquals(mac, new HMACConfidentialKey("test.shared.k11").mac("x"), "kept locally, so the same after a restart");
+        Files.delete(localFile(r, "test.shared.k11").toPath()); // as another controller, or a fresh home
+        assertEquals(mac, new HMACConfidentialKey("test.shared.k11").mac("x"), "the same from the store");
     }
 
     @Test

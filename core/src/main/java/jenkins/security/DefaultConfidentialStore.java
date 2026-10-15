@@ -21,6 +21,10 @@ import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.security.GeneralSecurityException;
 import java.security.SecureRandom;
+import java.util.Arrays;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.crypto.BadPaddingException;
@@ -34,6 +38,7 @@ import jenkins.persistence.ConflictException;
 import jenkins.persistence.PersistenceStore;
 import jenkins.persistence.PersistenceStores;
 import jenkins.util.SystemProperties;
+import jenkins.util.Timer;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 
@@ -172,6 +177,10 @@ public class DefaultConfidentialStore extends ConfidentialStore {
         if (local != null) {
             return local;
         }
+        byte[] temp = temporary.get(key.getId());
+        if (temp != null) {
+            return temp.clone(); // what this JVM uses already, whatever becomes of it in the store
+        }
         PersistenceStore store = PersistenceStores.get();
         if (store == null || !store.storesConfidentialKeys()) {
             return super.loadOrCreate(key, generator);
@@ -181,11 +190,19 @@ public class DefaultConfidentialStore extends ConfidentialStore {
         try {
             shared = store.read(storeKey);
         } catch (IOException e) {
-            // the store is unreachable and this key has never been used here: a temporary key, never written, so that
-            // whatever needs it (e.g. a page) works now; the cluster's key is used, or created, once the store is back
-            // and this controller restarts (Target 14)
-            LOGGER.log(Level.WARNING, "The persistence store is unreachable: using a temporary " + key.getId(), e);
-            return generator.generate();
+            // the store is unreachable and this key has never been used here: a temporary key, so that whatever needs
+            // it (e.g. a page) works now; the same one for the rest of this JVM's life (its users keep it), and once the
+            // store is back it is offered as the cluster's key, so that what was made with it stays readable (Target 14)
+            synchronized (temporary) {
+                byte[] value = temporary.get(key.getId());
+                if (value == null) {
+                    LOGGER.log(Level.WARNING, "The persistence store is unreachable: using a temporary " + key.getId(), e);
+                    value = generator.generate();
+                    temporary.put(key.getId(), value);
+                    publishLater(key, 0);
+                }
+                return value.clone();
+            }
         }
         if (shared == null) {
             byte[] value = generator.generate();
@@ -209,6 +226,51 @@ public class DefaultConfidentialStore extends ConfidentialStore {
     }
 
     static final String SHARED_PREFIX = "secrets/";
+
+    /** Keys first used while the store was unreachable, by id, until they are written to it (or found made elsewhere). */
+    private final Map<String, byte[]> temporary = new ConcurrentHashMap<>();
+
+    /** Offers a temporary key to the store once it is reachable again, with a backoff, up to every five minutes. */
+    private void publishLater(ConfidentialKey key, int attempt) {
+        Timer.get().schedule(() -> {
+            try {
+                publishTemporary(key);
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.FINE, "Still cannot offer the temporary " + key.getId() + " to the persistence store", e);
+                publishLater(key, attempt + 1);
+            }
+        }, Math.min(300, 5L << Math.min(attempt, 6)), TimeUnit.SECONDS);
+    }
+
+    /**
+     * Writes a temporary key to the store (create-only) and locally, so that it is the cluster's key from then on, also
+     * after a restart. If another controller created the key meanwhile, its value wins for later uses (after a restart):
+     * whatever this controller made with the temporary key cannot be read with it.
+     */
+    void publishTemporary(ConfidentialKey key) throws IOException {
+        byte[] value = temporary.get(key.getId());
+        PersistenceStore store = PersistenceStores.get();
+        if (value == null || store == null) {
+            return;
+        }
+        String storeKey = SHARED_PREFIX + key.getId();
+        byte[] encrypted = encrypt(key, value);
+        try {
+            store.write(storeKey, encrypted, PersistenceStore.ABSENT);
+            writeEncrypted(key, encrypted);
+            LOGGER.info(() -> "Created " + key.getId() + " for all controllers from the temporary one used while the persistence store was unreachable");
+        } catch (ConflictException e) {
+            PersistenceStore.Entry shared = store.read(storeKey);
+            if (shared == null || !Arrays.equals(decrypt(key, shared.content()), value)) {
+                LOGGER.severe(() -> "Another controller created " + key.getId() + " while this one used a temporary one (the persistence store was unreachable): "
+                        + "what this controller made with it then cannot be read elsewhere, nor here after a restart");
+                if (shared != null) {
+                    writeEncrypted(key, shared.content());
+                }
+            }
+        }
+        temporary.remove(key.getId());
+    }
 
     /**
      * Publishes keys created locally before the store was available (create-only), and warns about any which differ from the store's.
@@ -243,7 +305,7 @@ public class DefaultConfidentialStore extends ConfidentialStore {
                     shared = store.read(storeKey);
                 }
             }
-            if (shared != null && !java.util.Arrays.equals(shared.content(), encrypted)) {
+            if (shared != null && !Arrays.equals(shared.content(), encrypted)) {
                 LOGGER.warning(() -> "Key " + f.getName() + " differs from the one other controllers use; seed the same secrets/ on every controller");
             }
         }
