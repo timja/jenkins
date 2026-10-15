@@ -368,6 +368,26 @@ class BuildRecordsTest {
     }
 
     @Test
+    void aRecordWhoseSnapshotIsNotThereIsNotMaterialized() throws Exception {
+        FreeStyleProject p = project(r, "moving");
+        r.buildAndAssertSuccess(p);
+        byte[] snapshot;
+        try (InputStream in = BLOBS.get("jobs/moving/builds/1/files.tgz")) {
+            snapshot = in.readAllBytes();
+        }
+        // as seen during a rename elsewhere: the blobs already moved, the record not yet
+        BLOBS.delete("jobs/moving/builds/1");
+        wipeAndReload(r);
+        p = r.jenkins.getItemByFullName("moving", FreeStyleProject.class);
+        assertNull(p.getBuildByNumber(1));
+        assertFalse(new File(p.getBuildDir(), "1/build.xml").exists(), "not taken as complete");
+
+        BLOBS.put("jobs/moving/builds/1/files.tgz", new ByteArrayInputStream(snapshot), snapshot.length);
+        p._getRuns().purgeCache();
+        assertThat(p.getBuildByNumber(1).getLog(), containsString("hello from #1"));
+    }
+
+    @Test
     void aClaimLeftByAMoveThatNeverFinishedIsTakenOver() throws Exception {
         FreeStyleProject p = project(r, "late-claimer");
         r.buildAndAssertSuccess(p);

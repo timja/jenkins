@@ -285,14 +285,23 @@ public final class BuildRecords {
         if (record == null) {
             return false;
         }
-        Files.createDirectories(dir.toPath());
         BlobStore blobs = PersistenceStores.getBlobStore();
+        InputStream snapshot = null;
         if (blobs != null) {
-            try (InputStream in = blobs.get(base + "/" + SNAPSHOT)) {
-                if (in != null) {
-                    new FilePath(dir).untarFrom(in, FilePath.TarCompression.GZIP);
-                    removeLinks(dir.toPath());
-                }
+            snapshot = blobs.get(base + "/" + SNAPSHOT);
+            if (snapshot == null) {
+                // a record is stored only once its snapshot is: the snapshot is moving (a rename in progress), so the
+                // build is left unmaterialized rather than taken as complete without its files; it is retrieved again
+                // once the move is applied. (A record stored before a blob store was configured would stay hidden.)
+                LOGGER.fine(() -> "Snapshot of " + base + " not there (yet); not materialized");
+                return false;
+            }
+        }
+        Files.createDirectories(dir.toPath());
+        if (snapshot != null) {
+            try (InputStream in = snapshot) {
+                new FilePath(dir).untarFrom(in, FilePath.TarCompression.GZIP);
+                removeLinks(dir.toPath());
             } catch (InterruptedException e) {
                 throw (IOException) new InterruptedIOException().initCause(e);
             }
