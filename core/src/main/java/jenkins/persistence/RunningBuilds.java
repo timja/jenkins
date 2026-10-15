@@ -409,7 +409,12 @@ public final class RunningBuilds {
             throw new ConflictException(key, p.version, PersistenceStore.ANY);
         }
         Placeholder next = p.withOwner(p.origin, p.controller, p.epoch, properties);
-        long version = PersistenceStores.get().write(key, next.toBytes(), p.version);
+        long version;
+        try {
+            version = PersistenceStores.get().writeIfHeld(key, p.epoch, key, next.toBytes(), p.version);
+        } catch (LeaseLostException e) {
+            throw new ConflictException(key, p.version, PersistenceStore.ANY); // taken over since it was checked
+        }
         owned.put(key, new Placeholder(key, p.number, p.origin, p.controller, p.displayName, p.startTime, p.epoch, properties, version));
     }
 
@@ -554,8 +559,10 @@ public final class RunningBuilds {
                         try {
                             adopted = adopt(store, job, p.key, epoch);
                         } catch (IOException | RuntimeException e) {
+                            // its placeholder is kept, for the next sweep to try again; the other builds are still looked at
+                            LOGGER.log(Level.WARNING, "Could not adopt " + job.getFullName() + " #" + p.number + "; will retry", e);
                             leases.release(p.key, epoch);
-                            throw e;
+                            continue;
                         }
                         if (adopted) {
                             removedHere++;
@@ -625,7 +632,12 @@ public final class RunningBuilds {
             Placeholder mine = p.withOwner(store.getOrigin(), CONTROLLER_NAME, epoch, p.properties);
             long version;
             try {
-                version = store.write(key, mine.toBytes(), p.version);
+                // fenced by the lease: it may have lapsed while the adoption was prepared (a save point fetched), and
+                // another controller taken the build over meanwhile
+                version = store.writeIfHeld(key, epoch, key, mine.toBytes(), p.version);
+            } catch (LeaseLostException e) {
+                adoption.abandon();
+                throw e;
             } catch (ConflictException e) {
                 // the previous owner recorded a newer save point while it was being fetched
                 adoption.abandon();
@@ -635,14 +647,46 @@ public final class RunningBuilds {
             owned.put(key, new Placeholder(key, number, mine.origin, mine.controller, p.displayName, p.startTime, epoch, p.properties, version));
             invalidate(jobKeyOfRunning(runningKey(job)));
             LOGGER.info(() -> "Adopting " + job.getFullName() + " #" + number + " from " + p.controller + " (" + p.origin + "), which is gone");
-            adoption.resume(epoch);
+            try {
+                adoption.resume(epoch);
+            } catch (IOException | RuntimeException e) {
+                resumeFailed(store, job, p, version, e);
+            }
             return true;
         }
         return false;
     }
 
+    /**
+     * Undoes the adoption of a build whose resumption failed before anything of it was loaded here: its placeholder
+     * names its previous owner again, which is gone, so that a later sweep tries again (or closes it), rather than
+     * leaving it to this live controller, which does not run it. The caller releases the lease.
+     */
+    private static void resumeFailed(PersistenceStore store, Job<?, ?> job, Placeholder previous, long version, Exception e)
+            throws IOException {
+        if (job.getBuildByNumber(previous.number) != null) {
+            // partly resumed: it is here now, so this controller keeps it (and fences or completes it as any other)
+            LOGGER.log(Level.WARNING, "Resuming " + previous.key + " failed after it was loaded; keeping it here", e);
+            return;
+        }
+        owned.remove(previous.key);
+        try {
+            store.write(previous.key, previous.toBytes(), version);
+        } catch (ConflictException x) {
+            e.addSuppressed(x); // changed since: by its next owner
+        }
+        invalidate(jobKeyOfRunning(runningKey(job)));
+        throw new IOException("Could not resume " + previous.key, e);
+    }
+
+    /**
+     * @return an adoption, or null if no adopter can take the build
+     * @throws IOException if none could and one failed (perhaps for now only, as a save point not fetched): the build
+     *     is then not taken for one nobody can adopt
+     */
     @CheckForNull
-    private static BuildAdopter.Adoption prepare(Job<?, ?> job, Placeholder p) {
+    private static BuildAdopter.Adoption prepare(Job<?, ?> job, Placeholder p) throws IOException {
+        Exception failure = null;
         for (BuildAdopter adopter : ExtensionList.lookup(BuildAdopter.class)) {
             try {
                 BuildAdopter.Adoption adoption = adopter.prepare(job, p);
@@ -651,7 +695,13 @@ public final class RunningBuilds {
                 }
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.WARNING, adopter + " failed to prepare adoption of " + p.key, e);
+                if (failure == null) {
+                    failure = e;
+                }
             }
+        }
+        if (failure != null) {
+            throw failure instanceof IOException io ? io : new IOException(failure);
         }
         return null;
     }

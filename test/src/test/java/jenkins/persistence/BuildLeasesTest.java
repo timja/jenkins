@@ -96,6 +96,8 @@ class BuildLeasesTest {
         Adopter.abandoned.set(0);
         Adopter.interfere = null;
         Adopter.accept = true;
+        Adopter.failPrepare = 0;
+        Adopter.failResume = 0;
     }
 
     private static byte[] placeholder(String origin, int number, long epoch, String extra) {
@@ -312,6 +314,63 @@ class BuildLeasesTest {
         assertFalse(RunningBuilds.wasLost(b), "discarded");
     }
 
+    /** A build of a dead controller, offered for adoption. */
+    private String orphan(String name) throws Exception {
+        r.createFreeStyleProject(name);
+        String key = "jobs/" + name + "/running/1.xml";
+        dead.write(key, placeholder("dead-controller", 1, dead.leases().acquire(key), "x.savePoint=3\n"), PersistenceStore.ABSENT);
+        live = Set.of(STORE.getOrigin());
+        return key;
+    }
+
+    @Test
+    void adoptionWhoseLeaseLapsedWhilePreparingIsAbandoned() throws Exception {
+        String key = orphan("slow-adoption");
+        // while the save point is fetched, this controller looks gone for long enough that another one takes the lease
+        Adopter.interfere = () -> {
+            Adopter.interfere = null;
+            live = Set.of("third-controller");
+            assertThat(STORE.as("third-controller").leases().acquire(key), greaterThan(0L));
+            live = Set.of(STORE.getOrigin(), "third-controller");
+        };
+
+        assertEquals(0, RunningBuilds.removeStale());
+
+        assertTrue(Adopter.resumed.isEmpty(), "not resumed without the lease");
+        assertEquals(1, Adopter.abandoned.get());
+        assertThat("the placeholder is left to the lease's holder", text(key), containsString("origin=dead-controller"));
+        forget("slow-adoption");
+    }
+
+    @Test
+    void failedResumptionIsUndoneAndRetried() throws Exception {
+        String key = orphan("unresumable");
+        Adopter.failResume = 1;
+
+        assertEquals(0, RunningBuilds.removeStale());
+        assertThat("it names its gone owner again, not this live controller", text(key), containsString("origin=dead-controller"));
+        assertTrue(Adopter.resumed.isEmpty());
+
+        assertEquals(1, RunningBuilds.removeStale());
+        assertEquals(1, Adopter.resumed.size());
+        assertThat(text(key), containsString("origin=" + STORE.getOrigin()));
+        forget("unresumable");
+    }
+
+    @Test
+    void failedPreparationKeepsThePlaceholder() throws Exception {
+        String key = orphan("not-fetched");
+        Adopter.failPrepare = 1;
+
+        assertEquals(0, RunningBuilds.removeStale());
+        assertThat("not taken for a build nobody can adopt", text(key), containsString("origin=dead-controller"));
+
+        assertEquals(1, RunningBuilds.removeStale());
+        assertEquals(1, Adopter.resumed.size());
+        assertThat(text(key), containsString("x.savePoint=3"));
+        forget("not-fetched");
+    }
+
     @Test
     void completedCopyOfABuildLostMeanwhileIsNotRepublished() throws Exception {
         r.buildAndAssertSuccess(r.createFreeStyleProject("seed-lapsed"));
@@ -382,15 +441,22 @@ class BuildLeasesTest {
         static final AtomicInteger abandoned = new AtomicInteger();
         static volatile ThrowingRunnable interfere;
         static volatile boolean accept = true;
+        /** How many of the next preparations, and resumptions, fail. */
+        static volatile int failPrepare;
+        static volatile int failResume;
 
         interface ThrowingRunnable {
             void run() throws Exception;
         }
 
         @Override
-        public Adoption prepare(Job<?, ?> job, RunningBuilds.Placeholder placeholder) {
+        public Adoption prepare(Job<?, ?> job, RunningBuilds.Placeholder placeholder) throws java.io.IOException {
             if (!accept) {
                 return null;
+            }
+            if (failPrepare > 0) {
+                failPrepare--;
+                throw new java.io.IOException("save point not fetched, for now");
             }
             prepared.add(job.getFullName() + "#" + placeholder.getNumber() + "@savePoint=" + placeholder.getProperties().get("savePoint"));
             ThrowingRunnable i = interfere;
@@ -404,6 +470,10 @@ class BuildLeasesTest {
             return new Adoption() {
                 @Override
                 public void resume(long epoch) {
+                    if (failResume > 0) {
+                        failResume--;
+                        throw new IllegalStateException("could not resume, this time");
+                    }
                     resumed.add(epoch);
                 }
 
