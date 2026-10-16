@@ -42,11 +42,13 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.logging.Level;
 import jenkins.model.GlobalConfiguration;
 import jenkins.model.JenkinsLocationConfiguration;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
+import org.jvnet.hudson.test.LogRecorder;
 import org.jvnet.hudson.test.TestExtension;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 import org.springframework.security.core.userdetails.UsernameNotFoundException;
@@ -61,6 +63,7 @@ class StaticStateApplierTest {
             || key.matches("nodes/[^/]+/config\\.xml")
             || key.matches("[^/]+\\.xml") && !key.startsWith("queue") && !key.startsWith("nodeMonitors"));
 
+    private final LogRecorder logging = new LogRecorder();
     private JenkinsRule r;
     private PersistenceStore other;
 
@@ -150,6 +153,16 @@ class StaticStateApplierTest {
         awaitApplied();
         assertNull(User.getById("alice", false), "deleted elsewhere");
         assertFalse(new File(r.jenkins.getRootDir(), aliceKey).exists(), "and its local copy");
+    }
+
+    @Test
+    void aUserLoadedFromAChangeElsewhereBeforeTheStartupScanIsNoDuplicate() throws Exception {
+        User erin = User.getById("erin", true);
+        erin.save();
+        logging.record(User.class, Level.WARNING).capture(10);
+        User.AllUsers.scanAll(); // as at startup, after a change made elsewhere loaded erin already
+        assertTrue(logging.getMessages().stream().noneMatch(m -> m.contains("duplicates")), logging.getMessages().toString());
+        assertNotNull(User.getById("erin", false));
     }
 
     @Test

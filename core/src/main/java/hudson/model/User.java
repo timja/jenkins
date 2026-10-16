@@ -1139,6 +1139,9 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
             }
             var byName = instance.byName;
             var idStrategy = idStrategy();
+            // a user changed elsewhere can be loaded before this scan (changedElsewhere): only a second folder for the
+            // same user in this scan is a duplicate
+            var seen = new java.util.HashSet<String>();
             for (var dir : subdirectories) {
                 var dirName = dir.getName();
                 if (!HASHED_DIRNAMES.matcher(dirName).matches()) {
@@ -1170,8 +1173,9 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
                 // where its other files go, and what lets it be deleted
                 Util.createDirectories(dir.toPath());
                 user.fixUpAfterLoad();
-                var old = byName.put(idStrategy.keyFor(user.id), user);
-                if (old != null) {
+                var key = idStrategy.keyFor(user.id);
+                var old = byName.put(key, user);
+                if (!seen.add(key)) {
                     LOGGER.warning(() -> "entry for " + user.id + " in " + dir + " duplicates one seen earlier for " + old.id);
                 } else {
                     LOGGER.fine(() -> "successfully loaded " + user.id + " from " + xml);
