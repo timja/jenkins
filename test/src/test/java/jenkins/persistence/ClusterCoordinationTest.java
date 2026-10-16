@@ -32,6 +32,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.ExtensionList;
 import hudson.Launcher;
 import hudson.model.AbstractBuild;
@@ -44,7 +45,6 @@ import hudson.model.Result;
 import hudson.model.Run;
 import hudson.model.listeners.RunListener;
 import hudson.model.queue.CauseOfBlockage;
-import hudson.model.queue.QueueTaskDispatcher;
 import hudson.model.queue.QueueTaskFuture;
 import hudson.tasks.BuildTrigger;
 import java.io.IOException;
@@ -62,6 +62,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import jenkins.model.queue.QueueStartGate;
 import org.htmlunit.HttpMethod;
 import org.htmlunit.WebRequest;
 import org.junit.jupiter.api.BeforeEach;
@@ -477,13 +478,16 @@ class ClusterCoordinationTest {
         STORE.delete(key, PersistenceStore.ANY);
     }
 
-    /** Holds the items of a job from starting once they are claimed here. */
+    /**
+     * Holds the items of a job from starting once they are claimed here: at the start gate, where the claim is made,
+     * as the claim may land between a dispatcher's look at an item and its start.
+     */
     @TestExtension
-    public static class HoldClaimed extends QueueTaskDispatcher {
+    public static class HoldClaimed implements QueueStartGate {
         static volatile String job;
 
         @Override
-        public CauseOfBlockage canRun(Queue.Item item) {
+        public CauseOfBlockage mayStart(@NonNull Queue.BuildableItem item) {
             try {
                 ClusterQueue.Record rec = item.task instanceof Job<?, ?> j && j.getFullName().equals(job) ? STORE.clusterQueue().get(item.getId()) : null;
                 return rec != null && STORE.getOrigin().equals(rec.claimedBy()) ? new SharedQueue.Blocked("Held by the test") : null;
