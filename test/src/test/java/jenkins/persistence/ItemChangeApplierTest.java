@@ -177,6 +177,21 @@ class ItemChangeApplierTest {
     }
 
     @Test
+    void aKeyNamingNoFileIsIgnored() throws Exception {
+        MockFolder f = r.createFolder("dots");
+        FreeStyleProject v = r.createFreeStyleProject("victim");
+        // not written by a controller: ".." below the folder is the folder's own directory
+        other.move("jobs/victim", "jobs/dots/jobs/..");
+        other.write("jobs/../config.xml", project("not an item"), PersistenceStore.ANY);
+        awaitApplied();
+        assertThat(r.jenkins.getItem("victim"), sameInstance(v));
+        assertThat(r.jenkins.getItem("dots"), sameInstance(f));
+        assertTrue(new File(r.jenkins.getRootDir(), "jobs/victim").isDirectory());
+        assertTrue(new File(r.jenkins.getRootDir(), "jobs/dots").isDirectory());
+        other.move("jobs/dots/jobs/..", "jobs/victim"); // as it was, for the other tests
+    }
+
+    @Test
     void movedIntoFolderElsewhere() throws Exception {
         r.createFolder("dest");
         FreeStyleProject p = r.createFreeStyleProject("traveller");

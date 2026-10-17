@@ -179,6 +179,11 @@ public final class ItemChangeApplier {
         if (store.getOrigin().equals(e.origin())) {
             return; // our own change
         }
+        if (!PersistenceStores.isSafeKey(e.key()) || e.oldKey() != null && !PersistenceStores.isSafeKey(e.oldKey())) {
+            // not written by a controller: a segment such as ".." would make it a path outside its directory here
+            LOGGER.warning(() -> "Ignoring " + e + ": its key names no file");
+            return;
+        }
         try (ACLContext ctx = ACL.as2(ACL.SYSTEM2)) {
             PersistenceStores.applyingRemoteChange(() -> {
                 switch (e.kind()) {
