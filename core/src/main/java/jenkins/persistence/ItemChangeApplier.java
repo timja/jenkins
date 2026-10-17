@@ -170,6 +170,28 @@ public final class ItemChangeApplier {
         deferred.remove(key);
     }
 
+    /**
+     * Done with a change, applied or not (its version seen already, say): if it was a retry, what was put off of its key
+     * is forgotten too, or a newer change put off since is retried in its place. Otherwise later changes would wait for
+     * a retry that never comes.
+     */
+    private void retire(ChangeEvent e) {
+        if (!retrying.remove(e)) {
+            return; // not a retry, or put off again (retryLater took it)
+        }
+        String key = e.key();
+        if (deferred.remove(key, e)) {
+            retries.remove(key);
+            return;
+        }
+        ChangeEvent newer = deferred.get(key);
+        if (newer != null) {
+            retrying.add(newer);
+            pending.incrementAndGet();
+            queue.add(newer);
+        }
+    }
+
     /** The origin of {@link #reload} events (never a controller's). */
     private static final String MERGED = "(merged here)";
 
@@ -256,6 +278,7 @@ public final class ItemChangeApplier {
             } catch (Exception | LinkageError x) {
                 LOGGER.log(Level.WARNING, "Failed to apply " + e, x);
             } finally {
+                retire(e);
                 pending.decrementAndGet();
             }
         }
