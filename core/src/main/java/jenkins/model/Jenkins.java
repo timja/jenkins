@@ -278,7 +278,11 @@ import jenkins.diagnostics.URICheckEncodingMonitor;
 import jenkins.install.InstallState;
 import jenkins.install.SetupWizard;
 import jenkins.model.ProjectNamingStrategy.DefaultProjectNamingStrategy;
+import jenkins.persistence.PersistenceStore;
 import jenkins.persistence.PersistenceStores;
+import jenkins.persistence.RemovedFields;
+import jenkins.persistence.Route;
+import jenkins.persistence.StoreRouting;
 import jenkins.security.ClassFilterImpl;
 import jenkins.security.ConfidentialKey;
 import jenkins.security.ConfidentialStore;
@@ -1375,8 +1379,10 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
      *
      */
     public void setNoUsageStatistics(Boolean noUsageStatistics) throws IOException {
-        this.noUsageStatistics = noUsageStatistics;
-        save();
+        synchronized (this) { // as save() and reloadGlobalConfig() are: a reload never overwrites the assignment
+            this.noUsageStatistics = noUsageStatistics;
+            save();
+        }
     }
 
     public Api getApi() {
@@ -1721,8 +1727,10 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
      * Sets the system message.
      */
     public void setSystemMessage(String message) throws IOException {
-        this.systemMessage = message;
-        save();
+        synchronized (this) { // as save() and reloadGlobalConfig() are: a reload never overwrites the assignment
+            this.systemMessage = message;
+            save();
+        }
     }
 
     @StaplerDispatchable
@@ -2362,8 +2370,10 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
      *      null to the default value.
      */
     public void setQuietPeriod(Integer quietPeriod) throws IOException {
-        this.quietPeriod = quietPeriod;
-        save();
+        synchronized (this) { // as save() and reloadGlobalConfig() are: a reload never overwrites the assignment
+            this.quietPeriod = quietPeriod;
+            save();
+        }
     }
 
     /**
@@ -2374,8 +2384,10 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
     }
 
     public void setScmCheckoutRetryCount(int scmCheckoutRetryCount) throws IOException {
-        this.scmCheckoutRetryCount = scmCheckoutRetryCount;
-        save();
+        synchronized (this) { // as save() and reloadGlobalConfig() are: a reload never overwrites the assignment
+            this.scmCheckoutRetryCount = scmCheckoutRetryCount;
+            save();
+        }
     }
 
     @Override
@@ -3007,10 +3019,21 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
         if (n < 0) {
             throw new IllegalArgumentException("Incorrect field \"# of executors\": " + n + ". It should be a non-negative number.");
         }
-        if (this.numExecutors != n) {
-            this.numExecutors = n;
-            updateComputers(this);
-            save();
+        boolean changed = false;
+        try {
+            synchronized (this) { // as the other setters: a reload of the configuration never overwrites the assignment
+                changed = this.numExecutors != n;
+                if (changed) {
+                    this.numExecutors = n;
+                    save();
+                }
+            }
+        } finally {
+            if (changed) {
+                // outside the lock: it takes the queue's; and if the save failed too, so that the executors match the
+                // field (which a retry would find unchanged)
+                updateComputers(this);
+            }
         }
     }
 
@@ -3293,8 +3316,10 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
     }
 
     public void setMode(Mode m) throws IOException {
-        this.mode = m;
-        save();
+        synchronized (this) { // as save() and reloadGlobalConfig() are: a reload never overwrites the assignment
+            this.mode = m;
+            save();
+        }
     }
 
     @Override
@@ -3304,8 +3329,10 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
 
     @Override
     public void setLabelString(String label) throws IOException {
-        _setLabelString(label);
-        save();
+        synchronized (this) { // as save() and reloadGlobalConfig() are: a reload never overwrites the assignment
+            _setLabelString(label);
+            save();
+        }
     }
 
     private void _setLabelString(String label) {
@@ -3585,6 +3612,34 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
         });
 
         return g;
+    }
+
+    /**
+     * Applies global configuration saved by another controller sharing a {@link jenkins.persistence.PersistenceStore}:
+     * re-reads {@code config.xml} into this instance, as {@link #load} does at startup, and re-derives what depends on it,
+     * including the inbound agent listener's port. Unlike {@link #reload}, it neither reloads items nor blocks requests.
+     * Synchronized like {@link #save}, so it cannot interleave with a local save.
+     */
+    @Restricted(NoExternalUse.class)
+    public synchronized void reloadGlobalConfig() throws IOException {
+        IdStrategy userIdStrategy = securityRealm == null ? null : securityRealm.getUserIdStrategy();
+        XmlFile config = getConfigFile();
+        Route route = StoreRouting.route(config.getPath());
+        PersistenceStore.Entry stored = route == null ? null : route.peek();
+        if (stored != null) {
+            // loaded over this object, as at startup, never nulled out: only what was removed elsewhere is cleared
+            RemovedFields.clear(config, this, stored.content());
+        }
+        load();
+        if (userIdStrategy != null && securityRealm != null && !userIdStrategy.equals(securityRealm.getUserIdStrategy())) {
+            // as setSecurityRealm does on the controller that changed it, which moved the users in the store
+            LOGGER.info("User ID strategy changed elsewhere; reloading users");
+            User.reload();
+        }
+        _setLabelString(label);
+        trimLabels();
+        launchTcpSlaveAgentListener(); // on the port now configured, or none
+        LOGGER.fine("Reloaded global configuration changed elsewhere");
     }
 
     /**

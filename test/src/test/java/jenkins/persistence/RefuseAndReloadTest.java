@@ -34,7 +34,9 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
+import hudson.ExtensionList;
 import hudson.XmlFile;
+import hudson.init.InitMilestone;
 import hudson.model.AbstractItem;
 import hudson.model.AbstractProject;
 import hudson.model.FreeStyleBuild;
@@ -42,8 +44,10 @@ import hudson.model.FreeStyleProject;
 import hudson.model.Job;
 import hudson.model.Saveable;
 import hudson.model.UnprotectedRootAction;
+import hudson.model.User;
 import hudson.security.ACL;
 import hudson.security.ACLContext;
+import hudson.security.HudsonPrivateSecurityRealm;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.lang.management.MonitorInfo;
@@ -60,6 +64,8 @@ import java.util.concurrent.locks.LockSupport;
 import java.util.function.BooleanSupplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import jenkins.model.Jenkins;
+import jenkins.security.ApiTokenProperty;
 import org.htmlunit.FailingHttpStatusCodeException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -252,6 +258,71 @@ class RefuseAndReloadTest {
             assertThrows(ConflictException.class, () -> p.setDescription("mine"));
         }
         assertEquals(null, STORE.read("jobs/deleted/config.xml"), "not created again");
+    }
+
+    @Test
+    void aSaveRefusedWhileStartingDoesNotFailTheStartup() throws Exception {
+        // two controllers starting at once apply the same configuration as code: both create the user admin
+        HudsonPrivateSecurityRealm realm = new HudsonPrivateSecurityRealm(false, false, null);
+        r.jenkins.setSecurityRealm(realm);
+        User admin = realm.createAccount("admin", "admin-password-1");
+        String token = admin.getProperty(ApiTokenProperty.class).generateNewToken("t").plainValue;
+        String key = "users/" + admin.getUserFolder().getName() + "/config.xml";
+        String stored = STORE.text(key);
+        assertThat(stored, containsString("</user>"));
+        long refused = PersistenceStores.getRefusedCount();
+        Field initLevel = Jenkins.class.getDeclaredField("initLevel");
+        initLevel.setAccessible(true);
+        synchronized (admin) { // before the change made elsewhere is applied here
+            STORE.as("other").write(key, stored.replace("</user>", "<description>theirs</description></user>")
+                    .getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+            initLevel.set(r.jenkins, InitMilestone.SYSTEM_CONFIG_LOADED); // as configuration as code runs
+            try {
+                realm.createAccount("admin", "admin-password-1"); // saves the user: refused, without failing
+            } finally {
+                initLevel.set(r.jenkins, InitMilestone.COMPLETED);
+            }
+        }
+        assertEquals(refused + 1, PersistenceStores.getRefusedCount());
+        assertThat("what was stored first stands", STORE.text(key), containsString("<description>theirs</description>"));
+        // administrators are told which files were not saved
+        RefusedAtStartupMonitor monitor = ExtensionList.lookupSingleton(RefusedAtStartupMonitor.class);
+        assertTrue(monitor.isActivated());
+        assertEquals(List.of(key), monitor.getKeys());
+        assertThat(r.createWebClient().goTo("manage").getWebResponse().getContentAsString(), containsString(key));
+        await(() -> "theirs".equals(User.getById("admin", false).getDescription()));
+        assertTrue(User.getById("admin", false).getProperty(ApiTokenProperty.class).matchesPassword(token),
+                "reloaded as at startup: its API token still works");
+
+        // once started, a refused save fails as before
+        await(StoredReloads::isIdle);
+        synchronized (admin) {
+            changeElsewhere(key, "<description>theirs</description>", "<description>again</description>");
+            assertThrows(ConflictException.class, () -> realm.createAccount("admin", "admin-password-1"));
+        }
+        assertEquals(List.of(key), monitor.getKeys(), "only what was refused while starting");
+        JenkinsRule.WebClient wc = r.createWebClient();
+        org.htmlunit.WebRequest dismiss = new org.htmlunit.WebRequest(new java.net.URL(r.getURL(), monitor.getUrl() + "/dismiss"),
+                org.htmlunit.HttpMethod.POST);
+        wc.addCrumb(dismiss);
+        wc.getPage(dismiss);
+        assertFalse(monitor.isActivated(), "dismissed");
+    }
+
+    @Test
+    void aUserChangedElsewhereKeepsWorkingApiTokens() throws Exception {
+        HudsonPrivateSecurityRealm realm = new HudsonPrivateSecurityRealm(false, false, null);
+        r.jenkins.setSecurityRealm(realm);
+        User alice = realm.createAccount("alice", "alice-password-1");
+        String token = alice.getProperty(ApiTokenProperty.class).generateNewToken("t").plainValue;
+        String key = "users/" + alice.getUserFolder().getName() + "/config.xml";
+        STORE.as("other").write(key, STORE.text(key).replace("</user>", "<description>theirs</description></user>")
+                .getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        await(() -> "theirs".equals(User.getById("alice", false).getDescription()));
+        assertTrue(User.getById("alice", false).getProperty(ApiTokenProperty.class).matchesPassword(token));
+        String who = r.createWebClient().withBasicCredentials("alice", token)
+                .goTo("whoAmI/api/json", "application/json").getWebResponse().getContentAsString();
+        assertThat(who, containsString("\"name\":\"alice\""));
     }
 
     @Test

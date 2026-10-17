@@ -72,7 +72,8 @@ import org.kohsuke.accmod.restrictions.NoExternalUse;
 
 /**
  * Brings this controller up to date with changes other controllers make in the {@link PersistenceStore}: items
- * created, reconfigured, renamed, moved or deleted elsewhere; and, through the {@link RemoteChangeHandler}s, changes to
+ * created, reconfigured, renamed, moved or deleted elsewhere; the global configuration, descriptors, users and nodes
+ * ({@link StaticStateApplier}); and, through the {@link RemoteChangeHandler}s, changes to
  * keys core does not route.
  *
  * <p>Subscribes before items are loaded, so nothing made in the meantime is missed, but only applies changes once
@@ -85,7 +86,8 @@ import org.kohsuke.accmod.restrictions.NoExternalUse;
  * <p>Every {@link #CATCH_UP_MINUTES} minutes, the versions stored are compared with those this controller holds, and
  * any difference applied as a change made elsewhere would be: a change whose event never arrived, or one that could
  * not be applied, is not kept from this controller until its key changes again or it restarts. One run at a time, a
- * listing of each item group and a read of each item's configuration; nothing with no store.
+ * listing of each item group, of users and of nodes, and a read of each item's configuration and of each other key
+ * this controller holds; nothing with no store.
  */
 @Restricted(NoExternalUse.class)
 public final class ItemChangeApplier {
@@ -303,6 +305,39 @@ public final class ItemChangeApplier {
             return;
         }
         catchUpItems(jenkins, found);
+        catchUpStaticState(found);
+    }
+
+    /**
+     * Compares the global configuration, descriptors, users and nodes with what is stored: a read of each key this
+     * controller holds outside items, and a listing of users and nodes for those made elsewhere.
+     */
+    private void catchUpStaticState(List<ChangeEvent> found) throws IOException {
+        Set<String> keys = new TreeSet<>();
+        for (String key : StoredVersions.held().keySet()) {
+            if (!key.startsWith("jobs/")) {
+                keys.add(key);
+            }
+        }
+        for (String dir : List.of("users", "nodes")) {
+            for (String name : store.children(dir)) {
+                if (PersistenceStores.isSafeName(name)) {
+                    keys.add(dir + "/" + name + "/config.xml");
+                }
+            }
+        }
+        for (String key : keys) {
+            if (!StoreRouting.isRouted(key) || newest.containsKey(key) || failures.containsKey(key)) {
+                continue;
+            }
+            PersistenceStore.Entry entry = store.read(key);
+            long held = StoredVersions.lastSeen(key);
+            if (entry != null && entry.version() > held) {
+                found.add(new ChangeEvent(ChangeEvent.Kind.WRITTEN, key, null, entry.version(), CATCH_UP));
+            } else if (entry == null && held > PersistenceStore.ABSENT) {
+                found.add(new ChangeEvent(ChangeEvent.Kind.DELETED, key, null, held + 1, CATCH_UP));
+            }
+        }
     }
 
     /**
@@ -420,7 +455,10 @@ public final class ItemChangeApplier {
 
     private void written(ChangeEvent e) throws Exception {
         if (!e.key().startsWith("jobs/")) {
-            return; // global configuration, users, nodes: applied by their own code
+            if (e.version() > StoredVersions.lastSeen(e.key()) && StaticStateApplier.apply(e.key(), false)) {
+                applied.incrementAndGet();
+            }
+            return;
         }
         List<String> names = itemPath(e.key());
         if (names == null) {
@@ -549,6 +587,13 @@ public final class ItemChangeApplier {
 
     private void deleted(ChangeEvent e) throws Exception {
         if (!e.key().startsWith("jobs/")) {
+            if (e.version() <= StoredVersions.lastSeen(e.key())) {
+                return; // deleted before what this controller has: saved here since, say
+            }
+            if (StaticStateApplier.apply(e.key(), true)) {
+                applied.incrementAndGet();
+            }
+            StoredVersions.seen(e.key(), PersistenceStore.ABSENT);
             return;
         }
         List<String> names = itemPath(e.key());
