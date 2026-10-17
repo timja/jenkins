@@ -32,25 +32,44 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import hudson.Util;
+import hudson.model.Descriptor;
 import hudson.model.Label;
 import hudson.model.Node;
 import hudson.model.User;
+import hudson.security.AbstractPasswordBasedSecurityRealm;
+import hudson.security.GroupDetails;
 import hudson.security.HudsonPrivateSecurityRealm;
+import hudson.security.SecurityRealm;
 import java.io.File;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import java.util.logging.Level;
+import java.util.stream.Collectors;
 import jenkins.model.GlobalConfiguration;
+import jenkins.model.IdStrategy;
 import jenkins.model.JenkinsLocationConfiguration;
+import jenkins.model.NodeListener;
+import jenkins.security.HMACConfidentialKey;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.LogRecorder;
 import org.jvnet.hudson.test.TestExtension;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
+import org.springframework.security.authentication.BadCredentialsException;
+import org.springframework.security.core.AuthenticationException;
+import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.security.core.userdetails.UsernameNotFoundException;
 
 /**
@@ -61,7 +80,29 @@ class StaticStateApplierTest {
 
     static final InMemoryPersistenceStore STORE = new InMemoryPersistenceStore(key -> key.matches("users/[^/]+/config\\.xml")
             || key.matches("nodes/[^/]+/config\\.xml")
-            || key.matches("[^/]+\\.xml") && !key.startsWith("queue") && !key.startsWith("nodeMonitors"));
+            || key.matches("[^/]+\\.xml") && !key.startsWith("queue") && !key.startsWith("nodeMonitors")) {
+        @Override
+        public Entry read(String key) {
+            ReadHook hook = onRead;
+            return hook == null ? super.read(key) : hook.read(key, () -> super.read(key));
+        }
+    };
+
+    /** Reads made here, which a test can delay or precede with a change made elsewhere. */
+    interface ReadHook {
+        PersistenceStore.Entry read(String key, Supplier<PersistenceStore.Entry> read);
+    }
+
+    static volatile ReadHook onRead;
+
+    private static boolean calledFrom(Class<?> type, String methodPrefix) {
+        return StackWalker.getInstance().walk(s -> s.anyMatch(f -> f.getClassName().equals(type.getName()) && f.getMethodName().startsWith(methodPrefix)));
+    }
+
+    private static boolean applierBlocked() {
+        return Thread.getAllStackTraces().keySet().stream()
+                .anyMatch(t -> t.getName().equals("Persistence store item change applier") && t.getState() == Thread.State.BLOCKED);
+    }
 
     private final LogRecorder logging = new LogRecorder();
     private JenkinsRule r;
@@ -69,6 +110,7 @@ class StaticStateApplierTest {
 
     @BeforeEach
     void setUp(JenkinsRule rule) {
+        onRead = null;
         r = rule;
         other = STORE.as("other-controller");
     }
@@ -134,7 +176,7 @@ class StaticStateApplierTest {
         User alice = User.getById("alice", true);
         alice.setFullName("Alice");
         alice.save();
-        String aliceKey = STORE.children("users").stream().map(d -> "users/" + d + "/config.xml").findFirst().orElseThrow();
+        String aliceKey = STORE.children("users").stream().filter(d -> d.startsWith("alice_")).map(d -> "users/" + d + "/config.xml").findFirst().orElseThrow();
         writeElsewhere(aliceKey, text(aliceKey).replace("<fullName>Alice</fullName>", "<fullName>Alice Changed</fullName>"));
         assertEquals("Alice Changed", User.getById("alice", false).getFullName());
         alice.setDescription("about Alice");
@@ -153,6 +195,184 @@ class StaticStateApplierTest {
         awaitApplied();
         assertNull(User.getById("alice", false), "deleted elsewhere");
         assertFalse(new File(r.jenkins.getRootDir(), aliceKey).exists(), "and its local copy");
+    }
+
+    @Test
+    void aFieldRemovedByAVersionStoredWhileADescriptorIsReloadedIsCleared() throws Exception {
+        JenkinsLocationConfiguration location = JenkinsLocationConfiguration.get();
+        location.setUrl("http://first.example/");
+        location.setAdminAddress("admin@example.com");
+        String key = JenkinsLocationConfiguration.class.getName() + ".xml";
+        String second = text(key).replace("admin@example.com", "other@example.com");
+        // stored between the read finding what the second version removed (nothing) and the read loading it
+        String third = second.replaceAll("<jenkinsUrl>[^<]*</jenkinsUrl>", "");
+        onRead = (k, read) -> {
+            if (k.equals(key) && calledFrom(Descriptor.class, "load")) {
+                onRead = null;
+                try {
+                    other.write(key, third.getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            }
+            return read.get();
+        };
+        writeElsewhere(key, second);
+        assertNull(onRead);
+        assertEquals("other@example.com", location.getAdminAddress());
+        assertNull(location.getUrl(), "removed by the third version");
+    }
+
+    @Test
+    void aUserStoredWithoutPropertiesElsewhereLoadsWithDefaultOnes() throws Exception {
+        User frank = User.getById("frank", true);
+        frank.save();
+        String frankKey = STORE.children("users").stream().filter(d -> d.startsWith("frank_")).map(d -> "users/" + d + "/config.xml").findFirst().orElseThrow();
+        // as written by another version of Jenkins, or by hand: no <properties/>, which the constructor initialises
+        writeElsewhere(frankKey, "<?xml version='1.1' encoding='UTF-8'?><user><id>frank</id><fullName>Frank Elsewhere</fullName></user>");
+        User again = User.getById("frank", false);
+        assertEquals("Frank Elsewhere", again.getFullName());
+        assertFalse(again.getAllProperties().isEmpty(), "default properties");
+    }
+
+    @Test
+    void aUserChangedElsewhereWhileUsersAreScannedHasTheChange() throws Exception {
+        User grace = User.getById("grace", true);
+        grace.setFullName("Grace One");
+        grace.save();
+        String graceKey = STORE.children("users").stream().filter(d -> d.startsWith("grace_")).map(d -> "users/" + d + "/config.xml").findFirst().orElseThrow();
+        CountDownLatch scanning = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        onRead = (k, read) -> {
+            PersistenceStore.Entry e = read.get();
+            if (k.equals(graceKey) && calledFrom(User.AllUsers.class, "scanAll") && calledFrom(hudson.XmlFile.class, "unmarshal")) {
+                onRead = null;
+                scanning.countDown(); // having read the first version
+                try {
+                    release.await();
+                } catch (InterruptedException x) {
+                    throw new AssertionError(x);
+                }
+            }
+            return e;
+        };
+        Thread reloading = new Thread(() -> {
+            try {
+                User.reload();
+            } catch (IOException x) {
+                throw new UncheckedIOException(x);
+            }
+        });
+        reloading.start();
+        assertTrue(scanning.await(30, TimeUnit.SECONDS));
+        long applied = ItemChangeApplier.getAppliedCount();
+        other.write(graceKey, text(graceKey).replace("Grace One", "Grace Two").getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        // until the change is applied, or waits for the scan to end
+        for (int i = 0; i < 500 && ItemChangeApplier.getAppliedCount() == applied && !applierBlocked(); i++) {
+            Thread.sleep(10);
+        }
+        release.countDown();
+        reloading.join();
+        awaitApplied();
+        assertEquals("Grace Two", User.getById("grace", false).getFullName());
+    }
+
+    @Test
+    void aUserIdStrategyChangedHereMovesTheStoredUsers() throws Exception {
+        r.jenkins.setSecurityRealm(new StrategyRealm(false));
+        try {
+            User henry = User.getById("Henry", true);
+            henry.setFullName("Henry H");
+            henry.save();
+            User ivan = User.getById("Ivan", true);
+            ivan.setFullName("Ivan I");
+            ivan.save();
+            Util.deleteRecursive(ivan.getUserFolder()); // stored only, as if made on another controller
+            Set<String> before = storedUsers("henry_", "ivan_");
+
+            r.jenkins.setSecurityRealm(new StrategyRealm(true));
+
+            assertEquals("Henry H", User.getById("Henry", false).getFullName());
+            assertEquals("Ivan I", User.getById("Ivan", false).getFullName());
+            Set<String> after = storedUsers("henry_", "ivan_");
+            assertEquals(2, after.size(), after.toString());
+            assertTrue(after.stream().noneMatch(before::contains), "moved in the store: " + before + " " + after);
+        } finally {
+            r.jenkins.setSecurityRealm(SecurityRealm.NO_AUTHENTICATION); // the configuration is stored for later tests
+        }
+    }
+
+    private static Set<String> storedUsers(String... prefixes) {
+        return STORE.children("users").stream().filter(d -> Arrays.stream(prefixes).anyMatch(d::startsWith)).collect(Collectors.toSet());
+    }
+
+    @Test
+    void aUserIdStrategyChangedElsewhereKeepsTheUsersFindable() throws Exception {
+        r.jenkins.setSecurityRealm(new StrategyRealm(false));
+        try {
+            User judy = User.getById("Judy", true);
+            judy.setFullName("Judy J");
+            judy.save();
+            String oldDir = judy.getUserFolder().getName();
+            Field dirNames = User.class.getDeclaredField("DIRNAMES"); // its key, read once per JVM
+            dirNames.setAccessible(true);
+            String newDir = "judy_" + ((HMACConfidentialKey) dirNames.get(null)).mac("Judy"); // case-sensitive: not of "judy"
+            // as setSecurityRealm does there: the users are moved, then the configuration saved
+            other.move("users/" + oldDir, "users/" + newDir);
+            writeElsewhere("config.xml", text("config.xml").replace("<caseSensitive>false</caseSensitive>", "<caseSensitive>true</caseSensitive>"));
+            assertTrue(r.jenkins.getSecurityRealm().getUserIdStrategy() instanceof IdStrategy.CaseSensitive);
+            assertEquals("Judy J", User.getById("Judy", false).getFullName());
+        } finally {
+            r.jenkins.setSecurityRealm(SecurityRealm.NO_AUTHENTICATION); // the configuration is stored for later tests
+        }
+    }
+
+    /** A realm whose user ID strategy is configured. */
+    public static class StrategyRealm extends AbstractPasswordBasedSecurityRealm {
+        private final boolean caseSensitive;
+
+        StrategyRealm(boolean caseSensitive) {
+            this.caseSensitive = caseSensitive;
+        }
+
+        @Override
+        public IdStrategy getUserIdStrategy() {
+            return caseSensitive ? new IdStrategy.CaseSensitive() : IdStrategy.CASE_INSENSITIVE;
+        }
+
+        @Override
+        protected UserDetails authenticate2(String username, String password) throws AuthenticationException {
+            throw new BadCredentialsException(username);
+        }
+
+        @Override
+        public UserDetails loadUserByUsername2(String username) throws UsernameNotFoundException {
+            throw new UsernameNotFoundException(username);
+        }
+
+        @Override
+        public GroupDetails loadGroupByGroupname2(String groupname, boolean fetchMembers) throws UsernameNotFoundException {
+            throw new UsernameNotFoundException(groupname);
+        }
+
+        @TestExtension
+        public static class DescriptorImpl extends Descriptor<SecurityRealm> {}
+    }
+
+    @Test
+    void aNodeVetoedHereIsNotLoadedWhenMadeElsewhere() throws Exception {
+        r.createSlave("n3", null, null);
+        writeElsewhere("nodes/vetoed/config.xml", text("nodes/n3/config.xml").replace("<name>n3</name>", "<name>vetoed</name>"));
+        assertNull(r.jenkins.getNode("vetoed"));
+        assertNull(r.jenkins.getComputer("vetoed"));
+    }
+
+    @TestExtension("aNodeVetoedHereIsNotLoadedWhenMadeElsewhere")
+    public static class Veto extends NodeListener {
+        @Override
+        protected boolean allowLoad(Node node) {
+            return !node.getNodeName().equals("vetoed");
+        }
     }
 
     @Test

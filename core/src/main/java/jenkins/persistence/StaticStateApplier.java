@@ -88,8 +88,7 @@ final class StaticStateApplier {
             if (d != null && !deleted) {
                 LOGGER.fine(() -> "Reloading " + r.group(1) + " changed elsewhere");
                 synchronized (d) { // as Descriptor.load and save are
-                    PersistenceStores.clearRemovedFields(new XmlFile(PersistenceStores.fileFor(key)), d);
-                    d.load();
+                    PersistenceStores.reload(new XmlFile(PersistenceStores.fileFor(key)), d, d::load);
                 }
             }
             return true;

@@ -3597,8 +3597,13 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
      */
     @Restricted(Beta.class)
     public synchronized void reloadGlobalConfig() throws IOException {
-        jenkins.persistence.PersistenceStores.clearRemovedFields(getConfigFile(), this); // a system message cleared, say
-        load();
+        IdStrategy userIdStrategy = securityRealm == null ? null : securityRealm.getUserIdStrategy();
+        jenkins.persistence.PersistenceStores.reload(getConfigFile(), this, this::load); // a system message cleared, say
+        if (userIdStrategy != null && securityRealm != null && !userIdStrategy.equals(securityRealm.getUserIdStrategy())) {
+            // as setSecurityRealm does on the controller that changed it, which moved them in the store (User.rekey)
+            LOGGER.info("User ID strategy changed elsewhere; reloading users");
+            User.reload();
+        }
         _setLabelString(label);
         trimLabels();
         launchTcpSlaveAgentListener(); // on the port now configured, or none

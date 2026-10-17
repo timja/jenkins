@@ -359,9 +359,9 @@ public class Nodes implements PersistenceRoot {
             }
             return;
         }
-        Node loaded = load(name);
+        Node loaded = load(name, true);
         if (loaded == null) {
-            return;
+            return; // gone meanwhile, or vetoed here (then dropped here too, as at startup)
         }
         if (old != null) {
             Queue.withLock(() -> {
@@ -451,6 +451,17 @@ public class Nodes implements PersistenceRoot {
         });
     }
 
+    /** Whether every {@link NodeListener} allows a node to be loaded, as {@link #load()} asks. */
+    private static boolean allowLoad(Node node) {
+        return ExtensionList.lookup(NodeListener.class).stream().allMatch(nodeListener -> {
+            if (!nodeListener.allowLoad(node)) {
+                LOGGER.log(Level.FINE, () -> "Loading of node " + node.getNodeName() + " vetoed by " + nodeListener);
+                return false;
+            }
+            return true;
+        });
+    }
+
     @CheckForNull
     public Node getOrLoad(String name) {
         Node node = getNode(name);
@@ -460,10 +471,29 @@ public class Nodes implements PersistenceRoot {
 
     @CheckForNull
     public Node load(String name) {
+        return load(name, false);
+    }
+
+    /**
+     * @param vetoable whether {@link NodeListener#allowLoad} may veto the node, as at startup ({@link #load()}): a node
+     *     vetoed is not loaded, and one of that name loaded before is dropped
+     */
+    @CheckForNull
+    private Node load(String name, boolean vetoable) {
         try {
             XmlFile xmlFile = getConfigFile(name);
             if (xmlFile.exists()) {
                 Node n = (Node) xmlFile.read();
+                if (vetoable && !allowLoad(n)) {
+                    Node old = nodes.get(n.getNodeName());
+                    if (old != null) { // as if deleted: it would not be here after a restart either
+                        unload(old);
+                        jenkins.updateComputerList();
+                        jenkins.trimLabels();
+                        NodeListener.fireOnDeleted(old);
+                    }
+                    return null;
+                }
                 nodes.put(n.getNodeName(), n);
                 n.onLoad(this, n.getNodeName());
                 jenkins.updateNewComputer(n);
