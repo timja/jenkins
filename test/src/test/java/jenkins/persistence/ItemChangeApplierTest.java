@@ -269,7 +269,7 @@ class ItemChangeApplierTest {
             other.write("jobs/rf2/jobs/c/config.xml", project("changed elsewhere"), PersistenceStore.ANY);
             assertThrows(ConflictException.class, () -> c.setDescription("here"));
         } finally {
-            PersistenceStores.CONFLICTS = "warn";
+            PersistenceStores.CONFLICTS = "refuse";
             resumeApplier();
         }
     }
@@ -333,7 +333,7 @@ class ItemChangeApplierTest {
         try {
             r.createFreeStyleProject("vacated");
         } finally {
-            PersistenceStores.CONFLICTS = "warn";
+            PersistenceStores.CONFLICTS = "refuse";
         }
     }
 
