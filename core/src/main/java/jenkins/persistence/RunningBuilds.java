@@ -1117,9 +1117,9 @@ public final class RunningBuilds {
                 return Adoption.NONE;
             }
             Placeholder p = Placeholder.fromBytes(key, number, entry.content(), entry.version());
-            if (p != null && store.getOrigin().equals(p.origin) && !unsure.contains(key)) {
+            if (p != null && store.getOrigin().equals(p.origin) && !unsure.contains(key) && !p.properties.containsKey(HANDED_OVER)) {
                 return Adoption.ADOPTED; // this controller has it already (a sweep listed it as it was): its lease stays
-            } // else written by an adoption here whose write seemed to fail: not resumed yet, so it carries on
+            } // else written by an adoption here whose write seemed to fail, or handed over: not resumed here, so it carries on
             Run<?, ?> local = BuildRecords.loadedCopy(job, number);
             if (local != null && local.isLogUpdated() && !local.hasntStartedYet()) {
                 // a copy still running here (lost to the owner now gone, and not stopped yet): not adopted over it, which
