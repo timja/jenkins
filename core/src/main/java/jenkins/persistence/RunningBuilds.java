@@ -44,6 +44,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.HashSet;
@@ -52,6 +53,7 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
@@ -328,6 +330,11 @@ public final class RunningBuilds {
     private static final Map<String, Placeholder> owned = new ConcurrentHashMap<>();
     /** Builds this controller has lost to another one: placeholder keys. */
     private static final Set<String> lost = ConcurrentHashMap.newKeySet();
+    /**
+     * Copies of builds lost to another controller and discarded here, by identity: one still referenced (by a plugin,
+     * or a Pipeline's execution) may be saved after its key is no longer {@link #lost}, and must never be published.
+     */
+    private static final Set<Run<?, ?>> discarded = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
 
     @CheckForNull
     private static String placeholderKey(@NonNull Run<?, ?> run) {
@@ -478,20 +485,39 @@ public final class RunningBuilds {
         Job<?, ?> job = run.getParent();
         int number = run.getNumber();
         String key = placeholderKey(run);
-        discard(job, number, key, 0);
+        discard(job, number, key, run, 0);
     }
 
-    private static void discard(Job<?, ?> job, int number, String key, int attempt) {
+    /**
+     * Whether this is a copy of a build discarded here, lost to another controller: a save of it is not published, and
+     * the local copy it wrote is discarded again ({@link #discardAgain}).
+     */
+    static boolean wasDiscarded(@NonNull Run<?, ?> run) {
+        return discarded.contains(run);
+    }
+
+    /**
+     * Discards again the local copy of a build which a {@linkplain #wasDiscarded discarded} copy saved: its
+     * {@code build.xml} would otherwise stand for the new owner's record here.
+     */
+    static void discardAgain(@NonNull Run<?, ?> run) {
+        LOGGER.fine(() -> "A discarded copy of " + run + " was saved; discarding the local copy again");
+        discard(run.getParent(), run.getNumber(), null, run, 0);
+    }
+
+    private static void discard(Job<?, ?> job, int number, String key, Run<?, ?> run, int attempt) {
         Timer.get().schedule(() -> {
             try {
                 PersistenceStores.applyingRemoteChange(() -> {
-                    BuildRecords.deletedElsewhere(job, number);
+                    // whatever is stored now: the record there is its new owner's, not this copy
+                    BuildRecords.forgetLocalCopy(job, number);
                     if (BuildRecords.isStored(job, number)) {
                         // its new owner published it already, and this controller applied that to the copy just discarded
                         BuildRecords.writtenElsewhere(job, number);
                     }
                     return null;
                 });
+                discarded.add(run); // before its key is no longer lost: a save of this copy is never published
                 if (key != null) {
                     lost.remove(key);
                 }
@@ -499,7 +525,7 @@ public final class RunningBuilds {
                 // kept fenced (lost) until discarded: a later save of the local copy must not be published
                 LOGGER.log(Level.WARNING, "Failed to discard the local copy of " + job.getFullName() + " #" + number + "; retrying", e);
                 if (attempt < MAX_DISCARD_ATTEMPTS) {
-                    discard(job, number, key, attempt + 1);
+                    discard(job, number, key, run, attempt + 1);
                 }
             }
         }, DISCARD_DELAY_SECONDS * (1L << Math.min(attempt, 6)), TimeUnit.SECONDS);
@@ -569,13 +595,24 @@ public final class RunningBuilds {
                             continue;
                         }
                     }
-                    LOGGER.info(() -> "Removing placeholder of " + job.getFullName() + " #" + p.number + " left by " + p.controller + " (" + p.origin + "), which is gone");
-                    // idempotent, so several controllers noticing at once is harmless
-                    store.delete(p.key, PersistenceStore.ANY);
+                    // as stored now, and only while this controller still holds its lease: one that lapsed while the
+                    // adoption was prepared (a long pause) may have let another controller adopt the build, writing it
+                    PersistenceStore.Entry now = store.read(p.key);
+                    if (now != null && (leases == null || leases.holds(p.key, epoch))) {
+                        LOGGER.info(() -> "Removing placeholder of " + job.getFullName() + " #" + p.number + " left by " + p.controller + " (" + p.origin + "), which is gone");
+                        try {
+                            // only as read: several controllers noticing at once is harmless, and a write since is kept
+                            store.delete(p.key, now.version());
+                            removedHere++;
+                        } catch (ConflictException e) {
+                            LOGGER.fine(() -> p.key + " changed meanwhile; left alone");
+                        }
+                    } else {
+                        LOGGER.fine(() -> p.key + " completed, or was taken over, meanwhile; left alone");
+                    }
                     if (leases != null) {
                         leases.release(p.key, epoch);
                     }
-                    removedHere++;
                 }
             }
             removed += removedHere;
@@ -624,6 +661,10 @@ public final class RunningBuilds {
                 }
                 return true;
             }
+            if (BuildRecords.isStored(job, number)) {
+                // completed: its record is published only once it has, and its owner was gone before removing this
+                return false;
+            }
             Placeholder p = Placeholder.fromBytes(key, number, entry.content(), entry.version());
             BuildAdopter.Adoption adoption = p == null ? null : prepare(job, p);
             if (adoption == null) {
@@ -643,6 +684,9 @@ public final class RunningBuilds {
                 adoption.abandon();
                 LOGGER.fine(() -> key + " changed while preparing its adoption; retrying");
                 continue;
+            } catch (IOException | RuntimeException e) {
+                adoption.abandon(); // retried by the next sweep, which prepares it again
+                throw e;
             }
             owned.put(key, new Placeholder(key, number, mine.origin, mine.controller, p.displayName, p.startTime, epoch, p.properties, version));
             invalidate(jobKeyOfRunning(runningKey(job)));

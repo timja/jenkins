@@ -27,9 +27,12 @@ package jenkins.persistence;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.greaterThan;
+import static org.hamcrest.Matchers.not;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -80,7 +83,19 @@ class BuildLeasesTest {
         public Set<String> liveOrigins() {
             return live;
         }
+
+        @Override
+        public long writeIfHeld(String leaseKey, long epoch, String key, byte[] content, long expectedVersion) throws java.io.IOException {
+            if (key.equals(failWriteOf)) {
+                failWriteOf = null;
+                throw new java.io.IOException("store unreachable, this time");
+            }
+            return super.writeIfHeld(leaseKey, epoch, key, content, expectedVersion);
+        }
     };
+
+    /** A key whose next lease-fenced write fails. */
+    static volatile String failWriteOf;
     static final InMemoryBlobStore BLOBS = new InMemoryBlobStore();
 
     private JenkinsRule r;
@@ -98,6 +113,8 @@ class BuildLeasesTest {
         Adopter.accept = true;
         Adopter.failPrepare = 0;
         Adopter.failResume = 0;
+        Adopter.declineAfterInterfering = false;
+        failWriteOf = null;
     }
 
     private static byte[] placeholder(String origin, int number, long epoch, String extra) {
@@ -297,6 +314,7 @@ class BuildLeasesTest {
         }
         assertFalse(dir.exists(), "local copy discarded");
         assertNull(p.getBuildByNumber(1));
+        forget("partitioned");
     }
 
     /** Removes what a test left in the store, which outlives it, so that later tests neither load nor sweep it. */
@@ -434,6 +452,102 @@ class BuildLeasesTest {
         forget("seed-handed", "handed");
     }
 
+    @Test
+    void discardedCopySavedLaterIsNotPublished() throws Exception {
+        r.buildAndAssertSuccess(r.createFreeStyleProject("seed-kept"));
+        byte[] record = STORE.read("jobs/seed-kept/builds/1/build.xml").content();
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        FreeStyleProject p = blocking(r, "kept", started, release);
+        QueueTaskFuture<FreeStyleBuild> f = p.scheduleBuild2(0);
+        assertTrue(started.await(60, TimeUnit.SECONDS));
+        FreeStyleBuild b = p.getBuildByNumber(1);
+        String key = "jobs/kept/running/1.xml";
+        live = Set.of("dead-controller");
+        long theirs = dead.leases().acquire(key);
+        dead.write(key, placeholder("dead-controller", 1, theirs, ""), PersistenceStore.ANY);
+        live = null;
+        RunningBuilds.checkOwnership();
+        assertEquals(Result.ABORTED, f.get(60, TimeUnit.SECONDS).getResult());
+        try (java.io.InputStream snapshot = BLOBS.get("jobs/seed-kept/builds/1/files.tgz")) {
+            byte[] bytes = snapshot.readAllBytes();
+            BLOBS.put("jobs/kept/builds/1/files.tgz", new java.io.ByteArrayInputStream(bytes), bytes.length);
+        }
+        dead.write("jobs/kept/builds/1/build.xml", record, PersistenceStore.ABSENT);
+        dead.delete(key, PersistenceStore.ANY);
+        awaitDiscarded(b);
+        FreeStyleBuild published = p.getBuildByNumber(1);
+        assertNotNull(published);
+
+        // something kept the discarded copy, and saves it now
+        b.setDescription("stale");
+        assertThat("the new owner's record stands", text("jobs/kept/builds/1/build.xml"), not(containsString("stale")));
+        FreeStyleBuild now = null;
+        for (int i = 0; i < 300; i++) {
+            now = p.getBuildByNumber(1);
+            if (now != null && now != b && now != published) {
+                break;
+            }
+            Thread.sleep(100);
+        }
+        assertNotNull(now);
+        assertNotSame(b, now, "the copy the stale save wrote was discarded again");
+        assertNull(now.getDescription(), "the new owner's record here, not the stale save");
+        now.setDescription("edited here");
+        assertThat("an edit of the build as it is now is published", text("jobs/kept/builds/1/build.xml"), containsString("edited here"));
+        forget("seed-kept", "kept");
+    }
+
+    @Test
+    void placeholderOfABuildWhoseRecordIsStoredIsRemovedNotAdopted() throws Exception {
+        r.buildAndAssertSuccess(r.createFreeStyleProject("seed-done"));
+        byte[] record = STORE.read("jobs/seed-done/builds/1/build.xml").content();
+        String key = orphan("done");
+        // its controller published its record, and was gone before removing its placeholder
+        dead.write("jobs/done/builds/1/build.xml", record, PersistenceStore.ABSENT);
+
+        RunningBuilds.removeStale();
+        assertTrue(Adopter.prepared.stream().noneMatch(a -> a.startsWith("done#")), "a completed build is not offered for adoption");
+        assertNull(text(key));
+        assertArrayEquals(record, STORE.read("jobs/done/builds/1/build.xml").content());
+        forget("seed-done", "done");
+    }
+
+    @Test
+    void placeholderWrittenByAnAdoptionElsewhereWhilePreparingHereIsKept() throws Exception {
+        String key = orphan("adopted-elsewhere");
+        // while the save point is fetched, this controller looks gone long enough for another one to adopt the build;
+        // then the adopters here find they cannot take it after all
+        Adopter.declineAfterInterfering = true;
+        Adopter.interfere = () -> {
+            Adopter.interfere = null;
+            live = Set.of("third-controller");
+            PersistenceStore third = STORE.as("third-controller");
+            long epoch = third.leases().acquire(key);
+            third.writeIfHeld(key, epoch, key, placeholder("third-controller", 1, epoch, "x.savePoint=3\n"), PersistenceStore.ANY);
+            live = Set.of(STORE.getOrigin(), "third-controller");
+        };
+
+        assertEquals(0, RunningBuilds.removeStale());
+        assertThat("the other controller's adoption stands", text(key), containsString("origin=third-controller"));
+        forget("adopted-elsewhere");
+    }
+
+    @Test
+    void adoptionWhoseWriteFailsIsAbandonedAndRetried() throws Exception {
+        String key = orphan("unwritten");
+        failWriteOf = key;
+
+        assertEquals(0, RunningBuilds.removeStale());
+        assertEquals(1, Adopter.abandoned.get(), "what was prepared for it is let go");
+        assertTrue(Adopter.resumed.isEmpty());
+
+        assertEquals(1, RunningBuilds.removeStale());
+        assertEquals(1, Adopter.resumed.size());
+        assertEquals(1, Adopter.abandoned.get());
+        forget("unwritten");
+    }
+
     @TestExtension
     public static class Adopter implements BuildAdopter {
         static final List<String> prepared = new CopyOnWriteArrayList<>();
@@ -444,6 +558,8 @@ class BuildLeasesTest {
         /** How many of the next preparations, and resumptions, fail. */
         static volatile int failPrepare;
         static volatile int failResume;
+        /** Whether to answer that nobody can adopt it, once {@link #interfere} ran. */
+        static volatile boolean declineAfterInterfering;
 
         interface ThrowingRunnable {
             void run() throws Exception;
@@ -465,6 +581,9 @@ class BuildLeasesTest {
                     i.run();
                 } catch (Exception e) {
                     throw new AssertionError(e);
+                }
+                if (declineAfterInterfering) {
+                    return null;
                 }
             }
             return new Adoption() {
