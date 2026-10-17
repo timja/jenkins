@@ -88,6 +88,19 @@ class InMemoryPersistenceStoreTest {
     }
 
     @Test
+    void aListenerFailingDoesNotStopTheOthersNorTheChange() throws Exception {
+        InMemoryPersistenceStore store = new InMemoryPersistenceStore(key -> true);
+        store.subscribe(e -> {
+            throw new IllegalStateException("broken listener");
+        });
+        List<String> delivered = new ArrayList<>();
+        store.subscribe(e -> delivered.add(e.key()));
+        store.write("k1", new byte[] {1}, PersistenceStore.ANY);
+        store.write("k2", new byte[] {2}, PersistenceStore.ANY);
+        assertEquals(List.of("k1", "k2"), delivered);
+    }
+
+    @Test
     void deletingAnAbsentKeySucceedsWhateverTheVersion() throws Exception {
         InMemoryPersistenceStore store = new InMemoryPersistenceStore(key -> true);
         store.delete("never", 42);
