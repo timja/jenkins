@@ -311,6 +311,30 @@ public final class SharedQueue {
         };
     }
 
+    /**
+     * Records a record read after a claim. Claimed here, the local item first takes its actions as claimed, before the
+     * gate (which decides from what is known) lets it start: a fold made elsewhere just before may not have been
+     * mirrored yet. Both under the queue lock, so that a late mirrored change does not put older actions back between.
+     */
+    private static void knowClaimed(@NonNull ClusterQueue.Record now) {
+        if (now.state() != ClusterQueue.State.CLAIMED || !origin().equals(now.claimedBy())) {
+            know(now);
+            return;
+        }
+        Queue.withLock(() -> {
+            Calendar due = new GregorianCalendar();
+            due.setTimeInMillis(now.dueAt());
+            Queue.getInstance().updateShared(now.id(), due, fromXml(now.actions()));
+            know(now);
+        });
+    }
+
+    /** Whether an item is known to be claimed here: its actions are then those it was claimed with (knowClaimed). */
+    private static boolean knownClaimedHere(long id) {
+        ClusterQueue.Record k = known.get(id);
+        return k != null && k.state() == ClusterQueue.State.CLAIMED && origin().equals(k.claimedBy());
+    }
+
     /** Live origins as last read, refreshed off the lock; null if unknown (taken as everyone alive). */
     private static volatile Set<String> live;
     private static volatile long liveAt;
@@ -569,12 +593,14 @@ public final class SharedQueue {
                 return new Blocked("Being checked with the other controllers");
             }
             String me = origin();
-            if (me.equals(r.claimedBy())) {
+            if (me.equals(r.claimedBy()) && r.state() == ClusterQueue.State.CLAIMED) {
                 return null;
             }
             if (r.state() != ClusterQueue.State.WAITING) {
+                // taken elsewhere, or started here already: an item started here has left the queue, so a copy still in
+                // it is stale (e.g. restored by a reload from a queue saved before it started)
                 Timer.get().submit(() -> dropLocal(id));
-                return new Blocked("Starting on another controller");
+                return new Blocked(r.state() == ClusterQueue.State.STARTED && me.equals(r.claimedBy()) ? "Started already" : "Starting on another controller");
             }
             if (r.pinnedTo() != null && !me.equals(r.pinnedTo())) {
                 return new Blocked("Waiting for the controller that scheduled it (it waits for the result)");
@@ -593,13 +619,16 @@ public final class SharedQueue {
         private static void claim(long id) {
             try {
                 ClusterQueue cq = queue();
+                String me = origin();
                 ClusterQueue.Record r = cq.get(id);
-                if (r != null && r.state() == ClusterQueue.State.WAITING && cq.claim(id)) {
+                // not if a request folded into it since the gate looked pinned it elsewhere (the claim checks it did not since)
+                if (r != null && r.state() == ClusterQueue.State.WAITING && (r.pinnedTo() == null || me.equals(r.pinnedTo()))
+                        && cq.claim(id, r.pinnedTo())) {
                     LOGGER.fine(() -> "Claimed queue item " + id);
                 }
                 ClusterQueue.Record now = cq.get(id);
                 if (now != null) {
-                    know(now);
+                    knowClaimed(now);
                 }
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.WARNING, "Cannot claim queue item " + id + "; not starting it for now", e);
@@ -812,9 +841,15 @@ public final class SharedQueue {
                 case WAITING -> {
                     if (localItem(r.id()) != null) {
                         // e.g. another controller folded a request into it: take over its causes and quiet period
+                        // (unless claimed here since: this change came late, and its actions are older)
                         Calendar due = new GregorianCalendar();
                         due.setTimeInMillis(r.dueAt());
-                        Queue.getInstance().updateShared(r.id(), due, fromXml(r.actions()));
+                        List<Action> actions = fromXml(r.actions());
+                        Queue.withLock(() -> {
+                            if (!knownClaimedHere(r.id())) {
+                                Queue.getInstance().updateShared(r.id(), due, actions);
+                            }
+                        });
                     } else if (!me.equals(r.origin()) || droppedHere.contains(r.id())) {
                         // our own items are recreated only if dropped: else absent here means they already left
                         create(r);

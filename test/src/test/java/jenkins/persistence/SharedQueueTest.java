@@ -53,6 +53,7 @@ import hudson.model.TopLevelItem;
 import hudson.model.TopLevelItemDescriptor;
 import hudson.model.queue.FoldableAction;
 import hudson.model.queue.QueueTaskFuture;
+import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.List;
 import java.util.Objects;
@@ -96,6 +97,19 @@ class SharedQueueTest {
     /** If set, called with the id of an item about to be updated (folded into). */
     static volatile java.util.function.LongConsumer beforeUpdate;
 
+    /** While set, queue changes are not delivered to this controller's mirror but kept here: they come late. */
+    static volatile List<Runnable> heldChanges;
+
+    private static void deliverHeldChanges() {
+        List<Runnable> held = heldChanges;
+        heldChanges = null;
+        if (held != null) {
+            synchronized (held) {
+                held.forEach(Runnable::run);
+            }
+        }
+    }
+
     private static ClusterQueue slowFor(ClusterQueue cq) {
         return new ClusterQueue() {
             @Override
@@ -136,8 +150,8 @@ class SharedQueueTest {
             }
 
             @Override
-            public boolean claim(long id) throws java.io.IOException {
-                return cq.claim(id);
+            public boolean claim(long id, String expectedPin) throws java.io.IOException {
+                return cq.claim(id, expectedPin);
             }
 
             @Override
@@ -162,7 +176,16 @@ class SharedQueueTest {
 
             @Override
             public AutoCloseable subscribe(java.util.function.Consumer<Record> listener) {
-                return cq.subscribe(listener);
+                return cq.subscribe(rec -> {
+                    List<Runnable> held = heldChanges;
+                    if (held != null) {
+                        synchronized (held) {
+                            held.add(() -> listener.accept(rec));
+                        }
+                    } else {
+                        listener.accept(rec);
+                    }
+                });
             }
         };
     }
@@ -641,6 +664,76 @@ class SharedQueueTest {
             slowPublish = null;
         }
         other.cancel(rec.id()); // the store outlives this test
+    }
+
+    @Test
+    void anItemStartedHereAlreadyDoesNotStartAgain() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("started-here");
+        // started here, but back in the queue (e.g. restored by a reload from a queue saved before it started)
+        long id = other.nextId();
+        STORE.clusterQueue().publish(new ClusterQueue.Record(id, "started-here", "started-here", SharedQueue.toXml(List.of(new CauseAction(new Cause.UserIdCause("xia")))),
+                System.currentTimeMillis(), ClusterQueue.State.STARTED, STORE.getOrigin(), null, STORE.getOrigin(), 1));
+        awaitMirrored();
+        SharedQueue.Ids.MIRRORED.set(id);
+        try {
+            PersistenceStores.applyingRemoteChange(() -> Queue.getInstance().schedule2(p, 0));
+        } finally {
+            SharedQueue.Ids.MIRRORED.remove();
+        }
+        for (int i = 0; i < 50 && !Queue.getInstance().isEmpty(); i++) {
+            Thread.sleep(100);
+        }
+        Thread.sleep(1_000);
+        assertNull(p.getLastBuild(), "it started already");
+        assertTrue(Queue.getInstance().isEmpty(), "dropped");
+    }
+
+    @Test
+    void anItemClaimedHereStartsWithWhatWasFoldedIntoItElsewhere() throws Exception {
+        long grace = SharedQueue.ORIGIN_GRACE_MILLIS;
+        SharedQueue.ORIGIN_GRACE_MILLIS = 0;
+        try {
+            FreeStyleProject p = r.createFreeStyleProject("claimed-with-fold");
+            ClusterQueue.Record rec = publishElsewhere("claimed-with-fold", 3_000, "yan");
+            heldChanges = new ArrayList<>(); // the fold's change reaches this controller late
+            List<Action> merged = List.of(new CauseAction(new Cause.UserIdCause("yan"), new Cause.UserIdCause("zoe")));
+            assertTrue(other.update(rec.id(), rec.actions(), SharedQueue.toXml(merged), rec.dueAt()));
+            for (int i = 0; i < 100 && p.getLastBuild() == null; i++) {
+                Thread.sleep(100);
+            }
+            assertNotNull(p.getLastBuild(), "claimed and started here");
+            r.waitForCompletion(p.getLastBuild());
+            StringBuilder users = new StringBuilder();
+            for (Cause c : p.getLastBuild().getCauses()) {
+                if (c instanceof Cause.UserIdCause u) {
+                    users.append(u.getUserId()).append(' ');
+                }
+            }
+            assertThat(users.toString(), containsString("zoe"));
+        } finally {
+            deliverHeldChanges();
+            SharedQueue.ORIGIN_GRACE_MILLIS = grace;
+        }
+    }
+
+    @Test
+    void anItemPinnedElsewhereAfterTheGateLookedIsNotClaimedHere() throws Exception {
+        long grace = SharedQueue.ORIGIN_GRACE_MILLIS;
+        SharedQueue.ORIGIN_GRACE_MILLIS = 0;
+        try {
+            FreeStyleProject p = r.createFreeStyleProject("pinned-meanwhile");
+            ClusterQueue.Record rec = publishElsewhere("pinned-meanwhile", 2_000, "abe");
+            heldChanges = new ArrayList<>(); // this controller does not learn of the pin before it claims
+            // a build step there folded a request into it: it must run there
+            assertTrue(other.update(rec.id(), rec.actions(), rec.actions(), rec.dueAt(), "other-controller"));
+            Thread.sleep(5_000); // past its quiet period
+            assertNull(p.getLastBuild(), "not started here");
+            assertNull(STORE.clusterQueue().get(rec.id()).claimedBy(), "not claimed here");
+            other.cancel(rec.id()); // the store outlives this test
+        } finally {
+            deliverHeldChanges();
+            SharedQueue.ORIGIN_GRACE_MILLIS = grace;
+        }
     }
 
     @Test
