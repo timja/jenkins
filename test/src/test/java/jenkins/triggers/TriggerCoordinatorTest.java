@@ -36,6 +36,7 @@ import hudson.triggers.Trigger;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -46,6 +47,21 @@ import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 
 @WithJenkins
 class TriggerCoordinatorTest {
+
+    /**
+     * The minute the tests tick: a fixed past one, so that the coordinators below can tell the real {@code Trigger.Cron},
+     * which keeps running during a test, from the test's own ticks. They refuse every other tick.
+     */
+    private static Calendar tick() {
+        Calendar cal = Calendar.getInstance();
+        cal.clear();
+        cal.set(2026, Calendar.OCTOBER, 14, 12, 34, 0);
+        return cal;
+    }
+
+    private static boolean isTestTick(Calendar tick) {
+        return tick.getTimeInMillis() == tick().getTimeInMillis();
+    }
 
     @Test
     void coordinatorDecidesWhichTriggersRunHere(JenkinsRule r) throws Exception {
@@ -58,7 +74,7 @@ class TriggerCoordinatorTest {
         mine.getTrigger(TimerTrigger.class).start(mine, true);
         theirs.getTrigger(TimerTrigger.class).start(theirs, true);
 
-        Trigger.checkTriggers(Calendar.getInstance());
+        Trigger.checkTriggers(tick());
         r.waitUntilNoActivity();
 
         assertNotNull(mine.getLastBuild(), "trigger allowed here ran");
@@ -76,8 +92,7 @@ class TriggerCoordinatorTest {
         timed.getTrigger(TimerTrigger.class).start(timed, true);
         r.jenkins.getDescriptorByType(SCMTrigger.DescriptorImpl.class).synchronousPolling = true;
 
-        Calendar cal = Calendar.getInstance();
-        cal.set(2026, Calendar.OCTOBER, 14, 12, 34, 0);
+        Calendar cal = tick();
         Trigger.checkTriggers(cal);
         assertEquals(34, cal.get(Calendar.MINUTE), "a coordinator moving its tick does not move the scheduler's");
         cal.add(Calendar.MINUTE, 1); // as Trigger.Cron does once checkTriggers returns, while the polling still runs
@@ -96,6 +111,9 @@ class TriggerCoordinatorTest {
 
         @Override
         public boolean shouldRun(TriggeredItem item, Trigger<?> trigger, Calendar tick) {
+            if (!isTestTick(tick)) {
+                return false;
+            }
             minutes.put(item.getName(), tick.get(Calendar.MINUTE));
             tick.add(Calendar.MINUTE, 7); // a careless coordinator
             return false;
@@ -111,19 +129,34 @@ class TriggerCoordinatorTest {
         fine.addTrigger(new TimerTrigger("* * * * *"));
         fine.getTrigger(TimerTrigger.class).start(fine, true);
 
-        Trigger.checkTriggers(Calendar.getInstance());
+        FreeStyleProject asserting = r.createFreeStyleProject("c-asserting");
+        asserting.addTrigger(new TimerTrigger("* * * * *"));
+        asserting.getTrigger(TimerTrigger.class).start(asserting, true);
+        FreeStyleProject last = r.createFreeStyleProject("d-last");
+        last.addTrigger(new TimerTrigger("* * * * *"));
+        last.getTrigger(TimerTrigger.class).start(last, true);
+
+        Trigger.checkTriggers(tick());
         r.waitUntilNoActivity();
 
         assertNull(broken.getLastBuild(), "refused when its coordinator failed");
         assertNotNull(fine.getLastBuild(), "the other trigger was still asked about and ran");
+        assertNull(asserting.getLastBuild(), "refused when its coordinator threw an Error");
+        assertNotNull(last.getLastBuild(), "and the round went on after it");
     }
 
     @TestExtension("aBrokenCoordinatorRefusesOnlyItsOwnTriggers")
     public static class LinkageBroken implements TriggerCoordinator {
         @Override
         public boolean shouldRun(TriggeredItem item, Trigger<?> trigger, Calendar tick) {
+            if (!isTestTick(tick)) {
+                return false;
+            }
             if (item.getName().equals("a-broken")) {
                 throw new NoClassDefFoundError("some/missing/Class");
+            }
+            if (item.getName().equals("c-asserting")) {
+                throw new AssertionError("a plugin's assertion");
             }
             return true;
         }
@@ -135,10 +168,13 @@ class TriggerCoordinatorTest {
 
     @TestExtension("coordinatorDecidesWhichTriggersRunHere")
     public static class Coordinator implements TriggerCoordinator {
-        static final List<String> asked = new ArrayList<>();
+        static final List<String> asked = Collections.synchronizedList(new ArrayList<>());
 
         @Override
         public boolean shouldRun(TriggeredItem item, Trigger<?> trigger, Calendar tick) {
+            if (!isTestTick(tick)) {
+                return false;
+            }
             asked.add(item.getName());
             return !item.getName().equals("theirs");
         }
