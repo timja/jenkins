@@ -387,7 +387,7 @@ class StaticStateApplierTest {
     }
 
     @Test
-    void aUserSavedHereAfterItsDeletionElsewhereIsKept() throws Exception {
+    void aUserSavedHereAfterItsDeletionElsewhereIsRefusedAndTheDeletionApplied() throws Exception {
         User dave = User.getById("dave", true);
         dave.save();
         String daveKey = STORE.children("users").stream().filter(d -> d.startsWith("dave_")).map(d -> "users/" + d + "/config.xml").findFirst().orElseThrow();
@@ -395,15 +395,14 @@ class StaticStateApplierTest {
         Blocker.holding.await();
         other.delete(daveKey, PersistenceStore.ANY);
         dave.setFullName("Dave Again");
-        dave.save(); // after the deletion elsewhere, which it overwrites (last writer wins)
+        assertThrows(ConflictException.class, dave::save, "after the deletion elsewhere, which it would overwrite");
         Blocker.release.countDown();
         awaitApplied();
-        assertNotNull(STORE.read(daveKey), "stored again");
-        assertEquals("Dave Again", User.getById("dave", false).getFullName(), "the deletion, older than the save, is not applied");
-        assertTrue(new File(r.jenkins.getRootDir(), daveKey).getParentFile().isDirectory());
+        assertNull(STORE.read(daveKey), "not stored again");
+        assertNull(User.getById("dave", false), "the deletion is applied");
     }
 
-    @TestExtension("aUserSavedHereAfterItsDeletionElsewhereIsKept")
+    @TestExtension("aUserSavedHereAfterItsDeletionElsewhereIsRefusedAndTheDeletionApplied")
     public static class Blocker implements RemoteChangeHandler {
         static final CountDownLatch holding = new CountDownLatch(1);
         static final CountDownLatch release = new CountDownLatch(1);
