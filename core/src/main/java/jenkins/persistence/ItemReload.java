@@ -101,7 +101,7 @@ final class ItemReload {
         /** Every field that changed elsewhere was copied: the item is in sync with the version read. */
         APPLIED,
         /**
-         * Some were not, having changed here too: the item is not that version, so it is not recorded as loaded (nor the
+         * Some were not, having changed here too, or other fields changed here: the item is not that version, so it is not recorded as loaded (nor the
          * caller's snapshot taken), and its pending save conflicts and merges against the last version in sync.
          */
         PARTLY
@@ -138,7 +138,11 @@ final class ItemReload {
             fields.put(name, f);
         }
         LOGGER.fine(() -> "Reloading " + item.getFullName() + " field by field from version " + prepared.entry().version() + ": changed " + changed);
-        boolean kept = false;
+        // changed here since the last sync, in any field (a setter assigning just after the caller checked, or an object
+        // applied to although it never saves): the item is then not that version either, whether or not the field
+        // changed elsewhere too; taken for it, the change here would become part of what is in sync, and a later change
+        // of that field elsewhere would overwrite it
+        boolean kept = !live.equals(before);
         for (Map.Entry<String, Field> e : fields.entrySet()) {
             if (!Objects.equals(live.get(e.getKey()), before.get(e.getKey()))) {
                 // changed here too since the last sync: keep it; its save is pending and merges with the store
