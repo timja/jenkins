@@ -432,7 +432,7 @@ public final class ItemChangeApplier {
             return; // not an item, or already have this version (e.g. loaded it at startup)
         }
         ChangeEvent failedDeletion = failedDeletions.get(e.key());
-        if (failedDeletion != null && failedDeletion.version() < e.version() && !MERGED.equals(e.origin())) {
+        if (failedDeletion != null && failedDeletion.version() < e.version() && !MERGED.equals(e.origin()) && !REFUSED.equals(e.origin())) {
             // made again elsewhere after a deletion that failed to apply here: that deletion first, or the deleted item
             // would be reloaded as the new one, keeping its builds and history (and its retry then skipped as older
             // than what was loaded); if it fails again, so does this write, retried after it
