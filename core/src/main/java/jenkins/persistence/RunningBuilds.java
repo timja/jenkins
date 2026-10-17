@@ -895,6 +895,7 @@ public final class RunningBuilds {
             } catch (IOException | RuntimeException e) {
                 resumeFailed(store, job, p, version, e);
             }
+            SharedQueue.resumedExclusive(job, number); // loaded now (or not resumed, and let go of): the queue sees it
             String jobKey = jobKeyOfRunning(runningKey(job));
             if (store.read(jobKey + "/" + PREFIX + "/" + number + STOP_SUFFIX) != null) {
                 stopRequested(jobKey, number); // asked to stop while its owner was gone
