@@ -330,14 +330,22 @@ public final class PersistenceStores {
             store.delete(key + MOVING, claim);
         } catch (IOException | RuntimeException e) {
             LOGGER.log(Level.WARNING, "Could not release the claim on " + key + "; it lapses", e);
+        } finally {
+            claiming.remove(key + MOVING);
         }
     }
 
     /** Suffix of the entry a move claims its destination with, next to (not below) the destination. */
     static final String MOVING = ".moving";
 
-    /** A claim this old was left by a move that never finished (its controller died): it may be taken over. */
+    /**
+     * Where the store does not track {@linkplain PersistenceStore#liveOrigins membership}, a claim this old was left by
+     * a move that never finished (its controller died): it may be taken over.
+     */
     static final long CLAIM_LAPSE_MILLIS = TimeUnit.MINUTES.toMillis(10);
+
+    /** The claims moves in this JVM hold now. */
+    private static final Set<String> claiming = ConcurrentHashMap.newKeySet();
 
     /**
      * Fails if another move holds a claim on what holds either key (a folder being moved), or on something below the
@@ -371,14 +379,27 @@ public final class PersistenceStores {
 
     private static void checkNotClaimed(PersistenceStore store, String claimKey) throws IOException {
         PersistenceStore.Entry held = store.read(claimKey);
-        if (held != null && !lapsed(held)) {
+        if (held != null && !lapsed(store, claimKey, held)) {
             throw new ConflictException(claimKey, PersistenceStore.ABSENT, held.version()); // another move overlaps this one
         }
     }
 
-    /** Whether a claim was left by a move that never finished (its controller died), and may be taken over. */
-    private static boolean lapsed(PersistenceStore.Entry held) {
-        String[] parts = new String(held.content(), StandardCharsets.UTF_8).split(" ", 2);
+    /**
+     * Whether a claim was left by a move that never finished (its controller died), and may be taken over: its controller
+     * is gone, however long the move takes; or, where the store does not track membership, it is older than
+     * {@link #CLAIM_LAPSE_MILLIS}. A claim of this controller's that no move here holds (its release failed) has lapsed too.
+     */
+    private static boolean lapsed(PersistenceStore store, String claimKey, PersistenceStore.Entry held) throws IOException {
+        String[] parts = new String(held.content(), StandardCharsets.UTF_8).split(" ", 3);
+        if (parts.length > 1) {
+            if (parts[1].equals(store.getOrigin())) {
+                return !claiming.contains(claimKey);
+            }
+            Set<String> live = store.liveOrigins();
+            if (live != null) {
+                return !live.contains(parts[1]);
+            }
+        }
         long since;
         try {
             since = Long.parseLong(parts[0]);
@@ -393,13 +414,15 @@ public final class PersistenceStores {
         byte[] claim = (System.currentTimeMillis() + " " + store.getOrigin() + " " + fromKey).getBytes(StandardCharsets.UTF_8);
         for (int attempt = 0; attempt < 3; attempt++) {
             try {
-                return store.write(toKey + MOVING, claim, PersistenceStore.ABSENT);
+                long version = store.write(toKey + MOVING, claim, PersistenceStore.ABSENT);
+                claiming.add(toKey + MOVING);
+                return version;
             } catch (ConflictException e) {
                 PersistenceStore.Entry held = store.read(toKey + MOVING);
                 if (held == null) {
                     continue; // released meanwhile
                 }
-                if (!lapsed(held)) {
+                if (!lapsed(store, toKey + MOVING, held)) {
                     throw new ConflictException(toKey, PersistenceStore.ABSENT, held.version()); // another move goes there now
                 }
                 LOGGER.warning(() -> "Taking over a lapsed claim on " + toKey + " (" + new String(held.content(), StandardCharsets.UTF_8) + ")");
