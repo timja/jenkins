@@ -67,6 +67,7 @@ import org.htmlunit.HttpMethod;
 import org.htmlunit.WebRequest;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.jvnet.hudson.test.FailureBuilder;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.TestBuilder;
 import org.jvnet.hudson.test.TestExtension;
@@ -622,6 +623,18 @@ class ClusterCoordinationTest {
         assertThat("looked at again after the store failed", stopReads.get(), greaterThan(reads + 1));
         STORE.delete("jobs/stop-retried/running/1.stop", PersistenceStore.ANY);
     }
+
+    @Test
+    void ownBuildElsewhereDoesNotBlockAJobInACycleWithItself() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("cycle");
+        p.setConcurrentBuild(true);
+        p.setBlockBuildWhenUpstreamBuilding(true);
+        p.setBlockBuildWhenDownstreamBuilding(true);
+        p.getBuildersList().add(new FailureBuilder()); // so that it does not trigger itself again
+        p.getPublishersList().add(new BuildTrigger("cycle", Result.SUCCESS));
+        r.jenkins.rebuildDependencyGraph();
+        other.write("jobs/cycle/running/5.xml", bytes("origin=other-controller\ncontroller=jenkins-b\ndisplayName=#5\nstartTime=1\n"), PersistenceStore.ABSENT);
+        awaitApplied();
 
         // as here, where its own builds do not block it either
         FreeStyleBuild b = p.scheduleBuild2(0).get(60, TimeUnit.SECONDS);
