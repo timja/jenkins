@@ -34,11 +34,20 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Util;
+import hudson.model.AbstractItem;
 import hudson.model.FreeStyleProject;
+import hudson.model.Item;
+import hudson.model.ItemGroup;
+import hudson.model.Job;
+import hudson.model.TopLevelItem;
+import hudson.model.TopLevelItemDescriptor;
 import java.io.File;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.util.Collection;
+import java.util.Set;
+import jenkins.model.Jenkins;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
@@ -133,6 +142,58 @@ class PersistenceStoreItemEnumerationTest {
         assertNotNull(r.jenkins.getItem("a"));
         assertNull(r.jenkins.getItem("b"));
         assertNotNull(r.jenkins.getItem("c"));
+    }
+
+    @Test
+    void anItemFailingToLinkDoesNotHideTheOthers() throws Exception {
+        STORE.write("jobs/link-a/config.xml", "<?xml version='1.1' encoding='UTF-8'?><jenkins.persistence.PersistenceStoreItemEnumerationTest_-Unlinkable/>"
+                .getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+        STORE.write("jobs/link-b/config.xml", "<?xml version='1.1' encoding='UTF-8'?><project/>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+        Unlinkable.failing = true;
+        try {
+            r.jenkins.reload();
+        } finally {
+            Unlinkable.failing = false;
+        }
+
+        assertNull(r.jenkins.getItem("link-a"));
+        assertNotNull(r.jenkins.getItem("link-b"));
+        STORE.delete("jobs/link-a/config.xml", PersistenceStore.ANY); // its type exists only in this test
+    }
+
+    /** An item whose loading fails as when a class it needs is missing. */
+    public static class Unlinkable extends AbstractItem implements TopLevelItem {
+        static volatile boolean failing;
+
+        public Unlinkable(ItemGroup<?> parent, String name) {
+            super(parent, name);
+        }
+
+        @Override
+        public void onLoad(ItemGroup<? extends Item> parent, String name) throws IOException {
+            if (failing) {
+                throw new NoClassDefFoundError("missing/Dependency");
+            }
+            super.onLoad(parent, name);
+        }
+
+        @Override
+        public Collection<? extends Job> getAllJobs() {
+            return Set.of();
+        }
+
+        @Override
+        public TopLevelItemDescriptor getDescriptor() {
+            return (TopLevelItemDescriptor) Jenkins.get().getDescriptorOrDie(getClass());
+        }
+
+        @TestExtension("anItemFailingToLinkDoesNotHideTheOthers")
+        public static class DescriptorImpl extends TopLevelItemDescriptor {
+            @Override
+            public TopLevelItem newInstance(ItemGroup parent, String name) {
+                return new Unlinkable(parent, name);
+            }
+        }
     }
 
     @TestExtension
