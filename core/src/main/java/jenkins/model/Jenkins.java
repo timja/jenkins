@@ -3483,7 +3483,8 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
                     TopLevelItem item = (TopLevelItem) Items.load(Jenkins.this, subdir);
                     items.put(item.getName(), item);
                     loadedNames.add(item.getName());
-                } catch (IOException | RuntimeException e) {
+                } catch (IOException | RuntimeException | LinkageError e) {
+                    // as with one task per item, one which fails to load (a missing plugin class, say) does not stop the others
                     LOGGER.log(Level.WARNING, "Failed to load item " + name + " from the persistence store", e);
                 }
             }
