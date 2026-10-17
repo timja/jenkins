@@ -35,6 +35,8 @@ import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import jenkins.model.Jenkins;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
 
 /**
  * Created when {@link hudson.model.Queue.Item} is created so that the caller can track the progress of the task.
@@ -56,6 +58,11 @@ public final class FutureImpl extends AsyncFutureImpl<Executable> implements Que
      */
     /*package*/ final AsyncFutureImpl<Executable> start = new AsyncFutureImpl<>();
 
+    /**
+     * Whether the item was taken by another controller sharing the queue ({@link hudson.model.Queue#handOff}).
+     */
+    private boolean handedOff;
+
     public FutureImpl(Task task) {
         this.task = task;
     }
@@ -74,6 +81,9 @@ public final class FutureImpl extends AsyncFutureImpl<Executable> implements Que
     public boolean cancel(boolean mayInterruptIfRunning) {
         Queue q = Jenkins.get().getQueue();
         synchronized (this) {
+            if (handedOff) {
+                return false; // not in this queue any more, nor running here
+            }
             if (!executors.isEmpty()) {
                 if (mayInterruptIfRunning)
                     for (Executor e : executors)
@@ -89,6 +99,24 @@ public final class FutureImpl extends AsyncFutureImpl<Executable> implements Que
         super.setAsCancelled();
         if (!start.isDone()) {
             start.setAsCancelled();
+        }
+    }
+
+    /**
+     * The item was taken by another controller sharing the queue: {@link #cancel} can no longer cancel it here.
+     */
+    @Restricted(NoExternalUse.class)
+    public synchronized void handedOff() {
+        handedOff = true;
+    }
+
+    /**
+     * The item, taken by another controller sharing the queue, started there.
+     */
+    @Restricted(NoExternalUse.class)
+    public synchronized void setAsStartedElsewhere(@NonNull Executable view) {
+        if (!start.isDone()) {
+            start.set(view);
         }
     }
 

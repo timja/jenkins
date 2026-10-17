@@ -37,6 +37,7 @@ import hudson.model.ParameterValue;
 import hudson.model.ParametersAction;
 import hudson.model.ParametersDefinitionProperty;
 import hudson.model.Queue;
+import hudson.model.Result;
 import hudson.model.Run;
 import hudson.model.TaskListener;
 import hudson.model.User;
@@ -51,6 +52,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import jenkins.model.ExternalBuild;
+import jenkins.model.ExternalBuilds;
 import jenkins.model.Jenkins;
 import jenkins.model.ParameterizedJobMixIn;
 import jenkins.scm.SCMDecisionHandler;
@@ -174,7 +177,13 @@ public class BuildCommand extends CLICommand {
             if (f == null) {
                 throw new IllegalStateException(BUILD_SCHEDULING_REFUSED);
             }
-            Run<?, ?> b = f.waitForStart();    // wait for the start
+            // wait for the start: a Run, or a view of a build which another controller sharing the queue started (so
+            // through the item's own future, which is not typed to a Run as f is)
+            Queue.Executable started = item.getFuture().waitForStart();
+            if (!(started instanceof Run) && started instanceof ExternalBuild elsewhere) {
+                return followElsewhere(item, elsewhere);
+            }
+            Run<?, ?> b = (Run<?, ?>) started;
             stdout.println("Started " + b.getFullDisplayName());
             stdout.flush();
 
@@ -202,7 +211,10 @@ public class BuildCommand extends CLICommand {
                             }
                         }
                     }
-                    f.get();    // wait for the completion
+                    // wait for the completion (of a build started elsewhere, the Run may be a newer instance)
+                    if (item.getFuture().get() instanceof Run<?, ?> completed) {
+                        b = completed;
+                    }
                     stdout.println("Completed " + b.getFullDisplayName() + " : " + b.getResult());
                     return b.getResult().ordinal;
                 } catch (InterruptedException e) {
@@ -210,7 +222,12 @@ public class BuildCommand extends CLICommand {
                         return 125;
                     } else {
                         if (job.hasPermission(Item.CANCEL)) {
-                            f.cancel(true);
+                            ExternalBuild elsewhere = ExternalBuilds.get().get(job, b.getNumber());
+                            if (elsewhere != null) {
+                                elsewhere.requestStop(Jenkins.getAuthentication2().getName());
+                            } else {
+                                f.cancel(true);
+                            }
                         }
                         Exception myException = new AbortException();
                         myException.initCause(e);
@@ -221,6 +238,39 @@ public class BuildCommand extends CLICommand {
         }
 
         return 0;
+    }
+
+    /**
+     * Like the rest of {@link #run} for a build which another controller sharing the queue started.
+     */
+    private int followElsewhere(Queue.Item item, ExternalBuild started) throws Exception {
+        stdout.println("Started " + job.getFullDisplayName() + " #" + started.getNumber() + " on " + started.getLocation());
+        stdout.flush();
+        if (!(sync || follow)) {
+            return 0;
+        }
+        try {
+            if (consoleOutput) {
+                ConsoleCommand.follow(started, 0, stdout);
+            }
+            Queue.Executable done = item.getFuture().get();    // wait for the completion
+            Result result = done instanceof Run<?, ?> run ? run.getResult() : started.getResult();
+            if (result == null) {
+                result = Result.NOT_BUILT;
+            }
+            stdout.println("Completed " + job.getFullDisplayName() + " #" + started.getNumber() + " : " + result);
+            return result.ordinal;
+        } catch (InterruptedException e) {
+            if (follow) {
+                return 125;
+            }
+            if (job.hasPermission(Item.CANCEL)) {
+                started.requestStop(Jenkins.getAuthentication2().getName());
+            }
+            Exception myException = new AbortException();
+            myException.initCause(e);
+            throw myException;
+        }
     }
 
     @Override
