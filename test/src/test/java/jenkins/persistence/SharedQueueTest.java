@@ -1030,6 +1030,29 @@ class SharedQueueTest {
     }
 
     @Test
+    void anItemPinnedToAControllerThatIsGoneIsClaimedHere() throws Exception {
+        long grace = SharedQueue.ORIGIN_GRACE_MILLIS;
+        SharedQueue.ORIGIN_GRACE_MILLIS = 0;
+        live = Set.of(STORE.getOrigin(), "other-controller"); // not the controller it is pinned to
+        try {
+            FreeStyleProject p = r.createFreeStyleProject("pinned-to-gone");
+            List<Action> actions = List.of(new CauseAction(new Cause.UserIdCause("cid")));
+            long id = other.nextId();
+            other.publish(new ClusterQueue.Record(id, "pinned-to-gone", "pinned-to-gone", SharedQueue.toXml(actions),
+                    System.currentTimeMillis(), ClusterQueue.State.WAITING, "other-controller", "gone-controller", null, 0));
+            for (int i = 0; i < 300 && p.getLastBuild() == null; i++) {
+                Thread.sleep(100);
+            }
+            assertNotNull(p.getLastBuild(), "a pin to a controller that is gone does not keep it waiting");
+            assertEquals(id, p.getLastBuild().getQueueId());
+            r.waitForCompletion(p.getLastBuild());
+        } finally {
+            live = null;
+            SharedQueue.ORIGIN_GRACE_MILLIS = grace;
+        }
+    }
+
+    @Test
     void recordsKeptApartInTheStoreAreMirroredApart() throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("mirrored-apart");
         long[] ids = new long[2];

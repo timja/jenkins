@@ -1039,8 +1039,10 @@ public final class SharedQueue {
             try {
                 String me = origin();
                 ClusterQueue.Record r = cq.get(id);
-                // not if a request folded into it since the gate looked pinned it elsewhere (the claim checks it did not since)
-                if (r != null && r.state() == ClusterQueue.State.WAITING && (r.pinnedTo() == null || me.equals(r.pinnedTo()))) {
+                // not if a request folded into it since the gate looked pinned it to a live controller elsewhere (the claim
+                // checks it did not since)
+                if (r != null && r.state() == ClusterQueue.State.WAITING
+                        && (r.pinnedTo() == null || me.equals(r.pinnedTo()) || !pinHolds(r.pinnedTo()))) {
                     String reservedBy = Reservations.holder(id);
                     if (reservedBy != null && !origin().equals(reservedBy)) {
                         if (!gone(reservedBy)) {
