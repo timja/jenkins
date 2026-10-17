@@ -243,6 +243,25 @@ public abstract class AbstractLazyLoadRunMap<R> extends AbstractMap<Integer, R> 
         }
     }
 
+    /**
+     * Drops the loaded instance of a build, if any, so that it is read again from disk when next needed,
+     * as after another controller changed its record.
+     */
+    @Restricted(NoExternalUse.class)
+    public final synchronized void unload(int buildNumber) {
+        if (core.containsKey(buildNumber)) {
+            core.put(buildNumber, new BuildReference<>(String.valueOf(buildNumber)));
+        }
+    }
+
+    /**
+     * Removes a build from the index without loading it or notifying anyone, as after another controller deleted it.
+     */
+    @Restricted(NoExternalUse.class)
+    public final synchronized void forget(int buildNumber) {
+        core.remove(buildNumber);
+    }
+
     @Override
     public Comparator<? super Integer> comparator() {
         return Collections.reverseOrder();
