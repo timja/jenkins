@@ -103,6 +103,11 @@ public final class ItemChangeApplier {
      * that one, as a delete retried after the key was made again would.
      */
     private final Map<String, Long> newest = new java.util.concurrent.ConcurrentHashMap<>();
+    /**
+     * Item deletions that failed to apply and are to be retried, by key: a write of the key made since (the item made
+     * again) applies the deletion first. Only touched by the worker.
+     */
+    private final Map<String, ChangeEvent> failedDeletions = new HashMap<>();
     private Thread worker;
 
     private ItemChangeApplier(Jenkins jenkins, PersistenceStore store) {
@@ -289,7 +294,7 @@ public final class ItemChangeApplier {
                 Long latest = newest.get(e.key());
                 // except an item's deletion: the item made again since is another one, which must not take over the
                 // deleted one's builds and history (deleted() skips one older than what this controller has read)
-                boolean itemDeleted = e.kind() == ChangeEvent.Kind.DELETED && itemPath(e.key()) != null;
+                boolean itemDeleted = itemDeleted(e);
                 // nor a move: a later write of its destination does not move the item from its old name (or a second
                 // one would be loaded at the new name, the moved one left where it was)
                 boolean move = e.kind() == ChangeEvent.Kind.MOVED;
@@ -300,7 +305,11 @@ public final class ItemChangeApplier {
                 apply(e);
                 failures.remove(e.key());
                 newest.remove(e.key(), e.version());
+                failedDeletions.remove(e.key(), e);
             } catch (Exception | LinkageError x) {
+                if (itemDeleted(e)) {
+                    failedDeletions.merge(e.key(), e, (a, b) -> b.version() > a.version() ? b : a);
+                }
                 // e.g. the store was unreachable while reading the new content: try again with backoff, then every few
                 // minutes for a while, or this controller would keep the old version until the key changes again
                 int n = failures.merge(e.key(), 1, Integer::sum);
@@ -312,6 +321,7 @@ public final class ItemChangeApplier {
                 } else {
                     failures.remove(e.key());
                     newest.remove(e.key(), e.version());
+                    failedDeletions.remove(e.key(), e);
                     LOGGER.log(Level.WARNING, "Failed to apply " + e + "; giving up until its key changes again", x);
                 }
             } finally {
@@ -400,6 +410,15 @@ public final class ItemChangeApplier {
         if (names == null || e.version() <= PersistenceStores.lastSeen(e.key())) {
             return; // not an item, or already have this version (e.g. loaded it at startup)
         }
+        ChangeEvent failedDeletion = failedDeletions.get(e.key());
+        if (failedDeletion != null && failedDeletion.version() < e.version() && !MERGED.equals(e.origin())) {
+            // made again elsewhere after a deletion that failed to apply here: that deletion first, or the deleted item
+            // would be reloaded as the new one, keeping its builds and history (and its retry then skipped as older
+            // than what was loaded); if it fails again, so does this write, retried after it
+            LOGGER.fine(() -> "Applying " + failedDeletion + ", which failed, before " + e);
+            deleted(failedDeletion);
+            failedDeletions.remove(e.key(), failedDeletion);
+        }
         String fullName = String.join("/", names);
         Item item = jenkins.getItemByFullName(fullName);
         if (item instanceof AbstractItem existing) {
@@ -473,6 +492,10 @@ public final class ItemChangeApplier {
                 written(w);
             }
         }
+    }
+
+    private static boolean itemDeleted(ChangeEvent e) {
+        return e.kind() == ChangeEvent.Kind.DELETED && itemPath(e.key()) != null;
     }
 
     private void deleted(ChangeEvent e) throws Exception {
