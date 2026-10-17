@@ -71,7 +71,7 @@ class PersistenceStoreItemConfigTest {
 
     @AfterEach
     void tearDown() {
-        PersistenceStores.CONFLICTS = "warn";
+        PersistenceStores.CONFLICTS = "refuse";
     }
 
     @Test
@@ -143,14 +143,29 @@ class PersistenceStoreItemConfigTest {
         long before = PersistenceStores.getConflictCount();
         // another controller modifies the job behind our back
         STORE.write(key, "<project><description>elsewhere</description></project>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
-        p.setDescription("here");
+        assertThrows(ConflictException.class, () -> p.setDescription("here"));
         assertEquals(before + 1, PersistenceStores.getConflictCount());
-        assertThat(new String(STORE.read(key).content(), StandardCharsets.UTF_8), containsString("here"));
+        assertThat(new String(STORE.read(key).content(), StandardCharsets.UTF_8), containsString("elsewhere"));
 
         PersistenceStores.CONFLICTS = "fail";
         STORE.write(key, "<project><description>elsewhere again</description></project>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
         assertThrows(IOException.class, () -> p.setDescription("rejected"));
         assertThat(new String(STORE.read(key).content(), StandardCharsets.UTF_8), containsString("elsewhere again"));
+    }
+
+    @Test
+    void aKeyNeverReadHereIsOnlyCreated() throws Exception {
+        String key = "jobs/unread/config.xml";
+        byte[] theirs = "<project><description>elsewhere</description></project>".getBytes(StandardCharsets.UTF_8);
+        STORE.write(key, theirs, PersistenceStore.ANY);
+        // not read here (its read failed, say, and the object holds defaults): its save must not replace what is stored
+        PersistenceStores.Route route = PersistenceStores.route(PersistenceStores.fileFor(key));
+        assertThrows(ConflictException.class, () -> route.write("<project/>".getBytes(StandardCharsets.UTF_8)));
+        assertArrayEquals(theirs, STORE.read(key).content());
+        // never stored: created
+        PersistenceStores.Route fresh = PersistenceStores.route(PersistenceStores.fileFor("jobs/unread2/config.xml"));
+        fresh.write("<project/>".getBytes(StandardCharsets.UTF_8));
+        assertThat(STORE.versions(), hasKey("jobs/unread2/config.xml"));
     }
 
     @Test

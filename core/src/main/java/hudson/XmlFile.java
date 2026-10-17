@@ -67,6 +67,7 @@ import jenkins.persistence.PersistenceStores;
 import org.apache.commons.io.IOUtils;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.xml.sax.Attributes;
 import org.xml.sax.InputSource;
 import org.xml.sax.Locator;
@@ -324,16 +325,22 @@ public final class XmlFile {
     }
 
     public boolean exists() {
-        PersistenceStores.Route route = route();
-        if (route != null) {
-            try {
-                return route.exists();
-            } catch (IOException e) {
-                LOGGER.log(Level.WARNING, "Failed to check whether " + route.key() + " exists", e);
-                return false;
-            }
+        try {
+            return checkExists();
+        } catch (IOException e) {
+            LOGGER.log(Level.WARNING, "Failed to check whether " + file + " exists", e);
+            return false;
         }
-        return file.exists();
+    }
+
+    /**
+     * As {@link #exists()}, except that a {@link PersistenceStore} which cannot tell (being unreachable, say) throws,
+     * rather than the file being taken for absent: for callers that would take that for a deletion.
+     */
+    @Restricted(NoExternalUse.class)
+    public boolean checkExists() throws IOException {
+        PersistenceStores.Route route = route();
+        return route != null ? route.exists() : file.exists();
     }
 
     public void delete() throws IOException {

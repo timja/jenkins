@@ -47,8 +47,9 @@ import org.kohsuke.accmod.restrictions.NoExternalUse;
  *
  * <p>Also remembers, per key, the version this JVM last read or wrote, so that writes can detect
  * modifications made by other controllers in the meantime.
- * What happens on such a conflict depends on {@code -Djenkins.persistence.PersistenceStores.conflicts}:
- * {@code warn} (the default) logs and overwrites, {@code fail} throws {@link ConflictException}.
+ * A save conflicting with such a modification is refused ({@link ConflictException}): it never overwrites it. A save of
+ * a key this JVM has not read (it failed to, say) only creates it. A deletion conflicting with one is logged and done,
+ * unless {@code -Djenkins.persistence.PersistenceStores.conflicts=fail}.
  *
  * @since TODO
  */
@@ -58,10 +59,10 @@ public final class PersistenceStores {
     private static final Logger LOGGER = Logger.getLogger(PersistenceStores.class.getName());
 
     /**
-     * Conflict policy: {@code warn} or {@code fail}.
+     * Conflict policy: {@code refuse} (the default) or {@code fail}, which also refuses conflicting deletions.
      */
     @Restricted(NoExternalUse.class)
-    public static /* non-final for script console */ String CONFLICTS = SystemProperties.getString(PersistenceStores.class.getName() + ".conflicts", "warn");
+    public static /* non-final for script console */ String CONFLICTS = SystemProperties.getString(PersistenceStores.class.getName() + ".conflicts", "refuse");
 
     private static volatile PersistenceStore testingStore;
     private static volatile Jenkins resolvedFor;
@@ -187,7 +188,7 @@ public final class PersistenceStores {
     }
 
     /**
-     * Number of conflicting writes detected (and, under the {@code warn} policy, overwritten) by this JVM.
+     * Number of conflicting writes detected (and refused) by this JVM.
      */
     public static long getConflictCount() {
         return conflicts.get();
@@ -283,17 +284,15 @@ public final class PersistenceStores {
         public long write(@NonNull byte[] content) throws IOException {
             Creation creation = creations.get(key);
             boolean createOnly = creation != null && creation.written == PersistenceStore.ABSENT;
-            long expected = createOnly ? PersistenceStore.ABSENT : lastSeen(key);
+            // a key never read here (its read failed, say: the object holds defaults, not what is stored) only creates
+            long expected = createOnly ? PersistenceStore.ABSENT : versions.getOrDefault(key, PersistenceStore.ABSENT);
             long version;
             try {
                 version = store.write(key, content, expected);
             } catch (ConflictException e) {
                 conflicts.incrementAndGet();
-                if (createOnly || "fail".equals(CONFLICTS)) {
-                    throw e;
-                }
-                LOGGER.log(Level.WARNING, e.getMessage() + "; overwriting (last writer wins)");
-                version = store.write(key, content, PersistenceStore.ANY);
+                LOGGER.log(Level.WARNING, e.getMessage() + "; not saved, so as not to overwrite that change");
+                throw e;
             }
             if (creation != null) {
                 creation.written = version;
