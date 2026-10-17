@@ -316,7 +316,7 @@ public final class BuildRecords {
                 byte[] marked = (new String(stored.content(), StandardCharsets.UTF_8).replaceAll("\n<!-- files updated \\d+ -->$", "")
                         + "\n<!-- files updated " + System.currentTimeMillis() + " -->").getBytes(StandardCharsets.UTF_8);
                 try {
-                    store.write(base + "/" + RECORD, marked, stored.version());
+                    seen(base + "/" + RECORD, store.write(base + "/" + RECORD, marked, stored.version()));
                 } catch (ConflictException e) {
                     LOGGER.fine(() -> run + " changed meanwhile; its files are published with the next sweep");
                     return;
@@ -345,6 +345,7 @@ public final class BuildRecords {
         // complete), its deletion removed what was written before, and this removes what was written after
         if (isDeleted(base, run)) {
             PersistenceStores.get().delete(base + "/" + RECORD, PersistenceStore.ANY);
+            seen(base + "/" + RECORD, PersistenceStore.ABSENT);
             discardSnapshot(base);
             LOGGER.fine(() -> "Unpublished " + run + ": deleted while being published");
             return;
@@ -476,7 +477,7 @@ public final class BuildRecords {
             }
         }
         try {
-            store.write(base + "/" + RECORD, record.getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+            seen(base + "/" + RECORD, store.write(base + "/" + RECORD, record.getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT));
             LOGGER.info(() -> "Closed " + job.getFullName() + " #" + number + " as aborted: " + reason);
             writtenElsewhere(job, number); // this controller's own write raises no event here
         } catch (ConflictException e) {
