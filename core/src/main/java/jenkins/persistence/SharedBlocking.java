@@ -51,21 +51,24 @@ public final class SharedBlocking extends QueueTaskDispatcher {
             return null;
         }
         if (p.blockBuildWhenUpstreamBuilding()) {
-            CauseOfBlockage cause = runningElsewhere(p.getTransitiveUpstreamProjects(), "Upstream");
+            CauseOfBlockage cause = runningElsewhere(p, p.getTransitiveUpstreamProjects(), "Upstream");
             if (cause != null) {
                 return cause;
             }
         }
         if (p.blockBuildWhenDownstreamBuilding()) {
-            return runningElsewhere(p.getTransitiveDownstreamProjects(), "Downstream");
+            return runningElsewhere(p, p.getTransitiveDownstreamProjects(), "Downstream");
         }
         return null;
     }
 
     @CheckForNull
     @SuppressWarnings("rawtypes")
-    private static CauseOfBlockage runningElsewhere(Iterable<AbstractProject> jobs, String which) {
+    private static CauseOfBlockage runningElsewhere(AbstractProject<?, ?> queued, Iterable<AbstractProject> jobs, String which) {
         for (Job<?, ?> job : (Iterable<Job<?, ?>>) (Iterable) jobs) {
+            if (job == queued) {
+                continue; // in a cycle: as here, its own builds do not block it (one at a time is the exclusive lease's job)
+            }
             // under the queue lock: from what is cached only (a slow store would hold up the whole queue)
             List<RunningBuilds.Placeholder> running = RunningBuilds.elsewhereCached(job);
             if (running == null) {
