@@ -149,6 +149,33 @@ public interface PersistenceStore {
     }
 
     /**
+     * Leases on running builds, so that exactly one controller works on each.
+     *
+     * @return the leases, or null if this store does not offer them (builds are then never adopted)
+     */
+    @CheckForNull
+    default BuildLeases leases() {
+        return null;
+    }
+
+    /**
+     * Writes an entry only while this origin holds a {@linkplain #leases lease} with this epoch: the lease is the fence,
+     * so that a controller which lost a build (another one took it over) cannot write its record over the new owner's.
+     * Stores should check and write atomically (in one transaction); this default checks, then writes.
+     *
+     * @return the new version, as {@link #write}
+     * @throws LeaseLostException if the lease is not (or no longer) held with this epoch
+     */
+    default long writeIfHeld(@NonNull String leaseKey, long epoch, @NonNull String key, @NonNull byte[] content, long expectedVersion)
+            throws IOException {
+        BuildLeases leases = leases();
+        if (leases != null && !leases.holds(leaseKey, epoch)) {
+            throw new LeaseLostException(leaseKey, epoch);
+        }
+        return write(key, content, expectedVersion);
+    }
+
+    /**
      * Identifies this store instance (and so this controller) as the origin of the changes it makes.
      */
     @NonNull

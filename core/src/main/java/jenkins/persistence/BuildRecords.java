@@ -219,6 +219,11 @@ public final class BuildRecords {
             LOGGER.warning(() -> "Not publishing " + run + ": no " + record);
             return;
         }
+        // held while it ran here (none when publishing a build for another controller): what makes the publication its
+        // owner's, checked as the snapshot goes into place and as the record is written
+        RunningBuilds.Placeholder lease = PersistenceStores.get().leases() == null ? null : RunningBuilds.ownedPlaceholder(run);
+        // uploaded under a name of its own first, which a controller that lost the build cannot put over the owner's
+        String upload = lease == null ? SNAPSHOT : SNAPSHOT + "." + lease.getEpoch();
         BlobStore blobs = PersistenceStores.getBlobStore();
         if (blobs != null) {
             List<String> excludes = new ArrayList<>(DEFAULT_EXCLUDES);
@@ -233,24 +238,41 @@ public final class BuildRecords {
                     throw (IOException) new InterruptedIOException().initCause(e);
                 }
                 try (InputStream in = Files.newInputStream(snapshot)) {
-                    blobs.put(base + "/" + SNAPSHOT, in, Files.size(snapshot));
+                    blobs.put(base + "/" + upload, in, Files.size(snapshot));
                 }
             } finally {
                 Files.deleteIfExists(snapshot);
             }
+            if (lease != null) {
+                // the upload may take long; the lease is checked now, so only a moment remains for it to be lost in
+                if (!PersistenceStores.get().leases().holds(lease.getKey(), lease.getEpoch())) {
+                    blobs.delete(base + "/" + upload);
+                    throw new LeaseLostException(lease.getKey(), lease.getEpoch());
+                }
+                blobs.move(base + "/" + upload, base + "/" + SNAPSHOT);
+            }
         }
         byte[] published = Files.readAllBytes(record);
-        seen(base + "/" + RECORD, PersistenceStores.get().write(base + "/" + RECORD, published, PersistenceStore.ANY));
+        publishRecord(lease, base + "/" + RECORD, published);
         // a save made while publishing found no record yet, so republish left it to this: include it
         for (int i = 0; i < 10; i++) {
             byte[] now = Files.readAllBytes(record);
             if (Arrays.equals(now, published)) {
                 break;
             }
-            seen(base + "/" + RECORD, PersistenceStores.get().write(base + "/" + RECORD, now, PersistenceStore.ANY));
+            publishRecord(lease, base + "/" + RECORD, now);
             published = now;
         }
         LOGGER.fine(() -> "Published " + run);
+    }
+
+    /** Writes a build record, while holding the build's lease if it has one (the store checks it with the write). */
+    private static void publishRecord(@CheckForNull RunningBuilds.Placeholder lease, String key, byte[] content) throws IOException {
+        if (lease == null) {
+            seen(key, PersistenceStores.get().write(key, content, PersistenceStore.ANY));
+        } else {
+            seen(key, PersistenceStores.get().writeIfHeld(lease.getKey(), lease.getEpoch(), key, content, PersistenceStore.ANY));
+        }
     }
 
     /**
@@ -542,6 +564,12 @@ public final class BuildRecords {
         PeepholePermalink.changedElsewhere(job, number, false);
     }
 
+    /** Whether a record of the build is stored. */
+    static boolean isStored(@NonNull Job<?, ?> job, int number) throws IOException {
+        String builds = buildsKey(job);
+        return builds != null && PersistenceStores.get().read(builds + "/" + number + "/" + RECORD) != null;
+    }
+
     /**
      * A build's record was moved elsewhere along with its job, whose move this controller has applied: a copy
      * materialized here is refreshed, as for a change, since an edit made elsewhere before the move found no record
@@ -573,6 +601,15 @@ public final class BuildRecords {
             return;
         }
         LOGGER.fine(() -> "Forgetting " + job.getFullName() + " #" + number + " deleted elsewhere");
+        forgetLocalCopy(job, number);
+    }
+
+    /** Drops this controller's copy of a build: the loaded object, and its directory. */
+    static void forgetLocalCopy(@NonNull Job<?, ?> job, int number) throws IOException {
+        RunMap<?> runs = runsOf(job);
+        if (runs == null) {
+            return;
+        }
         runs.forget(number);
         Util.deleteRecursive(new File(job.getBuildDir(), String.valueOf(number)));
         PeepholePermalink.changedElsewhere(job, number, true);
@@ -655,8 +692,21 @@ public final class BuildRecords {
             if (PersistenceStores.isApplyingRemoteChange()) {
                 return;
             }
+            if (RunningBuilds.wasLost(run) || !RunningBuilds.owns(run)) {
+                // another controller has taken it over and will publish it
+                LOGGER.warning(() -> "Not publishing " + run + ": it is owned by another controller");
+                RunningBuilds.lost(run); // fenced until discarded: a save of this copy meanwhile is not republished
+                RunningBuilds.discard(run);
+                return;
+            }
             try {
                 publish(run);
+            } catch (LeaseLostException e) {
+                // taken over while it was being published: the new owner publishes it; nothing of it is left from here
+                LOGGER.warning(() -> "Not publishing " + run + ": " + e.getMessage());
+                RunningBuilds.lost(run);
+                RunningBuilds.discard(run);
+                return;
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.WARNING, "Failed to publish " + run, e);
             }
@@ -761,7 +811,14 @@ public final class BuildRecords {
 
         @Override
         public void onChange(Saveable o, XmlFile file) {
-            if (!(o instanceof Run<?, ?> run) || run.isLogUpdated() || LOADING.get() != null || PersistenceStores.isApplyingRemoteChange()) {
+            if (o instanceof Run<?, ?> stale && RunningBuilds.wasDiscarded(stale) && !PersistenceStores.isApplyingRemoteChange()) {
+                // a copy of a build lost to another controller, discarded here but still referenced, saved its build.xml
+                // again: never published, and dropped again, as it would stand for the new owner's record here
+                RunningBuilds.discardAgain(stale);
+                return;
+            }
+            if (!(o instanceof Run<?, ?> run) || run.isLogUpdated() || LOADING.get() != null || PersistenceStores.isApplyingRemoteChange()
+                    || RunningBuilds.wasLost(run)) {
                 return;
             }
             try {

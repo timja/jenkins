@@ -67,6 +67,8 @@ public class InMemoryPersistenceStore implements PersistenceStore {
     private final Object delivering;
     /** The thread delivering changes, guarded by {@link #delivering}. */
     private Thread draining;
+    private final Map<String, long[]> leaseEpochs;
+    private final Map<String, String> leaseOwners;
     /** Versions come from one counter, so a key that is deleted and recreated never repeats a version. */
     private long clock;
 
@@ -81,6 +83,8 @@ public class InMemoryPersistenceStore implements PersistenceStore {
         this.listeners = new CopyOnWriteArrayList<>();
         this.outbox = new ArrayDeque<>();
         this.delivering = new Object();
+        this.leaseEpochs = new TreeMap<>();
+        this.leaseOwners = new TreeMap<>();
     }
 
     private InMemoryPersistenceStore(InMemoryPersistenceStore root, String origin) {
@@ -91,6 +95,8 @@ public class InMemoryPersistenceStore implements PersistenceStore {
         this.listeners = root.listeners;
         this.outbox = root.outbox;
         this.delivering = root.delivering;
+        this.leaseEpochs = root.leaseEpochs;
+        this.leaseOwners = root.leaseOwners;
     }
 
     /**
@@ -147,6 +153,67 @@ public class InMemoryPersistenceStore implements PersistenceStore {
         }
     }
 
+    /**
+     * Views made by {@link #as} share the liveness of the store they were made from, so tests can override it once.
+     */
+    @Override
+    public java.util.Set<String> liveOrigins() throws java.io.IOException {
+        return root == this ? null : root.liveOrigins();
+    }
+
+    /**
+     * Leases lapse when their owner is missing from {@link #liveOrigins} (when that is null, they never lapse).
+     */
+    @Override
+    @NonNull
+    public BuildLeases leases() {
+        return new BuildLeases() {
+            private boolean alive(String o) throws java.io.IOException {
+                java.util.Set<String> live = liveOrigins();
+                return live == null || live.contains(o);
+            }
+
+            @Override
+            public long acquire(@NonNull String key) throws java.io.IOException {
+                synchronized (root) {
+                    String owner = leaseOwners.get(key);
+                    if (owner != null && owner.equals(origin)) {
+                        return leaseEpochs.get(key)[0];
+                    }
+                    if (owner != null && alive(owner)) {
+                        return 0;
+                    }
+                    long epoch = ++root.clock;
+                    leaseOwners.put(key, origin);
+                    leaseEpochs.put(key, new long[] {epoch});
+                    return epoch;
+                }
+            }
+
+            @Override
+            public boolean holds(@NonNull String key, long epoch) throws java.io.IOException {
+                synchronized (root) {
+                    // a lease lapses with its holder's liveness, as BuildLeases says
+                    return held(key, epoch) && alive(origin);
+                }
+            }
+
+            private boolean held(String key, long epoch) {
+                return origin.equals(leaseOwners.get(key)) && leaseEpochs.get(key)[0] == epoch;
+            }
+
+            @Override
+            public void release(@NonNull String key, long epoch) {
+                synchronized (root) {
+                    if (held(key, epoch)) {
+                        leaseOwners.remove(key);
+                        leaseEpochs.remove(key);
+                    }
+                }
+            }
+        };
+    }
+
     @Override
     public boolean owns(@NonNull String key) {
         return owns.test(key);
@@ -165,19 +232,40 @@ public class InMemoryPersistenceStore implements PersistenceStore {
     public long write(@NonNull String key, @NonNull byte[] content, long expectedVersion) throws ConflictException {
         long version;
         synchronized (root) {
-            Entry current = entries.get(key);
-            long actual = current == null ? ABSENT : current.version();
-            if (expectedVersion != ANY && expectedVersion != actual) {
-                throw new ConflictException(key, expectedVersion, actual);
-            }
-            if (current != null && Arrays.equals(current.content(), content)) {
-                return actual;
-            }
-            version = ++root.clock;
-            entries.put(key, new Entry(content.clone(), version));
-            outbox.add(new ChangeEvent(ChangeEvent.Kind.WRITTEN, key, null, version, origin));
+            version = commitWrite(key, content, expectedVersion);
         }
         deliver();
+        return version;
+    }
+
+    /** The lease check and the write in one step, as a store doing both in one transaction would. */
+    @Override
+    public long writeIfHeld(@NonNull String leaseKey, long epoch, @NonNull String key, @NonNull byte[] content, long expectedVersion)
+            throws java.io.IOException {
+        long version;
+        synchronized (root) {
+            if (!leases().holds(leaseKey, epoch)) {
+                throw new LeaseLostException(leaseKey, epoch);
+            }
+            version = commitWrite(key, content, expectedVersion);
+        }
+        deliver();
+        return version;
+    }
+
+    /** Under the data lock: writes, and queues the change for delivery. */
+    private long commitWrite(String key, byte[] content, long expectedVersion) throws ConflictException {
+        Entry current = entries.get(key);
+        long actual = current == null ? ABSENT : current.version();
+        if (expectedVersion != ANY && expectedVersion != actual) {
+            throw new ConflictException(key, expectedVersion, actual);
+        }
+        if (current != null && Arrays.equals(current.content(), content)) {
+            return actual;
+        }
+        long version = ++root.clock;
+        entries.put(key, new Entry(content.clone(), version));
+        outbox.add(new ChangeEvent(ChangeEvent.Kind.WRITTEN, key, null, version, origin));
         return version;
     }
 
