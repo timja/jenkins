@@ -117,6 +117,7 @@ import jenkins.model.queue.AsynchronousExecution;
 import jenkins.model.queue.CompositeCauseOfBlockage;
 import jenkins.model.queue.QueueIdStrategy;
 import jenkins.model.queue.QueueItem;
+import jenkins.model.queue.QueueStartGate;
 import jenkins.security.QueueItemAuthenticator;
 import jenkins.security.QueueItemAuthenticatorProvider;
 import jenkins.security.stapler.StaplerAccessibleType;
@@ -669,6 +670,10 @@ public class Queue extends ResourceController implements Saveable {
             }
 
             if (queueUpdated) scheduleMaintenance();
+
+            for (Item item : duplicatesInQueue) {
+                Listeners.notify(QueueListener.class, true, l -> l.onFolded(item, actions));
+            }
 
             // REVISIT: when there are multiple existing items in the queue that matches the incoming one,
             // whether the new one should affect all existing ones or not is debatable. I for myself
@@ -1447,6 +1452,22 @@ public class Queue extends ResourceController implements Saveable {
     }
 
     /**
+     * Whether the current thread holds the queue lock, for instance in {@link #withLock(Runnable)}, a
+     * {@link hudson.model.queue.QueueTaskDispatcher}, a {@link jenkins.model.queue.QueueStartGate} or a
+     * {@link hudson.model.queue.QueueListener} called during maintenance.
+     * <p>
+     * For extensions that may be called both under the lock and outside it and must not wait there, for example for a
+     * remote service: under the lock they answer from what they already have, or defer the work, since the whole
+     * queue, and every caller of {@link #withLock(Runnable)}, waits for them.
+     *
+     * @since TODO
+     */
+    @Restricted(Beta.class)
+    public boolean isLockHeldByCurrentThread() {
+        return lock.isHeldByCurrentThread();
+    }
+
+    /**
      * Some operations require to be performed with the {@link Queue} lock held. Use one of these methods rather
      * than locking directly on Queue in order to allow for future refactoring.
      *
@@ -1761,6 +1782,13 @@ public class Queue extends ResourceController implements Saveable {
                 if (p.task instanceof FlyweightTask) {
                     Runnable r = makeFlyWeightTaskBuildable(new BuildableItem(p));
                     if (r != null) {
+                        // e.g. it entered the buildables to have a node provisioned, so the gate has not seen it yet
+                        CauseOfBlockage gated = QueueStartGate.check(p);
+                        if (gated != null) {
+                            LOGGER.log(Level.FINER, "{0} may not start here: {1}", new Object[] {p, gated});
+                            p.transientCausesOfBlockage = List.of(gated);
+                            continue;
+                        }
                         p.leave(this);
                         LOGGER.log(Level.FINEST, "Executing flyweight task {0}", taskDisplayName);
                         r.run();
@@ -1799,6 +1827,13 @@ public class Queue extends ResourceController implements Saveable {
                                 new Object[]{p, candidates, parked.values()});
                         List<CauseOfBlockage> reasons = reasonMap.values().stream().filter(Objects::nonNull).collect(Collectors.toList());
                         p.transientCausesOfBlockage = reasons.isEmpty() ? null : reasons;
+                        continue;
+                    }
+
+                    CauseOfBlockage gated = QueueStartGate.check(p);
+                    if (gated != null) {
+                        LOGGER.log(Level.FINER, "{0} may not start here: {1}", new Object[] {p, gated});
+                        p.transientCausesOfBlockage = List.of(gated);
                         continue;
                     }
 
@@ -1846,6 +1881,12 @@ public class Queue extends ResourceController implements Saveable {
                 Runnable runnable = makeFlyWeightTaskBuildable(p);
                 LOGGER.log(Level.FINEST, "Converting flyweight task: {0} into a BuildableRunnable", taskDisplayName);
                 if (runnable != null) {
+                    CauseOfBlockage gated = QueueStartGate.check(p);
+                    if (gated != null) {
+                        // it waits as a buildable item, where the gate is asked again before it runs
+                        LOGGER.log(Level.FINER, "{0} may not start here yet: {1}", new Object[] {p, gated});
+                        return new BuildableRunnable(p);
+                    }
                     return runnable;
                 }
 
@@ -3201,9 +3242,18 @@ public class Queue extends ResourceController implements Saveable {
     }
 
     /**
+     * The milestone attained once {@link #init} restored the queue: whatever adds items at startup should require it,
+     * as loading clears the queue first.
+     *
+     * @since TODO
+     */
+    @Restricted(Beta.class)
+    public static final String LOADED = "hudson.model.Queue.loaded";
+
+    /**
      * Restores the queue content during the start up.
      */
-    @Initializer(after = JOB_CONFIG_ADAPTED)
+    @Initializer(after = JOB_CONFIG_ADAPTED, attains = LOADED)
     public static void init(Jenkins h) {
         Queue queue = h.getQueue();
         Item[] items = queue.getItems();
