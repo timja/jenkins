@@ -209,6 +209,23 @@ class RunningBuildsTest {
     }
 
     @Test
+    void controllerFoundGoneForOneJobIsAskedAboutAgainForTheNext() throws Exception {
+        FreeStyleProject a = r.createFreeStyleProject("a-first");
+        FreeStyleProject b = r.createFreeStyleProject("b-later");
+        other.write("jobs/a-first/running/1.xml", placeholder("other-controller", "jenkins-a", 1), PersistenceStore.ABSENT);
+        other.write("jobs/b-later/running/1.xml", placeholder("other-controller", "jenkins-a", 1), PersistenceStore.ABSENT);
+        awaitApplied();
+
+        // the other controller comes back (after a pause, say) once the sweep has looked at the first job
+        liveAnswers = List.of(Set.of(STORE.getOrigin()), Set.of(STORE.getOrigin()), Set.of(STORE.getOrigin(), "other-controller")).iterator();
+        assertEquals(1, RunningBuilds.removeStale());
+        assertNull(STORE.read("jobs/a-first/running/1.xml"));
+        assertNotNull(STORE.read("jobs/b-later/running/1.xml"), "the placeholder of the controller back is kept");
+        assertEquals(List.of(1), elsewhere(b));
+        assertEquals(List.of(), elsewhere(a));
+    }
+
+    @Test
     void placeholdersFollowAnItemRenamedHere() throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("old");
         other.write("jobs/old/running/1.xml", placeholder("other-controller", "jenkins-a", 1), PersistenceStore.ABSENT);
