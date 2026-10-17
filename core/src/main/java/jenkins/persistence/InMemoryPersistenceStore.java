@@ -26,28 +26,47 @@ package jenkins.persistence;
 
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Queue;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.Consumer;
 import java.util.function.Predicate;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
 
 /**
  * A {@link PersistenceStore} held in memory, for tests and as a reference for implementations.
- * Several Jenkins instances in one JVM may share an instance.
+ * {@link #as} gives views with other origins, standing in for other controllers sharing the store.
+ * Events are delivered synchronously, after the change, on the thread making it.
  *
  * @since TODO
  */
 @Restricted(Beta.class)
 public class InMemoryPersistenceStore implements PersistenceStore {
 
+    private static final Logger LOGGER = Logger.getLogger(InMemoryPersistenceStore.class.getName());
+
     private final Predicate<String> owns;
-    private final Map<String, Entry> entries = new TreeMap<>();
+    private final InMemoryPersistenceStore root;
+    private final String origin;
+    private final Map<String, Entry> entries;
+    private final List<Consumer<ChangeEvent>> listeners;
+    /** Changes made but not yet delivered, in the order they were made: added to under the data lock. */
+    private final Queue<ChangeEvent> outbox;
+    /** Held while delivering, so that changes are delivered one at a time, in order, but not under the data lock. */
+    private final Object delivering;
+    /** The thread delivering changes, guarded by {@link #delivering}. */
+    private Thread draining;
     /** Versions come from one counter, so a key that is deleted and recreated never repeats a version. */
     private long clock;
 
@@ -56,6 +75,76 @@ public class InMemoryPersistenceStore implements PersistenceStore {
      */
     public InMemoryPersistenceStore(@NonNull Predicate<String> owns) {
         this.owns = owns;
+        this.root = this;
+        this.origin = UUID.randomUUID().toString();
+        this.entries = new TreeMap<>();
+        this.listeners = new CopyOnWriteArrayList<>();
+        this.outbox = new ArrayDeque<>();
+        this.delivering = new Object();
+    }
+
+    private InMemoryPersistenceStore(InMemoryPersistenceStore root, String origin) {
+        this.owns = root.owns;
+        this.root = root;
+        this.origin = origin;
+        this.entries = root.entries;
+        this.listeners = root.listeners;
+        this.outbox = root.outbox;
+        this.delivering = root.delivering;
+    }
+
+    /**
+     * A view of the same entries whose changes carry a different origin, as if made by another controller.
+     */
+    public InMemoryPersistenceStore as(@NonNull String origin) {
+        return new InMemoryPersistenceStore(root, origin);
+    }
+
+    @Override
+    @NonNull
+    public String getOrigin() {
+        return origin;
+    }
+
+    @Override
+    @NonNull
+    public AutoCloseable subscribe(@NonNull Consumer<ChangeEvent> listener) {
+        listeners.add(listener);
+        return () -> listeners.remove(listener);
+    }
+
+    /**
+     * Delivers the changes made so far in the order they were made, as {@link #subscribe} promises: two threads
+     * committing one after the other must not have their changes delivered the other way round.
+     */
+    private void deliver() {
+        synchronized (delivering) {
+            if (root.draining == Thread.currentThread()) {
+                return; // a listener made a change: the loop below delivers it once every listener had the current one
+            }
+            root.draining = Thread.currentThread();
+            try {
+                while (true) {
+                    ChangeEvent e;
+                    synchronized (root) {
+                        e = outbox.poll();
+                    }
+                    if (e == null) {
+                        return;
+                    }
+                    for (Consumer<ChangeEvent> l : listeners) {
+                        try {
+                            l.accept(e);
+                        } catch (RuntimeException | LinkageError x) {
+                            // the change is made: the other listeners still get it, and the caller is not told it failed
+                            LOGGER.log(Level.WARNING, "A listener failed to handle " + e, x);
+                        }
+                    }
+                }
+            } finally {
+                root.draining = null;
+            }
+        }
     }
 
     @Override
@@ -65,83 +154,108 @@ public class InMemoryPersistenceStore implements PersistenceStore {
 
     @Override
     @CheckForNull
-    public synchronized Entry read(@NonNull String key) {
-        Entry e = entries.get(key);
-        return e == null ? null : new Entry(e.content().clone(), e.version());
+    public Entry read(@NonNull String key) {
+        synchronized (root) {
+            Entry e = entries.get(key);
+            return e == null ? null : new Entry(e.content().clone(), e.version());
+        }
     }
 
     @Override
-    public synchronized long write(@NonNull String key, @NonNull byte[] content, long expectedVersion) throws ConflictException {
-        Entry current = entries.get(key);
-        long actual = current == null ? ABSENT : current.version();
-        if (expectedVersion != ANY && expectedVersion != actual) {
-            throw new ConflictException(key, expectedVersion, actual);
+    public long write(@NonNull String key, @NonNull byte[] content, long expectedVersion) throws ConflictException {
+        long version;
+        synchronized (root) {
+            Entry current = entries.get(key);
+            long actual = current == null ? ABSENT : current.version();
+            if (expectedVersion != ANY && expectedVersion != actual) {
+                throw new ConflictException(key, expectedVersion, actual);
+            }
+            if (current != null && Arrays.equals(current.content(), content)) {
+                return actual;
+            }
+            version = ++root.clock;
+            entries.put(key, new Entry(content.clone(), version));
+            outbox.add(new ChangeEvent(ChangeEvent.Kind.WRITTEN, key, null, version, origin));
         }
-        if (current != null && Arrays.equals(current.content(), content)) {
-            return actual;
-        }
-        long version = ++clock;
-        entries.put(key, new Entry(content.clone(), version));
+        deliver();
         return version;
     }
 
     @Override
-    public synchronized void delete(@NonNull String key, long expectedVersion) throws ConflictException {
-        Entry current = entries.get(key);
-        if (current == null) {
-            return;
+    public void delete(@NonNull String key, long expectedVersion) throws ConflictException {
+        long version;
+        synchronized (root) {
+            Entry current = entries.get(key);
+            if (current == null) {
+                return;
+            }
+            if (expectedVersion != ANY && expectedVersion != current.version()) {
+                throw new ConflictException(key, expectedVersion, current.version());
+            }
+            entries.remove(key);
+            version = ++root.clock;
+            outbox.add(new ChangeEvent(ChangeEvent.Kind.DELETED, key, null, version, origin));
         }
-        if (expectedVersion != ANY && expectedVersion != current.version()) {
-            throw new ConflictException(key, expectedVersion, current.version());
-        }
-        entries.remove(key);
+        deliver();
     }
 
     @Override
     @NonNull
-    public synchronized Set<String> children(@NonNull String parentKey) {
+    public Set<String> children(@NonNull String parentKey) {
         String prefix = parentKey + "/";
         Set<String> names = new TreeSet<>();
-        for (String key : entries.keySet()) {
-            if (key.startsWith(prefix)) {
-                String rest = key.substring(prefix.length());
-                int slash = rest.indexOf('/');
-                names.add(slash == -1 ? rest : rest.substring(0, slash));
+        synchronized (root) {
+            for (String key : entries.keySet()) {
+                if (key.startsWith(prefix)) {
+                    String rest = key.substring(prefix.length());
+                    int slash = rest.indexOf('/');
+                    names.add(slash == -1 ? rest : rest.substring(0, slash));
+                }
             }
         }
         return names;
     }
 
     @Override
-    public synchronized List<Moved> move(@NonNull String fromPrefix, @NonNull String toPrefix) throws ConflictException {
-        for (String key : entries.keySet()) {
-            if (key.equals(toPrefix) || key.startsWith(toPrefix + "/")) {
-                throw new ConflictException(key, ABSENT, entries.get(key).version());
-            }
-        }
+    public List<Moved> move(@NonNull String fromPrefix, @NonNull String toPrefix) throws ConflictException {
+        List<ChangeEvent> events = new ArrayList<>();
         List<Moved> moved = new ArrayList<>();
-        Map<String, Entry> now = new TreeMap<>();
-        for (var it = entries.entrySet().iterator(); it.hasNext(); ) {
-            var e = it.next();
-            String key = e.getKey();
-            if (key.equals(fromPrefix) || key.startsWith(fromPrefix + "/")) {
-                String to = toPrefix + key.substring(fromPrefix.length());
-                long version = ++clock;
-                now.put(to, new Entry(e.getValue().content(), version));
-                moved.add(new Moved(key, e.getValue().version(), to, version));
-                it.remove();
+        synchronized (root) {
+            for (String key : entries.keySet()) {
+                if (key.equals(toPrefix) || key.startsWith(toPrefix + "/")) {
+                    throw new ConflictException(key, ABSENT, entries.get(key).version());
+                }
             }
+            List<String> keys = new ArrayList<>();
+            for (String key : entries.keySet()) {
+                if (key.equals(fromPrefix) || key.startsWith(fromPrefix + "/")) {
+                    keys.add(key);
+                }
+            }
+            // shallower keys first, so a folder moves before its children
+            keys.sort((a, b) -> a.length() != b.length() ? Integer.compare(a.length(), b.length()) : a.compareTo(b));
+            for (String key : keys) {
+                String newKey = toPrefix + key.substring(fromPrefix.length());
+                long version = ++root.clock;
+                Entry old = entries.remove(key);
+                entries.put(newKey, new Entry(old.content(), version));
+                moved.add(new Moved(key, old.version(), newKey, version));
+                events.add(new ChangeEvent(ChangeEvent.Kind.MOVED, newKey, key, version, origin));
+            }
+            outbox.addAll(events);
         }
-        entries.putAll(now);
+        deliver();
         return moved;
     }
 
     /**
      * Snapshot of the stored keys, for assertions.
      */
-    public synchronized Map<String, Long> versions() {
+    public Map<String, Long> versions() {
         Map<String, Long> r = new TreeMap<>();
-        entries.forEach((k, v) -> r.put(k, v.version()));
+        synchronized (root) {
+            entries.forEach((k, v) -> r.put(k, v.version()));
+        }
         return r;
     }
 }

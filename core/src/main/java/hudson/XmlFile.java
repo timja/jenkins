@@ -67,6 +67,7 @@ import jenkins.persistence.PersistenceStores;
 import org.apache.commons.io.IOUtils;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.xml.sax.Attributes;
 import org.xml.sax.InputSource;
 import org.xml.sax.Locator;
@@ -166,6 +167,15 @@ public final class XmlFile {
         if (route != null) {
             materialize(route);
         }
+        return file;
+    }
+
+    /**
+     * The local path of this file, without copying the stored content to it (as {@link #getFile} does).
+     * For code that only needs to know which file, or which store key, this is.
+     */
+    @Restricted(NoExternalUse.class)
+    public File getPath() {
         return file;
     }
 

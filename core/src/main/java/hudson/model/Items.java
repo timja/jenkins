@@ -57,6 +57,8 @@ import jenkins.util.MemoryReductionUtil;
 import jenkins.util.ThrowingCallable;
 import jenkins.util.ThrowingRunnable;
 import org.apache.commons.io.FileUtils;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.springframework.security.core.Authentication;
 
 /**
@@ -638,6 +640,15 @@ public class Items {
         }
         ItemListener.fireLocationChange(newItem, oldFullName);
         return newItem;
+    }
+
+    /**
+     * Renames an item to match a rename another controller already made in the persistence store.
+     * Exists to reach {@link AbstractItem#renameTo}, which is protected.
+     */
+    @Restricted(NoExternalUse.class)
+    public static void renameToMatchStore(AbstractItem item, String newName) throws IOException {
+        item.renameTo(newName);
     }
 
     private static class AllItemsIterable<T extends Item> implements Iterable<T> {
