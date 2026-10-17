@@ -29,6 +29,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
@@ -62,6 +63,8 @@ class SharedConfidentialKeysTest {
     static volatile boolean storesKeys = true;
     /** While set, reading a key from the store fails, as when it is unreachable. */
     static volatile boolean unreachable;
+    /** A key whose next write is committed, then fails as if its answer was lost. */
+    static volatile String commitThenFail;
 
     @SuppressWarnings("unchecked")
     private static <E extends Throwable> RuntimeException sneaky(Throwable t) throws E {
@@ -89,6 +92,16 @@ class SharedConfidentialKeysTest {
                 }
             }
             return e;
+        }
+
+        @Override
+        public long write(String key, byte[] content, long expectedVersion) throws ConflictException {
+            long version = super.write(key, content, expectedVersion);
+            if (key.equals(commitThenFail)) {
+                commitThenFail = null;
+                throw SharedConfidentialKeysTest.<RuntimeException>sneaky(new java.io.IOException("the connection broke before the answer came"));
+            }
+            return version;
         }
     };
 
@@ -208,6 +221,51 @@ class SharedConfidentialKeysTest {
         assertEquals(mac, new HMACConfidentialKey("test.shared.k11").mac("x"), "kept locally, so the same after a restart");
         Files.delete(localFile(r, "test.shared.k11").toPath()); // as another controller, or a fresh home
         assertEquals(mac, new HMACConfidentialKey("test.shared.k11").mac("x"), "the same from the store");
+    }
+
+    @Test
+    void aTemporaryKeyWhoseOfferWentThroughUnansweredIsKeptLocally(JenkinsRule r) throws Exception {
+        String mac;
+        unreachable = true;
+        try {
+            mac = new HMACConfidentialKey("test.shared.k15").mac("x");
+        } finally {
+            unreachable = false;
+        }
+        DefaultConfidentialStore store = (DefaultConfidentialStore) ConfidentialStore.get();
+        commitThenFail = "secrets/test.shared.k15";
+        assertThrows(java.io.IOException.class, () -> store.publishTemporary(new HMACConfidentialKey("test.shared.k15")));
+        assertNotNull(STORE.read("secrets/test.shared.k15"), "stored, its answer lost");
+        store.publishTemporary(new HMACConfidentialKey("test.shared.k15")); // as the retry does: a conflict, with its own value
+        assertTrue(localFile(r, "test.shared.k15").isFile(), "kept locally");
+        unreachable = true; // another outage
+        try {
+            assertEquals(mac, new HMACConfidentialKey("test.shared.k15").mac("x"), "the same key, not another temporary one");
+        } finally {
+            unreachable = false;
+        }
+    }
+
+    @Test
+    void aTemporaryKeyCreatedElsewhereMeanwhileIsKeptUntilARestart(JenkinsRule r) throws Exception {
+        HMACConfidentialKey first;
+        String mac;
+        unreachable = true;
+        try {
+            first = new HMACConfidentialKey("test.shared.k16");
+            mac = first.mac("x");
+        } finally {
+            unreachable = false;
+        }
+        new HMACConfidentialKey("test.shared.k17").mac("x"); // a key of the same kind, as another controller made k16
+        STORE.as("other-controller").write("secrets/test.shared.k16", STORE.read("secrets/test.shared.k17").content(), PersistenceStore.ABSENT);
+        ((DefaultConfidentialStore) ConfidentialStore.get()).publishTemporary(new HMACConfidentialKey("test.shared.k16"));
+        assertFalse(localFile(r, "test.shared.k16").exists(), "the cluster's value is not taken before a restart");
+        HMACConfidentialKey later = new HMACConfidentialKey("test.shared.k16");
+        assertEquals(mac, later.mac("x"), "a key instance made now agrees with the earlier ones");
+        assertTrue(later.checkMac("x", mac));
+        DefaultConfidentialStore.reconcile(); // as at the next startup
+        assertTrue(localFile(r, "test.shared.k16").isFile(), "the cluster's value from then on");
     }
 
     @Test

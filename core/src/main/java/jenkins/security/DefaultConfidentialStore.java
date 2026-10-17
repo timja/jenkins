@@ -244,8 +244,9 @@ public class DefaultConfidentialStore extends ConfidentialStore {
 
     /**
      * Writes a temporary key to the store (create-only) and locally, so that it is the cluster's key from then on, also
-     * after a restart. If another controller created the key meanwhile, its value wins for later uses (after a restart):
-     * whatever this controller made with the temporary key cannot be read with it.
+     * after a restart. If another controller created the key meanwhile, this controller keeps using the temporary key
+     * until it restarts (so that every use of the key here agrees), and the cluster's from then on: whatever this
+     * controller made with the temporary key cannot be read with it then, nor elsewhere.
      */
     void publishTemporary(ConfidentialKey key) throws IOException {
         byte[] value = temporary.get(key.getId());
@@ -261,13 +262,17 @@ public class DefaultConfidentialStore extends ConfidentialStore {
             LOGGER.info(() -> "Created " + key.getId() + " for all controllers from the temporary one used while the persistence store was unreachable");
         } catch (ConflictException e) {
             PersistenceStore.Entry shared = store.read(storeKey);
-            if (shared == null || !Arrays.equals(decrypt(key, shared.content()), value)) {
-                LOGGER.severe(() -> "Another controller created " + key.getId() + " while this one used a temporary one (the persistence store was unreachable): "
-                        + "what this controller made with it then cannot be read elsewhere, nor here after a restart");
-                if (shared != null) {
-                    writeEncrypted(key, shared.content());
-                }
+            if (shared == null) {
+                throw new IOException(key.getId() + " was created and removed meanwhile; offering it again", e);
             }
+            if (!Arrays.equals(decrypt(key, shared.content()), value)) {
+                LOGGER.severe(() -> "Another controller created " + key.getId() + " while this one used a temporary one (the persistence store was unreachable): "
+                        + "this controller keeps using it until it restarts, but what it made with it cannot be read elsewhere, nor here after a restart");
+                // not written locally: key instances made here from now on would use the cluster's value, and those made
+                // before the temporary one, so that they could not read each other's output; the restart copies it down
+                return;
+            }
+            writeEncrypted(key, shared.content()); // the write went through, its answer was lost: kept locally all the same
         }
         temporary.remove(key.getId());
     }
