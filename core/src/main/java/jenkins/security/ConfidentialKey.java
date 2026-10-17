@@ -46,6 +46,13 @@ public abstract class ConfidentialKey {
         return ConfidentialStore.get().load(this);
     }
 
+    /**
+     * Loads the value, or creates and stores it if there is none yet, as one step (see {@link ConfidentialStore#loadOrCreate}).
+     */
+    byte[] loadOrCreate(ConfidentialStore.Generator generator) throws IOException {
+        return ConfidentialStore.get().loadOrCreate(this, generator);
+    }
+
     protected void store(byte[] payload) throws IOException {
         ConfidentialStore.get().store(this, payload);
     }

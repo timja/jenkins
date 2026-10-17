@@ -1,26 +1,38 @@
 package jenkins.security;
 
+import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.FilePath;
 import hudson.Util;
+import hudson.init.InitMilestone;
+import hudson.init.Initializer;
 import hudson.util.Secret;
 import hudson.util.TextFile;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
+import java.nio.file.LinkOption;
 import java.security.GeneralSecurityException;
 import java.security.SecureRandom;
+import java.util.logging.Logger;
 import javax.crypto.BadPaddingException;
 import javax.crypto.Cipher;
 import javax.crypto.CipherInputStream;
 import javax.crypto.CipherOutputStream;
+import javax.crypto.IllegalBlockSizeException;
 import javax.crypto.SecretKey;
 import jenkins.model.Jenkins;
+import jenkins.persistence.ConflictException;
+import jenkins.persistence.PersistenceStore;
+import jenkins.persistence.PersistenceStores;
 import jenkins.util.SystemProperties;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
 
 /**
  * Default portable implementation of {@link ConfidentialStore} that uses
@@ -35,6 +47,8 @@ import jenkins.util.SystemProperties;
  */
 // @MetaInfServices --- not annotated because this is the fallback implementation
 public class DefaultConfidentialStore extends ConfidentialStore {
+
+    private static final Logger LOGGER = Logger.getLogger(DefaultConfidentialStore.class.getName());
     static final String MASTER_KEY_FILE_SYSTEM_PROPERTY = DefaultConfidentialStore.class.getName() + ".file";
     static final String MASTER_KEY_READONLY_SYSTEM_PROPERTY_NAME = DefaultConfidentialStore.class.getName() + ".readOnly";
 
@@ -98,18 +112,128 @@ public class DefaultConfidentialStore extends ConfidentialStore {
      */
     @Override
     protected void store(ConfidentialKey key, byte[] payload) throws IOException {
+        writeEncrypted(key, encrypt(key, payload));
+    }
+
+    private byte[] encrypt(ConfidentialKey key, byte[] payload) throws IOException {
         try {
             Cipher sym = Secret.getCipher("AES");
             sym.init(Cipher.ENCRYPT_MODE, masterKey);
-            try (OutputStream fos = Files.newOutputStream(getFileFor(key).toPath());
-                 CipherOutputStream cos = new CipherOutputStream(fos, sym)) {
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (CipherOutputStream cos = new CipherOutputStream(bytes, sym)) {
                 cos.write(payload);
                 cos.write(MAGIC);
             }
+            return bytes.toByteArray();
         } catch (GeneralSecurityException e) {
             throw new IOException("Failed to persist the key: " + key.getId(), e);
+        }
+    }
+
+    @CheckForNull
+    private byte[] decrypt(ConfidentialKey key, byte[] encrypted) throws IOException {
+        try {
+            Cipher sym = Secret.getCipher("AES");
+            sym.init(Cipher.DECRYPT_MODE, masterKey);
+            try (CipherInputStream cis = new CipherInputStream(new ByteArrayInputStream(encrypted), sym)) {
+                return verifyMagic(cis.readAllBytes());
+            }
+        } catch (GeneralSecurityException e) {
+            throw new IOException("Failed to load the key: " + key.getId(), e);
+        } catch (IOException x) {
+            if (x.getCause() instanceof BadPaddingException || x.getCause() instanceof IllegalBlockSizeException) {
+                return null; // broken somehow, e.g. encrypted with another master key, or truncated
+            }
+            throw x;
+        }
+    }
+
+    private void writeEncrypted(ConfidentialKey key, byte[] encrypted) throws IOException {
+        try {
+            Files.write(getFileFor(key).toPath(), encrypted);
         } catch (InvalidPathException e) {
             throw new IOException(e);
+        }
+    }
+
+    /**
+     * Shares keys created at runtime with other controllers using the same {@link PersistenceStore}, when it
+     * {@linkplain PersistenceStore#storesConfidentialKeys stores confidential keys} (the master key must be
+     * the same on all of them, e.g. seeded): a key not found locally is looked up in the store as {@code secrets/<id>},
+     * and a new one is created there with a create-only write, so that the first controller to use a key decides its value
+     * for all of them. Keys used before the store is available stay local, as before.
+     */
+    @Override
+    byte[] loadOrCreate(ConfidentialKey key, Generator generator) throws IOException {
+        byte[] local = load(key);
+        if (local != null) {
+            return local;
+        }
+        PersistenceStore store = PersistenceStores.get();
+        if (store == null || !store.storesConfidentialKeys()) {
+            return super.loadOrCreate(key, generator);
+        }
+        String storeKey = SHARED_PREFIX + key.getId();
+        PersistenceStore.Entry shared = store.read(storeKey);
+        if (shared == null) {
+            byte[] value = generator.generate();
+            byte[] encrypted = encrypt(key, value);
+            try {
+                store.write(storeKey, encrypted, PersistenceStore.ABSENT);
+                writeEncrypted(key, encrypted);
+                LOGGER.fine(() -> "Created " + key.getId() + " for all controllers");
+                return value;
+            } catch (ConflictException e) {
+                shared = store.read(storeKey); // another controller created it first: use theirs
+            }
+        }
+        byte[] value = shared == null ? null : decrypt(key, shared.content());
+        if (value == null) {
+            LOGGER.warning(() -> "Cannot decrypt " + key.getId() + " from the persistence store; is the master key the same on every controller?");
+            return super.loadOrCreate(key, generator);
+        }
+        writeEncrypted(key, shared.content());
+        return value;
+    }
+
+    static final String SHARED_PREFIX = "secrets/";
+
+    /**
+     * Publishes keys created locally before the store was available (create-only), and warns about any which differ from the store's.
+     */
+    @Initializer(after = InitMilestone.EXTENSIONS_AUGMENTED, before = InitMilestone.SYSTEM_CONFIG_LOADED)
+    @Restricted(NoExternalUse.class)
+    public static void reconcile() throws IOException {
+        PersistenceStore store = PersistenceStores.get();
+        if (store == null || !store.storesConfidentialKeys() || !(ConfidentialStore.get() instanceof DefaultConfidentialStore cs)) {
+            return;
+        }
+        File[] files = cs.rootDir.listFiles((d, n) -> !n.equals("master.key") && !n.endsWith(".tmp"));
+        if (files == null) {
+            return;
+        }
+        for (File f : files) {
+            if (!Files.isRegularFile(f.toPath(), LinkOption.NOFOLLOW_LINKS)) {
+                continue; // directories (e.g. filepath-filters.d) and links are not keys
+            }
+            byte[] encrypted = Files.readAllBytes(f.toPath());
+            if (!cs.isKey(encrypted)) {
+                // secrets/ holds other files too (e.g. the setup wizard's initial password, in plain text): they stay here
+                LOGGER.fine(() -> f.getName() + " is not a confidential key; not sharing it");
+                continue;
+            }
+            String storeKey = SHARED_PREFIX + f.getName();
+            PersistenceStore.Entry shared = store.read(storeKey);
+            if (shared == null) {
+                try {
+                    store.write(storeKey, encrypted, PersistenceStore.ABSENT);
+                } catch (ConflictException e) {
+                    shared = store.read(storeKey);
+                }
+            }
+            if (shared != null && !java.util.Arrays.equals(shared.content(), encrypted)) {
+                LOGGER.warning(() -> "Key " + f.getName() + " differs from the one other controllers use; seed the same secrets/ on every controller");
+            }
         }
     }
 
@@ -142,6 +266,19 @@ public class DefaultConfidentialStore extends ConfidentialStore {
             } else {
                 throw x;
             }
+        }
+    }
+
+    /** Whether a file's content is a key this store wrote: encrypted with the master key, with the trailer. */
+    private boolean isKey(byte[] content) {
+        try {
+            Cipher sym = Secret.getCipher("AES");
+            sym.init(Cipher.DECRYPT_MODE, masterKey);
+            try (CipherInputStream cis = new CipherInputStream(new ByteArrayInputStream(content), sym)) {
+                return verifyMagic(cis.readAllBytes()) != null;
+            }
+        } catch (GeneralSecurityException | IOException e) {
+            return false;
         }
     }
 
