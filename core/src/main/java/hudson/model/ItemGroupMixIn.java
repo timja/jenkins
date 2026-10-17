@@ -34,12 +34,11 @@ import hudson.util.Function1;
 import io.jenkins.servlet.ServletExceptionWrapper;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletResponse;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
-import java.nio.file.Files;
-import java.nio.file.StandardCopyOption;
 import java.util.Map;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -47,6 +46,8 @@ import javax.xml.transform.TransformerException;
 import javax.xml.transform.stream.StreamResult;
 import javax.xml.transform.stream.StreamSource;
 import jenkins.model.Jenkins;
+import jenkins.persistence.ConflictException;
+import jenkins.persistence.PersistenceStores;
 import jenkins.security.ExtendedReadRedaction;
 import jenkins.util.xml.XMLUtils;
 import org.kohsuke.stapler.StaplerRequest;
@@ -258,8 +259,7 @@ public abstract class ItemGroupMixIn {
         T result = (T) createProject(src.getDescriptor(), name, false);
 
         // copy config
-        Files.copy(Util.fileToPath(srcConfigFile.getFile()), Util.fileToPath(Items.getConfigFile(result).getFile()),
-                StandardCopyOption.COPY_ATTRIBUTES, StandardCopyOption.REPLACE_EXISTING);
+        Items.getConfigFile(result).writeRaw(srcConfigFile.readRawBytes());
 
         // reload from the new config
         final File rootDir = result.getRootDir();
@@ -281,12 +281,22 @@ public abstract class ItemGroupMixIn {
         Jenkins.checkGoodName(name);
 
         // place it as config.xml
-        File configXml = Items.getConfigFile(getRootDirFor(name)).getFile();
-        final File dir = configXml.getParentFile();
+        final File dir = getRootDirFor(name);
+        final XmlFile configXml = Items.getConfigFile(dir);
+        // in a persistence store, an item of that name this controller has not loaded is not replaced
+        final PersistenceStores.Creation creation = PersistenceStores.creating(new File(dir, "config.xml"));
+        // the directory of a stored item not loaded here (its builds) is not this creation's to delete
+        final boolean existed = dir.exists();
         boolean success = false;
         try {
             Util.createDirectories(dir.toPath());
-            XMLUtils.safeTransform(new StreamSource(xml), new StreamResult(configXml));
+            ByteArrayOutputStream buf = new ByteArrayOutputStream();
+            XMLUtils.safeTransform(new StreamSource(xml), new StreamResult(buf));
+            try {
+                configXml.writeRaw(buf.toByteArray());
+            } catch (ConflictException e) {
+                throw alreadyExists(name);
+            }
 
             // load it
             TopLevelItem result = Items.callWhileUpdatingByXml(() -> (TopLevelItem) Items.load(parent, dir));
@@ -317,11 +327,25 @@ public abstract class ItemGroupMixIn {
             success = false;
             throw e;
         } finally {
+            if (creation != null) {
+                creation.close();
+            }
             if (!success) {
                 // if anything fails, delete the config file to avoid further confusion
-                Util.deleteRecursive(dir);
+                // (in a persistence store, only what was written here)
+                if (creation != null) {
+                    creation.undo();
+                }
+                if (!existed || creation == null || !creation.wroteNothing()) {
+                    Util.deleteRecursive(dir);
+                }
             }
         }
+    }
+
+    /** Something of that name is stored, by another controller sharing the persistence store or not loaded here. */
+    private static Failure alreadyExists(String name) {
+        return new Failure(Messages.Hudson_JobAlreadyExists(name));
     }
 
     @NonNull
@@ -337,7 +361,11 @@ public abstract class ItemGroupMixIn {
 
         TopLevelItem item = type.newInstance(parent, name);
         item.onCreatedFromScratch();
-        item.save();
+        try (PersistenceStores.Creation creation = PersistenceStores.creating(new File(item.getRootDir(), "config.xml"))) {
+            item.save();
+        } catch (ConflictException e) {
+            throw alreadyExists(name);
+        }
         add(item);
         Jenkins.get().rebuildDependencyGraphAsync();
 

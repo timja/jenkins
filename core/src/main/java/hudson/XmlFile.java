@@ -30,15 +30,19 @@ import com.thoughtworks.xstream.converters.DataHolder;
 import com.thoughtworks.xstream.converters.UnmarshallingContext;
 import com.thoughtworks.xstream.io.HierarchicalStreamDriver;
 import com.thoughtworks.xstream.io.HierarchicalStreamReader;
+import edu.umd.cs.findbugs.annotations.CheckForNull;
 import hudson.diagnosis.OldDataMonitor;
 import hudson.model.Descriptor;
 import hudson.util.AtomicFileWriter;
 import hudson.util.XStream2;
 import java.io.BufferedInputStream;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
 import java.io.Reader;
 import java.io.Serializable;
 import java.io.StringWriter;
@@ -47,6 +51,8 @@ import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
+import java.nio.file.NoSuchFileException;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.Map;
@@ -56,7 +62,11 @@ import java.util.logging.Logger;
 import javax.xml.XMLConstants;
 import javax.xml.parsers.ParserConfigurationException;
 import javax.xml.parsers.SAXParserFactory;
+import jenkins.persistence.PersistenceStore;
+import jenkins.persistence.PersistenceStores;
 import org.apache.commons.io.IOUtils;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.Beta;
 import org.xml.sax.Attributes;
 import org.xml.sax.InputSource;
 import org.xml.sax.Locator;
@@ -146,7 +156,16 @@ public final class XmlFile {
         this.force = force;
     }
 
+    /**
+     * The file on the local filesystem.
+     * If the content is served by a {@link PersistenceStore}, the current content is first copied to this file,
+     * which then acts as a read-only snapshot: changes made to it directly are not seen by other controllers.
+     */
     public File getFile() {
+        PersistenceStores.Route route = route();
+        if (route != null) {
+            materialize(route);
+        }
         return file;
     }
 
@@ -161,7 +180,7 @@ public final class XmlFile {
         if (LOGGER.isLoggable(Level.FINE)) {
             LOGGER.fine("Reading " + file);
         }
-        try (InputStream in = new BufferedInputStream(Files.newInputStream(file.toPath()))) {
+        try (InputStream in = new BufferedInputStream(open())) {
             return xs.fromXML(in);
         } catch (RuntimeException | Error e) {
             throw new IOException("Unable to read " + file, e);
@@ -188,7 +207,7 @@ public final class XmlFile {
     }
 
     private Object unmarshal(Object o, boolean nullOut) throws IOException {
-        try (InputStream in = new BufferedInputStream(Files.newInputStream(file.toPath()))) {
+        try (InputStream in = new BufferedInputStream(open())) {
             // TODO: expose XStream the driver from XStream
             if (nullOut) {
                 return ((XStream2) xs).unmarshal(DEFAULT_DRIVER.createReader(in), o, null, true);
@@ -203,6 +222,26 @@ public final class XmlFile {
     public void write(Object o) throws IOException {
         if (LOGGER.isLoggable(Level.FINEST)) {
             LOGGER.log(Level.FINEST, new Throwable(), () -> "Writing " + file);
+        }
+        PersistenceStores.Route route = route();
+        if (route != null) {
+            ByteArrayOutputStream buf = new ByteArrayOutputStream();
+            try (Writer w = new OutputStreamWriter(buf, StandardCharsets.UTF_8)) {
+                w.write("<?xml version='1.1' encoding='UTF-8'?>\n");
+                beingWritten.put(o, null);
+                writing.set(file);
+                try {
+                    xs.toXML(o, w);
+                } finally {
+                    beingWritten.remove(o);
+                    writing.set(null);
+                }
+            } catch (RuntimeException e) {
+                throw new IOException(e);
+            }
+            mkdirs(); // the directory itself stays local: other files such as builds live alongside
+            route.write(buf.toByteArray());
+            return;
         }
         mkdirs();
         AtomicFileWriter w = force
@@ -223,6 +262,43 @@ public final class XmlFile {
             throw new IOException(e);
         } finally {
             w.abort();
+        }
+    }
+
+    /**
+     * Writes an already serialized XML document, for example one submitted by a user.
+     *
+     * @param content the complete document
+     * @since TODO
+     */
+    @Restricted(Beta.class)
+    public void writeRaw(byte[] content) throws IOException {
+        PersistenceStores.Route route = route();
+        if (route != null) {
+            mkdirs();
+            route.write(content);
+            return;
+        }
+        mkdirs();
+        // ISO-8859-1 maps every byte to one char and back, so the bytes are written unchanged
+        AtomicFileWriter w = new AtomicFileWriter(file.toPath(), StandardCharsets.ISO_8859_1, force, force);
+        try {
+            w.write(new String(content, StandardCharsets.ISO_8859_1));
+            w.commit();
+        } finally {
+            w.abort();
+        }
+    }
+
+    /**
+     * Reads the document as bytes, without interpreting its encoding.
+     *
+     * @since TODO
+     */
+    @Restricted(Beta.class)
+    public byte[] readRawBytes() throws IOException {
+        try (InputStream in = open()) {
+            return in.readAllBytes();
         }
     }
 
@@ -248,10 +324,23 @@ public final class XmlFile {
     }
 
     public boolean exists() {
+        PersistenceStores.Route route = route();
+        if (route != null) {
+            try {
+                return route.exists();
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "Failed to check whether " + route.key() + " exists", e);
+                return false;
+            }
+        }
         return file.exists();
     }
 
     public void delete() throws IOException {
+        PersistenceStores.Route route = route();
+        if (route != null) {
+            route.delete();
+        }
         Files.deleteIfExists(Util.fileToPath(file));
     }
 
@@ -273,7 +362,7 @@ public final class XmlFile {
      */
     public Reader readRaw() throws IOException {
         try {
-            InputStream fileInputStream = Files.newInputStream(file.toPath());
+            InputStream fileInputStream = open();
             try {
                 return new InputStreamReader(fileInputStream, sniffEncoding());
             } catch (IOException ex) {
@@ -323,7 +412,7 @@ public final class XmlFile {
             }
         }
 
-        try (InputStream in = Files.newInputStream(file.toPath())) {
+        try (InputStream in = open()) {
             InputSource input = new InputSource(file.toURI().toASCIIString());
             input.setByteStream(in);
             SAXParserFactory spf = SAXParserFactory.newInstance();
@@ -378,6 +467,53 @@ public final class XmlFile {
     /**
      * {@link XStream} instance is supposed to be thread-safe.
      */
+
+    @CheckForNull
+    private PersistenceStores.Route route() {
+        return PersistenceStores.route(file);
+    }
+
+    /**
+     * Opens the content, from the {@link PersistenceStore} if it serves this file, else from the local file.
+     */
+    private InputStream open() throws IOException {
+        PersistenceStores.Route route = route();
+        if (route == null) {
+            return Files.newInputStream(file.toPath());
+        }
+        PersistenceStore.Entry entry = route.read();
+        if (entry == null) {
+            throw new NoSuchFileException(file.toString(), null, "not found in persistence store as " + route.key());
+        }
+        return new ByteArrayInputStream(entry.content());
+    }
+
+    /**
+     * Copies the stored content to the local file, for callers of {@link #getFile} which read it directly.
+     */
+    private void materialize(PersistenceStores.Route route) {
+        try {
+            PersistenceStore.Entry entry = route.read();
+            if (entry == null) {
+                return;
+            }
+            if (file.isFile() && Arrays.equals(Files.readAllBytes(file.toPath()), entry.content())) {
+                return;
+            }
+            LOGGER.log(Level.FINE, new Throwable("caller"), () -> "Materializing " + route.key() + " to " + file);
+            mkdirs();
+            // replaced at once, never truncated in place: a reader of the file sees the old copy or the new one whole
+            AtomicFileWriter w = new AtomicFileWriter(file.toPath(), StandardCharsets.ISO_8859_1);
+            try {
+                w.write(new String(entry.content(), StandardCharsets.ISO_8859_1));
+                w.commit();
+            } finally {
+                w.abort();
+            }
+        } catch (IOException | InvalidPathException e) {
+            LOGGER.log(Level.WARNING, "Failed to materialize " + route.key() + " to " + file, e);
+        }
+    }
 
     private static final Logger LOGGER = Logger.getLogger(XmlFile.class.getName());
 
