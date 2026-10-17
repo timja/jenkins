@@ -285,6 +285,8 @@ public abstract class ItemGroupMixIn {
         final XmlFile configXml = Items.getConfigFile(dir);
         // in a persistence store, an item of that name this controller has not loaded is not replaced
         final PersistenceStores.Creation creation = PersistenceStores.creating(new File(dir, "config.xml"));
+        // the directory of a stored item not loaded here (its builds) is not this creation's to delete
+        final boolean existed = dir.exists();
         boolean success = false;
         try {
             Util.createDirectories(dir.toPath());
@@ -334,7 +336,9 @@ public abstract class ItemGroupMixIn {
                 if (creation != null) {
                     creation.undo();
                 }
-                Util.deleteRecursive(dir);
+                if (!existed || creation == null || !creation.wroteNothing()) {
+                    Util.deleteRecursive(dir);
+                }
             }
         }
     }

@@ -246,6 +246,11 @@ public final class PersistenceStores {
             }
         }
 
+        /** Whether this creation wrote nothing (yet), so that nothing stored under its key is its own. */
+        public boolean wroteNothing() {
+            return written == PersistenceStore.ABSENT;
+        }
+
         @Override
         public void close() {
             creations.remove(route.key(), this);

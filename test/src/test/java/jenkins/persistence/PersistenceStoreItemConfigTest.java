@@ -170,11 +170,16 @@ class PersistenceStoreItemConfigTest {
         String key = "jobs/taken/config.xml";
         byte[] theirs = "<project><description>elsewhere</description></project>".getBytes(StandardCharsets.UTF_8);
         STORE.write(key, theirs, PersistenceStore.ANY);
+        // its local directory (it failed to load here, say) keeps its builds
+        File build = new File(r.jenkins.getRootDir(), "jobs/taken/builds/1/build.xml");
+        Files.createDirectories(build.getParentFile().toPath());
+        Files.writeString(build.toPath(), "<build/>");
         assertThrows(Failure.class, () -> r.jenkins.createProject(FreeStyleProject.class, "taken"));
         assertArrayEquals(theirs, STORE.read(key).content());
         String xml = "<?xml version='1.1' encoding='UTF-8'?><project><description>mine</description></project>";
         assertThrows(Failure.class, () -> r.jenkins.createProjectFromXML("taken", new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8))));
         assertArrayEquals(theirs, STORE.read(key).content());
+        assertTrue(build.exists(), "the stored item's local directory is not deleted");
         assertNull(r.jenkins.getItem("taken"));
     }
 
