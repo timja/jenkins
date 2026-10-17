@@ -879,10 +879,17 @@ public final class SharedQueue {
         Set<String> live = PersistenceStores.get().liveOrigins();
         if (live == null) {
             // membership unknown: as the gate decides, its controller goes first, any other after a while
-            return now > r.dueAt() + ORIGIN_GRACE_MILLIS;
+            return now > r.dueAt() + ORIGIN_GRACE_MILLIS && !reservedElsewhere(r.id(), me, live);
         }
-        // its controller is gone: one of the others provisions, the same one whichever of them asks
-        return !live.contains(r.origin()) && me.equals(provisioner(r.id(), live));
+        // its controller is gone: one of the others provisions, the same one whichever of them asks (unless another
+        // reserved it first, before a controller joining changed which one that is)
+        return !live.contains(r.origin()) && me.equals(provisioner(r.id(), live)) && !reservedElsewhere(r.id(), me, live);
+    }
+
+    /** Whether another controller, not known to be gone, holds a reservation of an item: it is starting an agent for it. */
+    private static boolean reservedElsewhere(long id, String me, @CheckForNull Set<String> live) throws IOException {
+        String holder = Reservations.holder(id);
+        return holder != null && !holder.equals(me) && (live == null || live.contains(holder));
     }
 
     /** How long a reservation holds at most (the agent may never come up). */
