@@ -112,6 +112,21 @@ class ClusterCoordinationTest {
         }
 
         @Override
+        public BuildLeases leases() {
+            BuildLeases leases = super.leases();
+            return (BuildLeases) Proxy.newProxyInstance(BuildLeases.class.getClassLoader(), new Class<?>[] {BuildLeases.class}, (proxy, m, args) -> {
+                if (m.getName().equals("acquire") && ((String) args[0]).endsWith("/exclusive") && failingExclusive.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+                    throw new IOException("the store is unreachable, this time");
+                }
+                try {
+                    return m.invoke(leases, args);
+                } catch (InvocationTargetException e) {
+                    throw e.getCause();
+                }
+            });
+        }
+
+        @Override
         public Set<String> children(String parentKey) {
             CountDownLatch l = slowListing;
             if (l != null && parentKey.startsWith("jobs/slow")) {
@@ -131,6 +146,8 @@ class ClusterCoordinationTest {
     /** How many of the next claims go through but fail to answer, as does the read that follows each. */
     static final AtomicInteger lostClaimAnswers = new AtomicInteger();
     static final AtomicInteger failingReads = new AtomicInteger();
+    /** How many of the next acquisitions of a job's exclusive lease here fail. */
+    static final AtomicInteger failingExclusive = new AtomicInteger();
     /** Origins the store reports as alive; null means everyone. */
     static volatile Set<String> live;
 
@@ -144,6 +161,8 @@ class ClusterCoordinationTest {
         live = null;
         lostClaimAnswers.set(0);
         failingReads.set(0);
+        failingExclusive.set(0);
+        Adopter.abandoned.set(0);
         HoldClaimed.job = null;
         Adopter.job = null;
         Adopter.resumed.clear();
@@ -478,6 +497,27 @@ class ClusterCoordinationTest {
         STORE.delete(key, PersistenceStore.ANY);
     }
 
+    @Test
+    void adoptionWhoseExclusiveLeaseCannotBeTakenIsAbandoned() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("unreachable-lease");
+        PersistenceStore dead = STORE.as("dead-controller");
+        String key = "jobs/unreachable-lease/running/3.xml";
+        long deadEpoch = dead.leases().acquire(key);
+        dead.write(key, bytes("origin=dead-controller\ncontroller=jenkins-x\ndisplayName=#3\nstartTime=1\nepoch=" + deadEpoch + "\n"), PersistenceStore.ABSENT);
+        Adopter.job = p.getFullName();
+        live = Set.of(STORE.getOrigin());
+        failingExclusive.set(1);
+        try {
+            RunningBuilds.removeStale();
+            assertEquals(1, Adopter.abandoned.get(), "what was prepared for it is let go");
+            assertTrue(Adopter.resumed.isEmpty());
+            assertNotNull(STORE.read(key), "left for a later sweep");
+        } finally {
+            live = null;
+        }
+        STORE.delete(key, PersistenceStore.ANY);
+    }
+
     /**
      * Holds the items of a job from starting once they are claimed here: at the start gate, where the claim is made,
      * as the claim may land between a dispatcher's look at an item and its start.
@@ -502,6 +542,7 @@ class ClusterCoordinationTest {
     public static class Adopter implements BuildAdopter {
         static volatile String job;
         static final List<Integer> resumed = new CopyOnWriteArrayList<>();
+        static final AtomicInteger abandoned = new AtomicInteger();
 
         @Override
         public Adoption prepare(Job<?, ?> j, RunningBuilds.Placeholder placeholder) {
@@ -515,7 +556,9 @@ class ClusterCoordinationTest {
                 }
 
                 @Override
-                public void abandon() {}
+                public void abandon() {
+                    abandoned.incrementAndGet();
+                }
             };
         }
     }

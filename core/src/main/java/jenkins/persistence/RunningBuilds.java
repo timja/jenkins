@@ -860,7 +860,14 @@ public final class RunningBuilds {
             if (adoption == null) {
                 return false; // nobody can adopt it
             }
-            if (!SharedQueue.adoptExclusive(job, number)) {
+            boolean exclusive;
+            try {
+                exclusive = SharedQueue.adoptExclusive(job, number);
+            } catch (IOException | RuntimeException e) {
+                adoption.abandon(); // retried by the next sweep, which prepares it again
+                throw e;
+            }
+            if (!exclusive) {
                 // a newer build of this job (which allows one at a time) runs elsewhere, or here: resume this one later
                 adoption.abandon();
                 BuildLeases leases = store.leases();
