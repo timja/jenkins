@@ -422,6 +422,52 @@ class BuildLeasesTest {
         forget("stubborn");
     }
 
+    @Test
+    void aBuildHandedOverHereIsTakenOver() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("handed-here");
+        String key = "jobs/handed-here/running/1.xml";
+        // another controller, alive, ran it and handed it over to this one: released, marked handed over
+        long theirs = dead.leases().acquire(key);
+        dead.write(key, placeholder("dead-controller", 1, theirs, "savePoint=4\nhandedOver=" + System.currentTimeMillis() + "\n"), PersistenceStore.ABSENT);
+        dead.leases().release(key, theirs);
+        assertTrue(RunningBuilds.takeOver(p, 1));
+        assertEquals(List.of("handed-here#1@savePoint=4"), Adopter.prepared);
+        assertEquals(1, Adopter.resumed.size());
+        assertThat(text(key), containsString("origin=" + STORE.getOrigin()));
+        assertThat("no longer handed over", text(key), not(containsString("handedOver")));
+        forget("handed-here");
+    }
+
+    @Test
+    void aBuildHandedOverThatNobodyTakesIsAdoptedByASweepAfterAWhile() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        FreeStyleProject p = blocking(r, "handed-away", started, release);
+        QueueTaskFuture<FreeStyleBuild> f = p.scheduleBuild2(0);
+        assertTrue(started.await(60, TimeUnit.SECONDS));
+        FreeStyleBuild b = p.getBuildByNumber(1);
+        String key = "jobs/handed-away/running/1.xml";
+        long grace = RunningBuilds.HANDOVER_GRACE_MILLIS;
+        try {
+            RunningBuilds.handOver(b); // to a controller which then never takes it
+            assertThat(text(key), containsString("handedOver="));
+            assertEquals(Result.ABORTED, f.get(60, TimeUnit.SECONDS).getResult(), "stopped here");
+            awaitDiscarded(b);
+            live = Set.of(STORE.getOrigin()); // its owner, alive
+            RunningBuilds.removeStale();
+            assertEquals(List.of(), Adopter.prepared, "not before its taker had a while to take it");
+            RunningBuilds.HANDOVER_GRACE_MILLIS = 0;
+            RunningBuilds.removeStale();
+            assertEquals(List.of("handed-away#1@savePoint=null"), Adopter.prepared, "adopted, its owner's sweep included");
+            assertThat(text(key), not(containsString("handedOver")));
+        } finally {
+            RunningBuilds.HANDOVER_GRACE_MILLIS = grace;
+            live = null;
+            release.countDown();
+        }
+        forget("handed-away");
+    }
+
     /** Removes what a test left in the store, which outlives it, so that later tests neither load nor sweep it. */
     private static void forget(String... jobs) throws java.io.IOException {
         for (String job : jobs) {

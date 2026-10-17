@@ -109,6 +109,39 @@ public final class RunningBuilds {
     @Restricted(NoExternalUse.class)
     public static /* non-final for script console */ int CLEANUP_PERIOD = SystemProperties.getInteger(RunningBuilds.class.getName() + ".cleanupPeriod", 30);
 
+    /** Placeholder property: when its owner {@linkplain #handOver handed it over}, in milliseconds since the epoch. */
+    static final String HANDED_OVER = "handedOver";
+
+    /**
+     * How long a build handed over waits for its taker: past that, nobody took it (the taker went away, say), and any
+     * controller's sweep adopts it, its owner's included, as one of a controller gone.
+     */
+    @Restricted(NoExternalUse.class)
+    public static /* non-final for script console */ long HANDOVER_GRACE_MILLIS = SystemProperties.getLong(RunningBuilds.class.getName() + ".handoverGraceMillis", 120_000L);
+
+    /** Whether a build was handed over long enough ago that its taker is not coming. */
+    private static boolean handoverLapsed(Placeholder p) {
+        String at = p.properties.get(HANDED_OVER);
+        if (at == null) {
+            return false;
+        }
+        try {
+            return System.currentTimeMillis() - Long.parseLong(at) >= HANDOVER_GRACE_MILLIS;
+        } catch (NumberFormatException e) {
+            return true;
+        }
+    }
+
+    /** Properties of a placeholder as its new owner writes them: no longer handed over. */
+    private static Map<String, String> owning(Map<String, String> properties) {
+        if (!properties.containsKey(HANDED_OVER)) {
+            return properties;
+        }
+        Map<String, String> mine = new java.util.TreeMap<>(properties);
+        mine.remove(HANDED_OVER);
+        return mine;
+    }
+
     /** Placeholders per job key, kept up to date by change events; loaded from the store on first use. */
     private static final Map<String, List<Placeholder>> cache = new ConcurrentHashMap<>();
 
@@ -474,7 +507,7 @@ public final class RunningBuilds {
                 LOGGER.info(() -> "Another controller holds the lease on " + job.getFullName() + " #" + number + "; not resuming it here");
                 return false;
             }
-            Placeholder mine = p.withOwner(store.getOrigin(), CONTROLLER_NAME, epoch, p.properties);
+            Placeholder mine = p.withOwner(store.getOrigin(), CONTROLLER_NAME, epoch, owning(p.properties));
             long version;
             try {
                 version = store.writeIfHeld(key, epoch, key, mine.toBytes(), p.version); // fenced, as an adoption is
@@ -714,7 +747,8 @@ public final class RunningBuilds {
             Set<String> gone = new HashSet<>();
             int removedHere = 0;
             for (Placeholder p : all(job)) {
-                if (!live.contains(p.origin) && stillGone(store, p.origin, gone)) {
+                // a build handed over and not taken (its taker went away, say) is adopted as one of a controller gone
+                if ((!live.contains(p.origin) && stillGone(store, p.origin, gone)) || handoverLapsed(p)) {
                     long epoch = 0;
                     if (leases != null) {
                         epoch = leases.acquire(p.key);
@@ -1013,7 +1047,7 @@ public final class RunningBuilds {
                 LOGGER.info(() -> "Not adopting " + job.getFullName() + " #" + number + " yet: another build of it runs");
                 return Adoption.LATER;
             }
-            Placeholder mine = p.withOwner(store.getOrigin(), CONTROLLER_NAME, epoch, p.properties);
+            Placeholder mine = p.withOwner(store.getOrigin(), CONTROLLER_NAME, epoch, owning(p.properties));
             long version;
             try {
                 // fenced by the lease: it may have lapsed while the adoption was prepared (a save point fetched), and
@@ -1105,7 +1139,8 @@ public final class RunningBuilds {
     /**
      * Gives up a build this controller runs so that another controller can take it over ({@link #takeOver}), for example
      * a Pipeline waiting for an agent only another controller has (Target 12). The build is then stopped here without
-     * being published, as when ownership is lost.
+     * being published, as when ownership is lost. The caller should have a taker lined up: one that does not take it
+     * within {@link #HANDOVER_GRACE_MILLIS} leaves it to any controller's sweep, which adopts it as if its owner were gone.
      */
     @Restricted(Beta.class)
     public static void handOver(@NonNull Run<?, ?> run) throws IOException {
@@ -1114,6 +1149,17 @@ public final class RunningBuilds {
         Placeholder p = key == null ? null : owned.get(key);
         if (p == null || store == null || store.leases() == null) {
             throw new IOException(run + " is not owned here");
+        }
+        // marked as handed over first (fenced: still this controller's), so that if nobody takes it, a sweep adopts it
+        // after a while rather than it showing as running here for good
+        Map<String, String> properties = new java.util.TreeMap<>(p.properties);
+        properties.put(HANDED_OVER, String.valueOf(System.currentTimeMillis()));
+        Placeholder released = p.withOwner(p.origin, p.controller, p.epoch, properties);
+        try {
+            store.writeIfHeld(key, p.epoch, key, released.toBytes(), p.version);
+        } catch (LeaseLostException e) {
+            lost(run);
+            throw e;
         }
         store.leases().release(key, p.epoch);
         LOGGER.info(() -> "Handed over " + run);
