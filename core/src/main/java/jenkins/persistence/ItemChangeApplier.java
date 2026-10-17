@@ -305,6 +305,8 @@ public final class ItemChangeApplier {
         }
         if (e.kind() == ChangeEvent.Kind.DELETED) {
             BuildRecords.deletedElsewhere(job, record.number());
+        } else if (e.kind() == ChangeEvent.Kind.MOVED) {
+            BuildRecords.movedElsewhere(job, record.number()); // the job's own move came first
         } else {
             BuildRecords.writtenElsewhere(job, record.number());
         }
@@ -313,6 +315,10 @@ public final class ItemChangeApplier {
     }
 
     private void moved(ChangeEvent e) throws Exception {
+        if (BuildRecords.RecordKey.parse(e.key()) != null) {
+            build(e);
+            return;
+        }
         List<String> to = itemPath(e.key());
         List<String> from = e.oldKey() == null ? null : itemPath(e.oldKey());
         if (to == null || from == null) {

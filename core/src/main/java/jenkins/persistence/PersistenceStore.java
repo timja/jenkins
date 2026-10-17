@@ -110,7 +110,8 @@ public interface PersistenceStore {
      * Atomically renames a key and every key below it, as when an item directory is renamed or moved.
      * For example moving {@code jobs/a} to {@code jobs/f/jobs/a} moves {@code jobs/a/config.xml}
      * and {@code jobs/a/jobs/x/config.xml}, but not {@code jobs/ab/config.xml}.
-     * Moved entries get new versions.
+     * Moved entries get new versions. Their change events are delivered shallower keys first, so that an item's
+     * configuration arrives before the entries below it (its build records, its children's configuration).
      *
      * @return each entry moved: its key and version before, and its key and version now
      * @throws ConflictException if {@code toPrefix} or anything below it already exists

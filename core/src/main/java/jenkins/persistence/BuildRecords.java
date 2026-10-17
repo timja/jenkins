@@ -375,10 +375,23 @@ public final class BuildRecords {
             } else {
                 LOGGER.fine(() -> "Recognizing " + job.getFullName() + " #" + number + " completed elsewhere");
                 Files.createDirectories(dir.toPath());
+                // a reference left unloadable (its materialization failed, or found no snapshot yet) is retried
+                runs.unload(number);
                 runs.recognizeNumber(number);
             }
         }
         PeepholePermalink.changedElsewhere(job, number, false);
+    }
+
+    /**
+     * A build's record was moved elsewhere along with its job, whose move this controller has applied: a copy
+     * materialized here is refreshed, as for a change, since an edit made elsewhere before the move found no record
+     * at the old name here. A build not materialized here is read from the store when needed, as it is now.
+     */
+    static void movedElsewhere(@NonNull Job<?, ?> job, int number) throws IOException {
+        if (new File(new File(job.getBuildDir(), String.valueOf(number)), RECORD).isFile()) {
+            writtenElsewhere(job, number);
+        }
     }
 
     /**
@@ -387,7 +400,17 @@ public final class BuildRecords {
      */
     static void deletedElsewhere(@NonNull Job<?, ?> job, int number) throws IOException {
         RunMap<?> runs = runsOf(job);
-        if (runs == null) {
+        String builds = buildsKey(job);
+        if (runs == null || builds == null) {
+            return;
+        }
+        Run<?, ?> loaded = runs.getLoadedBuilds().get(number);
+        if (loaded != null && loaded.isBuilding()) {
+            return; // running here, so not what was deleted elsewhere: a build of an earlier job of this name, say
+        }
+        if (PersistenceStores.get().read(builds + "/" + number + "/" + RECORD) != null) {
+            // stored again since: the event is stale (the job was renamed here and this name reused, say), or the record
+            // was published again as it was deleted, which is resolved by another deletion
             return;
         }
         LOGGER.fine(() -> "Forgetting " + job.getFullName() + " #" + number + " deleted elsewhere");
