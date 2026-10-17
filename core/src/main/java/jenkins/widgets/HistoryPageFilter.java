@@ -43,6 +43,8 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
+import jenkins.model.ExternalBuild;
+import jenkins.model.ExternalBuilds;
 import jenkins.model.HistoricalBuild;
 import jenkins.model.queue.QueueItem;
 import org.kohsuke.accmod.Restricted;
@@ -263,6 +265,21 @@ public class HistoryPageFilter<T> {
 
             return Long.compare(o2QID, o1QID);
         });
+    }
+
+    /**
+     * Builds of the job not on this controller ({@link ExternalBuilds#running}), shown above its own builds:
+     * on the newest page only, when not searching, and when building builds are not filtered out.
+     */
+    @Restricted(NoExternalUse.class)
+    public List<? extends ExternalBuild> getRunningElsewhere() {
+        if (hasUpPage || (searchString != null && !searchString.isEmpty()) || widget == null || !(widget.owner instanceof Job<?, ?> job)) {
+            return List.of();
+        }
+        if (statuses != null && !statuses.isEmpty() && !statuses.contains(BuildStatusFilter.BUILDING.getValue())) {
+            return List.of();
+        }
+        return ExternalBuilds.get().running(job);
     }
 
     private long getNextBuildNumber(@NonNull Object entry) {

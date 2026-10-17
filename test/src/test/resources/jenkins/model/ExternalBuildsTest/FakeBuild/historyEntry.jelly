@@ -1,0 +1,4 @@
+<?jelly escape-by-default='true'?>
+<j:jelly xmlns:j="jelly:core">
+  <div class="fake-external-build">fake-external-build #${it.number} on ${it.location}</div>
+</j:jelly>
