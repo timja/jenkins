@@ -282,6 +282,38 @@ class SharedQueueTest {
     }
 
     @Test
+    void anItemClaimedHereThatMakesNoBuildIsCancelledNotLeftClaimed() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("no-build");
+        DisableOnStart.job = p;
+        p.scheduleBuild2(0);
+        long id = DisableOnStart.left.get(60, java.util.concurrent.TimeUnit.SECONDS);
+        ClusterQueue.Record rec = awaitShared(id, x -> x.state() == ClusterQueue.State.CANCELLED);
+        assertEquals(ClusterQueue.State.CANCELLED, rec.state(), "not left claimed by this controller, built nowhere");
+        assertNull(p.getLastBuild());
+    }
+
+    /** Disables a job as its item leaves the queue to start, before its build is made: it then makes none. */
+    @TestExtension("anItemClaimedHereThatMakesNoBuildIsCancelledNotLeftClaimed")
+    public static final class DisableOnStart extends hudson.model.queue.QueueListener {
+        static volatile FreeStyleProject job;
+        static final java.util.concurrent.CompletableFuture<Long> left = new java.util.concurrent.CompletableFuture<>();
+
+        @Override
+        public void onLeft(Queue.LeftItem li) {
+            if (li.task == job && !li.isCancelled()) {
+                try {
+                    java.lang.reflect.Field disabled = hudson.model.AbstractProject.class.getDeclaredField("disabled");
+                    disabled.setAccessible(true);
+                    disabled.setBoolean(job, true);
+                } catch (ReflectiveOperationException e) {
+                    throw new AssertionError(e);
+                }
+                left.complete(li.getId());
+            }
+        }
+    }
+
+    @Test
     void itemFromElsewhereIsMirroredWithItsIdAndCancelledEverywhere() throws Exception {
         r.createFreeStyleProject("mirrored");
         ClusterQueue.Record rec = publishElsewhere("mirrored", 60_000, "alice");

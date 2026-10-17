@@ -638,6 +638,29 @@ public final class SharedQueue {
         }
     }
 
+    /**
+     * An item which left the queue here to start, but whose task made no build (a job disabled meanwhile, say, or one
+     * failing to make its build): its shared record is cancelled, or it would stay claimed by this controller, built
+     * nowhere. Called under the queue lock: done off it.
+     */
+    @Restricted(NoExternalUse.class)
+    public static void leftWithoutBuild(@NonNull Queue.Item item) {
+        ClusterQueue cq = queue();
+        if (cq == null) {
+            return;
+        }
+        long id = item.getId();
+        jenkins.util.Timer.get().submit(() -> {
+            try {
+                if (cq.cancel(id)) {
+                    LOGGER.info(() -> "Queue item " + id + " started here without a build; cancelled");
+                }
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.WARNING, "Failed to cancel queue item " + id + ", which started here without a build", e);
+            }
+        });
+    }
+
     @Restricted(NoExternalUse.class)
     @Extension
     public static final class Starts extends RunListener<Run<?, ?>> {

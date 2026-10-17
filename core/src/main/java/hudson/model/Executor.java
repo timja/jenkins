@@ -382,10 +382,21 @@ public class Executor extends Thread implements ModelObject, IExecutor {
                 if (LOGGER.isLoggable(FINE))
                     LOGGER.log(FINE, getName() + " grabbed " + workUnit + " from queue");
                 SubTask _task = workUnit.work;
-                Executable _executable = _task.createExecutable();
+                Executable _executable;
+                try {
+                    _executable = _task.createExecutable();
+                } catch (IOException | RuntimeException | Error e) {
+                    if (workUnit.isMainWork()) {
+                        jenkins.persistence.SharedQueue.leftWithoutBuild(workUnit.context.item); // claimed for nothing
+                    }
+                    throw e;
+                }
                 if (_executable == null) {
                     String displayName = _task instanceof Queue.Task qt ? qt.getFullDisplayName() : _task.getDisplayName();
                     LOGGER.log(WARNING, "{0} cannot be run (for example because it is disabled)", displayName);
+                    if (workUnit.isMainWork()) {
+                        jenkins.persistence.SharedQueue.leftWithoutBuild(workUnit.context.item);
+                    }
                 }
                 lock.writeLock().lock();
                 try {
