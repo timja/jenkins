@@ -754,7 +754,9 @@ public class HudsonPrivateSecurityRealm extends AbstractPasswordBasedSecurityRea
          * Binds the protected password to who is editing it. Normally the session id;
          * with a {@link PersistenceStore} shared by several controllers, whose sessions are their own,
          * the signed-in user and their seed (which changes when their sessions are invalidated) instead,
-         * so that the form can be submitted to another controller than the one which rendered it.
+         * so that the form can be submitted to another controller than the one which rendered it. Such a form is then
+         * taken as unchanged only while the password it was rendered with is still the user's (see newInstance), and its
+         * crumb must not be bound to the session either (see {@link TokenBasedRememberMeServices2#ALWAYS_REMEMBER}).
          */
         static String replayGuard() {
             if (PersistenceStores.get() == null) {
@@ -905,7 +907,13 @@ public class HudsonPrivateSecurityRealm extends AbstractPasswordBasedSecurityRea
                     String prefix = replayGuard() + ':';
                     if (data.startsWith(prefix)) {
                         // The password is not being changed
-                        return Details.fromHashedPassword(data.substring(prefix.length()));
+                        String hash = data.substring(prefix.length());
+                        if (PersistenceStores.get() != null && !isCurrentPassword(req, hash)) {
+                            // not bound to a session, which logging out ends: a page rendered before the password was
+                            // changed would bring the old one back
+                            throw new FormException("The password was changed since this page was loaded; reload it", "user.password");
+                        }
+                        return Details.fromHashedPassword(hash);
                     }
                 }
 
@@ -933,6 +941,12 @@ public class HudsonPrivateSecurityRealm extends AbstractPasswordBasedSecurityRea
                 }
 
                 return Details.fromPlainPassword(Util.fixNull(pwd));
+            }
+
+            private static boolean isCurrentPassword(StaplerRequest2 req, String hash) {
+                User user = Util.getNearestAncestorOfTypeOrThrow(req, User.class);
+                Details current = user.getProperty(Details.class);
+                return current != null && MessageDigest.isEqual(current.getPassword().getBytes(StandardCharsets.UTF_8), hash.getBytes(StandardCharsets.UTF_8));
             }
 
             @POST
