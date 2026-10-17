@@ -398,8 +398,14 @@ public final class SharedQueue {
         }
     }
 
-    /** Removes an item from this controller's queue because it was claimed, started or cancelled elsewhere. */
-    private static void dropLocal(long id) {
+    /**
+     * Removes an item from this controller's queue because it was claimed or started elsewhere ({@code taken}), or
+     * cancelled.
+     */
+    private static void dropLocal(long id, boolean taken) {
+        if (taken) {
+            takenHere.add(id); // before it leaves: its listeners ask (takenElsewhere)
+        }
         if (PersistenceStores.applyingRemoteChange(() -> Queue.getInstance().cancelLocal(id))) {
             LOGGER.fine(() -> "Dropped queue item " + id + ", taken or cancelled elsewhere");
             droppedHere.add(id);
@@ -411,6 +417,14 @@ public final class SharedQueue {
      * before starting it, the store puts it back, under the same id, and it is mirrored again (Mirror.create).
      */
     private static final Set<Long> droppedHere = java.util.Collections.newSetFromMap(java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>() {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<Long, Boolean> eldest) {
+            return size() > 10_000;
+        }
+    }));
+
+    /** Of those, the items dropped because another controller claimed or started them (for {@link #takenElsewhere}). */
+    private static final Set<Long> takenHere = java.util.Collections.newSetFromMap(java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>() {
         @Override
         protected boolean removeEldestEntry(Map.Entry<Long, Boolean> eldest) {
             return size() > 10_000;
@@ -1010,7 +1024,8 @@ public final class SharedQueue {
             if (r.state() != ClusterQueue.State.WAITING) {
                 // taken elsewhere, or started here already: an item started here has left the queue, so a copy still in
                 // it is stale (e.g. restored by a reload from a queue saved before it started)
-                Timer.get().submit(() -> dropLocal(id));
+                boolean taken = r.state() != ClusterQueue.State.CANCELLED && !me.equals(r.claimedBy());
+                Timer.get().submit(() -> dropLocal(id, taken));
                 return new Blocked(r.state() == ClusterQueue.State.STARTED && me.equals(r.claimedBy()) ? "Started already" : "Starting on another controller");
             }
             if (r.pinnedTo() != null && !me.equals(r.pinnedTo()) && pinHolds(r.pinnedTo())) {
@@ -1384,10 +1399,10 @@ public final class SharedQueue {
                 }
                 case CLAIMED, STARTED -> {
                     if (!me.equals(r.claimedBy())) {
-                        dropLocal(r.id());
+                        dropLocal(r.id(), true);
                     }
                 }
-                case CANCELLED -> dropLocal(r.id());
+                case CANCELLED -> dropLocal(r.id(), false);
                 default -> throw new IllegalStateException(r.toString());
             }
         }
@@ -1443,6 +1458,7 @@ public final class SharedQueue {
                 Ids.MIRRORED.remove();
             }
             droppedHere.remove(r.id());
+            takenHere.remove(r.id()); // put back: it may yet be cancelled
         }
 
         /** Waiting items whose job was not here when they were mirrored, by job: they are once it comes. */
@@ -1480,12 +1496,19 @@ public final class SharedQueue {
      * Whether a queue item left this controller's queue because another controller claimed or started it, rather
      * than because it was cancelled (Target 15). Its local copy leaves as cancelled either way, so a
      * {@link hudson.model.queue.QueueListener#onLeft} that fails on cancellation should not when this is true.
+     *
+     * <p>Answered from what this controller knows: an item dropped here because it was taken elsewhere is known to be
+     * (without asking the store, under the queue lock that {@code onLeft} holds, nor failing if it cannot be asked). Of
+     * another item the store is asked; if it cannot be, the answer is false.
      */
     @Restricted(Beta.class)
     public static boolean takenElsewhere(long id) {
         ClusterQueue cq = queue();
         if (cq == null) {
             return false;
+        }
+        if (takenHere.contains(id)) {
+            return true;
         }
         try {
             ClusterQueue.Record r = cq.get(id);
