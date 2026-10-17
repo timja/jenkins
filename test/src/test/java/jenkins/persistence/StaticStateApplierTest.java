@@ -47,6 +47,7 @@ import java.io.UncheckedIOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
@@ -452,6 +453,20 @@ class StaticStateApplierTest {
         other.delete("nodes/n2/config.xml", PersistenceStore.ANY);
         awaitApplied();
         assertNull(r.jenkins.getNode("n2"), "deleted elsewhere");
+    }
+
+    @Test
+    void aNodeDeletedElsewhereDoesNotComeBackFromACopyHere() throws Exception {
+        r.createSlave("n5", null, null);
+        File copy = new File(r.jenkins.getRootDir(), "nodes/n5/config.xml");
+        Files.createDirectories(copy.toPath().getParent());
+        Files.writeString(copy.toPath(), text("nodes/n5/config.xml"), StandardCharsets.UTF_8); // e.g. read from the store
+        other.delete("nodes/n5/config.xml", PersistenceStore.ANY);
+        awaitApplied();
+        assertNull(r.jenkins.getNode("n5"));
+        assertFalse(copy.getParentFile().exists(), "the copy here went with the node");
+        r.jenkins.getNodesObject().load(); // as at the next startup
+        assertNull(r.jenkins.getNode("n5"), "not brought back");
     }
 
     @Test
