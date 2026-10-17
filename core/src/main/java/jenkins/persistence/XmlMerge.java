@@ -292,9 +292,18 @@ public final class XmlMerge {
         return d.getDocumentElement();
     }
 
+    /** Made once: looking the implementation up costs more than a merge. */
+    private static final TransformerFactory TRANSFORMERS = TransformerFactory.newInstance();
+
     private static String serialise(Node n) throws Exception {
-        Transformer tr = TransformerFactory.newInstance().newTransformer();
+        Transformer tr;
+        synchronized (TRANSFORMERS) { // a factory is not specified to be thread-safe; its transformers are used by one
+            tr = TRANSFORMERS.newTransformer();
+        }
         tr.setOutputProperty(OutputKeys.OMIT_XML_DECLARATION, "yes");
+        // as Jenkins writes its files: control characters (in a description, say) are then character references, which
+        // XML 1.0 output refuses (and the merge with it)
+        tr.setOutputProperty(OutputKeys.VERSION, "1.1");
         StringWriter w = new StringWriter();
         tr.transform(new DOMSource(n), new StreamResult(w));
         return w.toString();

@@ -43,6 +43,20 @@ class XmlMergeTest {
     }
 
     @Test
+    void controlCharactersInTextMerge() {
+        String base = BASE.replace(">hello<", ">bell &#x1; escape &#x1b;<");
+        String mine = base.replace("<quietPeriod>5<", "<quietPeriod>9<");
+        String theirs = base.replace("<scmCheckoutRetryCount>0<", "<scmCheckoutRetryCount>4<");
+        XmlMerge.Result r = XmlMerge.merge(b(base), b(mine), b(theirs));
+        assertNotNull(r, "an XML 1.1 file with control characters merges");
+        assertEquals(0, r.conflicts());
+        XmlMerge.Result again = XmlMerge.merge(r.merged(), r.merged(), r.merged());
+        assertNotNull(again, "and reads back: " + s(r.merged()));
+        assertTrue(s(r.merged()).contains("<quietPeriod>9<") && s(r.merged()).contains("<scmCheckoutRetryCount>4<"), s(r.merged()));
+        assertTrue(s(r.merged()).matches("(?s).*bell &#(x)?0*1; escape &#(x1b|27);.*"), s(r.merged()));
+    }
+
+    @Test
     void theMergeSaysTheEncodingItIsWrittenIn() {
         String base = BASE.replace("encoding='UTF-8'", "encoding='ISO-8859-1'");
         String mine = base.replace("<quietPeriod>5<", "<quietPeriod>9<");
