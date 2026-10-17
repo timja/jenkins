@@ -207,8 +207,7 @@ public final class ItemChangeApplier {
             // under the item's lock, as AbstractItem.save is: a save while the object is half reloaded would write a mix
             // of the two versions, as of the version just read, so nobody would notice (lost trigger, ET11 scenario 3)
             synchronized (existing) {
-                PersistenceStores.clearRemovedFields(existing.getConfigFile(), existing); // a display name cleared, say
-                existing.load();
+                PersistenceStores.reload(existing.getConfigFile(), existing, existing::load); // a display name cleared, say
             }
             ItemListener.fireOnUpdated(existing);
             applied.incrementAndGet();
@@ -239,8 +238,7 @@ public final class ItemChangeApplier {
             // reloading the folder loads children which so far exist only in the store; under its lock, as items are
             // reloaded above, so that a save of the folder meanwhile does not store a mix of the two versions
             synchronized (folder) {
-                PersistenceStores.clearRemovedFields(folder.getConfigFile(), folder);
-                folder.load();
+                PersistenceStores.reload(folder.getConfigFile(), folder, folder::load);
             }
             Item created = jenkins.getItemByFullName(fullName);
             if (created == null) {

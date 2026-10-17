@@ -170,6 +170,15 @@ public final class XmlFile {
         return file;
     }
 
+    /**
+     * The local path of this file, without copying the stored content to it (as {@link #getFile} does).
+     * For code that only needs to know which file, or which store key, this is.
+     */
+    @Restricted(NoExternalUse.class)
+    public File getPath() {
+        return file;
+    }
+
     public XStream getXStream() {
         return xs;
     }

@@ -37,6 +37,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import hudson.XmlFile;
 import hudson.init.InitMilestone;
 import hudson.init.Initializer;
+import hudson.model.AbstractItem;
 import hudson.model.FreeStyleProject;
 import hudson.model.Item;
 import hudson.model.Items;
@@ -63,7 +64,21 @@ import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 class ItemChangeApplierTest {
 
     static final InMemoryPersistenceStore STORE = new InMemoryPersistenceStore(
-            key -> key.startsWith("jobs/") && key.endsWith("/config.xml") && !key.contains("/builds/"));
+            key -> key.startsWith("jobs/") && key.endsWith("/config.xml") && !key.contains("/builds/")) {
+        @Override
+        public Entry read(String key) {
+            Runnable r = beforeLoading;
+            if (r != null && StackWalker.getInstance().walk(s -> s.anyMatch(f -> f.getMethodName().equals("load")
+                    && f.getClassName().equals(AbstractItem.class.getName())))) {
+                beforeLoading = null;
+                r.run();
+            }
+            return super.read(key);
+        }
+    };
+
+    /** While set, run once as an item is next loaded here, just before its file is read. */
+    static volatile Runnable beforeLoading;
 
     private JenkinsRule r;
     private PersistenceStore other;
@@ -314,6 +329,27 @@ class ItemChangeApplierTest {
         other.write("jobs/named/config.xml", project("display name cleared elsewhere"), PersistenceStore.ANY);
         awaitApplied();
         assertEquals("display name cleared elsewhere", p.getDescription());
+        assertNull(p.getDisplayNameOrNull());
+    }
+
+    @Test
+    void aFieldRemovedByAVersionStoredWhileReloadingIsCleared() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("twice");
+        p.setDisplayName("Shown");
+        // the version stored next keeps the display name; the one after it, stored between the read finding what that
+        // version removed and the read loading it, has it removed
+        beforeLoading = () -> {
+            try {
+                other.write("jobs/twice/config.xml", project("second"), PersistenceStore.ANY);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        };
+        other.write("jobs/twice/config.xml", ("<?xml version='1.1' encoding='UTF-8'?><project><description>first</description>"
+                + "<displayName>Shown</displayName></project>").getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        awaitApplied();
+        assertNull(beforeLoading);
+        assertEquals("second", p.getDescription());
         assertNull(p.getDisplayNameOrNull());
     }
 
