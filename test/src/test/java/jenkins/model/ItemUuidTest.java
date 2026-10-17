@@ -81,6 +81,13 @@ class ItemUuidTest {
         assertNotEquals(src.getItemUuid(), imported.getItemUuid());
         assertSame(src, ItemUuids.get(src.getItemUuid()));
         assertSame(imported, ItemUuids.get(imported.getItemUuid()));
+        // nor keeps an identity not known here: another controller may have been given the same configuration
+        String unknown = UUID.randomUUID().toString();
+        FreeStyleProject posted = (FreeStyleProject) r.jenkins.createProjectFromXML("posted",
+                new ByteArrayInputStream(("<project><itemUuid>" + unknown + "</itemUuid></project>").getBytes(StandardCharsets.UTF_8)));
+        assertNotEquals(unknown, posted.getItemUuid());
+        assertThat(posted.getConfigFile().asString(), not(containsString(unknown)));
+        assertSame(posted, ItemUuids.get(posted.getItemUuid()));
     }
 
     @Test

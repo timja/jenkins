@@ -606,7 +606,7 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
 
     /**
      * An identity of this item that renames and moves do not change, unlike {@link #getFullName}: a UUID, kept in its
-     * configuration. A new item gets a random one, as does a copy; an item saved before items had one gets one derived
+     * configuration. A new item gets a random one, as do a copy and an item created from posted configuration; an item saved before items had one gets one derived
      * from its full name when first loaded.
      *
      * @since TODO
