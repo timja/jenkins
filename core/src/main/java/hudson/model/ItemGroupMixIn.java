@@ -39,7 +39,12 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.xml.transform.TransformerException;
@@ -108,7 +113,29 @@ public abstract class ItemGroupMixIn {
             throw new UncheckedIOException(e);
         }
 
-        File[] subdirs = modulesDir.listFiles(File::isDirectory);
+        List<File> subdirs = new ArrayList<>(Arrays.asList(modulesDir.listFiles(File::isDirectory)));
+        Set<String> listed = new HashSet<>();
+        subdirs.forEach(d -> listed.add(d.getName()));
+        // items which so far exist only in a persistence store
+        Set<String> stored;
+        try {
+            stored = PersistenceStores.storedItemNames(modulesDir, listed); // those listed here are loaded anyway
+        } catch (IOException e) {
+            Logger.getLogger(ItemGroupMixIn.class.getName()).log(Level.WARNING, "could not list stored items of " + modulesDir, e);
+            stored = Set.of();
+        }
+        for (String name : stored) {
+            File subdir = new File(modulesDir, name);
+            if (!listed.contains(name)) {
+                try {
+                    Util.createDirectories(subdir.toPath());
+                    subdirs.add(subdir);
+                } catch (IOException e) {
+                    // one item which cannot be made here does not keep the others from loading
+                    Logger.getLogger(ItemGroupMixIn.class.getName()).log(Level.WARNING, "could not make a directory for stored item " + subdir, e);
+                }
+            }
+        }
         CopyOnWriteMap.Tree<K, V> configurations = new CopyOnWriteMap.Tree<>();
         for (File subdir : subdirs) {
             try {

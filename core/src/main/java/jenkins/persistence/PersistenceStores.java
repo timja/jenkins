@@ -32,6 +32,8 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
@@ -156,6 +158,52 @@ public final class PersistenceStores {
             return null;
         }
         return root.relativize(path).toString().replace(File.separatorChar, '/');
+    }
+
+    /**
+     * Names of the items stored below a directory which holds one subdirectory per item,
+     * such as {@code JENKINS_HOME/jobs} or a folder's {@code jobs} directory.
+     * Use in addition to listing the directory itself: on a fresh controller, items may exist only in the store.
+     *
+     * @return names whose {@code config.xml} the store holds; empty if no store is active
+     */
+    @NonNull
+    public static Set<String> storedItemNames(@NonNull File itemsDir) throws IOException {
+        return storedItemNames(itemsDir, Set.of());
+    }
+
+    /**
+     * As {@link #storedItemNames(File)}, but leaving out names the caller has already (listed locally, say): those
+     * are not read, which would take a round trip each for nothing.
+     */
+    @NonNull
+    public static Set<String> storedItemNames(@NonNull File itemsDir, @NonNull Set<String> skip) throws IOException {
+        PersistenceStore store = get();
+        String parent = store == null ? null : keyFor(itemsDir);
+        Set<String> names = new TreeSet<>();
+        if (parent != null) {
+            for (String name : store.children(parent)) {
+                if (skip.contains(name)) {
+                    continue;
+                }
+                String config = parent + "/" + name + "/config.xml";
+                // children() also names directories with only deeper keys left (e.g. a deleted item's sub-items): an
+                // item is there only if its configuration is
+                if (!store.owns(config)) {
+                    continue;
+                }
+                try {
+                    if (store.read(config) != null) {
+                        names.add(name);
+                    }
+                } catch (IOException | RuntimeException e) {
+                    // one entry which cannot be read does not hide the others: loading it reports its own failure
+                    LOGGER.log(Level.WARNING, "Failed to read " + config + "; listing it as an item anyway", e);
+                    names.add(name);
+                }
+            }
+        }
+        return names;
     }
 
     /**
