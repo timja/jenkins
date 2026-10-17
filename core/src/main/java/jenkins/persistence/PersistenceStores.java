@@ -284,8 +284,14 @@ public final class PersistenceStores {
      * Moves the stored entries (and blobs) below one directory to another, as when an item is renamed or moved.
      * Does nothing if no store is active or the directories are outside {@code JENKINS_HOME}.
      *
-     * @throws ConflictException if something is already stored at the destination, or the item's configuration is no
-     *     longer stored at the source (moved or deleted elsewhere)
+     * <p>The source and destination are claimed first, which excludes other moves of, to, into or out of them, on any
+     * controller. It does not exclude an item created at the destination while the move runs: should that item complete a
+     * build before the move fails (on finding it there), its snapshots can be overwritten by the moved ones, or moved back
+     * to the source with them.
+     *
+     * @throws ConflictException if something is already stored at the destination, the item's configuration is no
+     *     longer stored at the source (moved or deleted elsewhere), or another move holds either, or what holds them
+     *     (a folder being moved), or something in the source
      */
     public static void move(@NonNull File from, @NonNull File to) throws IOException {
         PersistenceStore store = get();
@@ -303,11 +309,13 @@ public final class PersistenceStores {
         }
         // the destination is claimed first, so that no other move to it (on any controller) runs between checking it
         // and moving there: blobs, moved before the entries, cannot be atomic with that check. The source too, so that
-        // two controllers moving the same item to two places do not split its blobs and entries between them
+        // two controllers moving the same item to two places do not split its blobs and entries between them. Moves of
+        // a folder and of something in it claim different keys: each looks for the other's claim once it holds its own
         long claim = claim(store, toKey, fromKey);
         try {
             long sourceClaim = claim(store, fromKey, fromKey);
             try {
+                checkNoOverlappingMove(store, fromKey, toKey);
                 moveClaimed(store, fromKey, toKey);
             } finally {
                 release(store, fromKey, sourceClaim);
@@ -331,6 +339,55 @@ public final class PersistenceStores {
     /** A claim this old was left by a move that never finished (its controller died): it may be taken over. */
     static final long CLAIM_LAPSE_MILLIS = TimeUnit.MINUTES.toMillis(10);
 
+    /**
+     * Fails if another move holds a claim on what holds either key (a folder being moved), or on something below the
+     * source (an item in the folder being moved). Each move looks only once it holds its own claims, so of two such
+     * moves at least one sees the other.
+     */
+    private static void checkNoOverlappingMove(PersistenceStore store, String fromKey, String toKey) throws IOException {
+        Set<String> ancestors = new TreeSet<>();
+        for (String key : List.of(fromKey, toKey)) {
+            for (int i = key.indexOf('/'); i > 0; i = key.indexOf('/', i + 1)) {
+                ancestors.add(key.substring(0, i));
+            }
+        }
+        for (String ancestor : ancestors) {
+            checkNotClaimed(store, ancestor + MOVING);
+        }
+        checkNothingClaimedBelow(store, fromKey);
+    }
+
+    private static void checkNothingClaimedBelow(PersistenceStore store, String prefix) throws IOException {
+        Set<String> children = store.children(prefix);
+        boolean item = children.contains("config.xml");
+        for (String child : children) {
+            if (child.endsWith(MOVING)) {
+                checkNotClaimed(store, prefix + "/" + child);
+            } else if (!(item && child.equals("builds"))) { // build records hold no items
+                checkNothingClaimedBelow(store, prefix + "/" + child);
+            }
+        }
+    }
+
+    private static void checkNotClaimed(PersistenceStore store, String claimKey) throws IOException {
+        PersistenceStore.Entry held = store.read(claimKey);
+        if (held != null && !lapsed(held)) {
+            throw new ConflictException(claimKey, PersistenceStore.ABSENT, held.version()); // another move overlaps this one
+        }
+    }
+
+    /** Whether a claim was left by a move that never finished (its controller died), and may be taken over. */
+    private static boolean lapsed(PersistenceStore.Entry held) {
+        String[] parts = new String(held.content(), StandardCharsets.UTF_8).split(" ", 2);
+        long since;
+        try {
+            since = Long.parseLong(parts[0]);
+        } catch (NumberFormatException x) {
+            since = 0;
+        }
+        return System.currentTimeMillis() - since >= CLAIM_LAPSE_MILLIS;
+    }
+
     /** Claims a destination (or source) for a move, with a create-only write; returns the claim's version. */
     private static long claim(PersistenceStore store, String toKey, String fromKey) throws IOException {
         byte[] claim = (System.currentTimeMillis() + " " + store.getOrigin() + " " + fromKey).getBytes(StandardCharsets.UTF_8);
@@ -342,17 +399,10 @@ public final class PersistenceStores {
                 if (held == null) {
                     continue; // released meanwhile
                 }
-                String[] parts = new String(held.content(), StandardCharsets.UTF_8).split(" ", 2);
-                long since;
-                try {
-                    since = Long.parseLong(parts[0]);
-                } catch (NumberFormatException x) {
-                    since = 0;
-                }
-                if (System.currentTimeMillis() - since < CLAIM_LAPSE_MILLIS) {
+                if (!lapsed(held)) {
                     throw new ConflictException(toKey, PersistenceStore.ABSENT, held.version()); // another move goes there now
                 }
-                LOGGER.warning(() -> "Taking over a lapsed claim on " + toKey + " (" + parts[parts.length - 1] + ")");
+                LOGGER.warning(() -> "Taking over a lapsed claim on " + toKey + " (" + new String(held.content(), StandardCharsets.UTF_8) + ")");
                 try {
                     store.delete(toKey + MOVING, held.version());
                 } catch (ConflictException x) {

@@ -67,6 +67,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.jvnet.hudson.test.JenkinsRule;
+import org.jvnet.hudson.test.MockFolder;
 import org.jvnet.hudson.test.TestBuilder;
 import org.jvnet.hudson.test.TestExtension;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
@@ -336,6 +337,31 @@ class BuildRecordsTest {
         assertThat(BLOBS.keys(), contains("jobs/contested/builds/1/files.tgz"));
         assertNull(STORE.read("jobs/mine.moving"), "the destination's claim is released");
         assertNotNull(STORE.read("jobs/contested.moving"), "the other claim is left alone");
+    }
+
+    @Test
+    void movesOfAFolderAndOfAnItemInItExcludeEachOther() throws Exception {
+        MockFolder f = r.createFolder("outer");
+        FreeStyleProject p = f.createProject(FreeStyleProject.class, "inner");
+        PersistenceStore other = STORE.as("other");
+        // another controller is renaming the folder right now
+        other.write("jobs/outer.moving", (System.currentTimeMillis() + " other jobs/outer").getBytes(StandardCharsets.UTF_8),
+                PersistenceStore.ABSENT);
+        assertThrows(ConflictException.class, () -> p.renameTo("inner2"));
+        assertEquals("inner", p.getName());
+        assertNull(STORE.read("jobs/outer/jobs/inner2.moving"), "the claims are released");
+        assertNull(STORE.read("jobs/outer/jobs/inner.moving"));
+        STORE.delete("jobs/outer.moving", PersistenceStore.ANY);
+        // another controller is renaming the job in it right now
+        other.write("jobs/outer/jobs/inner.moving", (System.currentTimeMillis() + " other jobs/outer/jobs/inner").getBytes(StandardCharsets.UTF_8),
+                PersistenceStore.ABSENT);
+        assertThrows(ConflictException.class, () -> f.renameTo("outer2"));
+        assertEquals("outer", f.getName());
+        assertNotNull(STORE.read("jobs/outer/jobs/inner/config.xml"), "nothing moved");
+        STORE.delete("jobs/outer/jobs/inner.moving", PersistenceStore.ANY);
+
+        f.renameTo("outer2");
+        assertNotNull(STORE.read("jobs/outer2/jobs/inner/config.xml"));
     }
 
     @Test
