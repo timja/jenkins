@@ -51,18 +51,22 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Stream;
@@ -213,6 +217,19 @@ public final class BuildRecords {
             return;
         }
         String base = builds + "/" + run.getNumber();
+        synchronized (deleted) {
+            publishing.merge(base, 1, Integer::sum);
+        }
+        try {
+            publish(run, base);
+        } finally {
+            synchronized (deleted) {
+                publishing.computeIfPresent(base, (k, n) -> n == 1 ? null : n - 1);
+            }
+        }
+    }
+
+    private static void publish(Run<?, ?> run, String base) throws IOException {
         File dir = run.getRootDir();
         Path record = new File(dir, RECORD).toPath();
         if (!Files.isRegularFile(record)) {
@@ -252,16 +269,35 @@ public final class BuildRecords {
                 blobs.move(base + "/" + upload, base + "/" + SNAPSHOT);
             }
         }
-        byte[] published = Files.readAllBytes(record);
-        publishRecord(lease, base + "/" + RECORD, published);
-        // a save made while publishing found no record yet, so republish left it to this: include it
-        for (int i = 0; i < 10; i++) {
-            byte[] now = Files.readAllBytes(record);
-            if (Arrays.equals(now, published)) {
-                break;
+        if (isDeleted(base, run)) {
+            discardSnapshot(base);
+            LOGGER.fine(() -> "Not publishing " + run + ": deleted while being published");
+            return;
+        }
+        try {
+            byte[] published = Files.readAllBytes(record);
+            publishRecord(lease, base + "/" + RECORD, published);
+            // a save made while publishing found no record yet, so republish left it to this: include it
+            for (int i = 0; i < 10; i++) {
+                byte[] now = Files.readAllBytes(record);
+                if (Arrays.equals(now, published)) {
+                    break;
+                }
+                publishRecord(lease, base + "/" + RECORD, now);
+                published = now;
             }
-            publishRecord(lease, base + "/" + RECORD, now);
-            published = now;
+        } catch (NoSuchFileException e) {
+            if (!isDeleted(base, run)) {
+                throw e;
+            } // else its directory went with it: unpublished below
+        }
+        // checked once every write is done: deleted while we wrote it (a build discarder runs as soon as builds
+        // complete), its deletion removed what was written before, and this removes what was written after
+        if (isDeleted(base, run)) {
+            PersistenceStores.get().delete(base + "/" + RECORD, PersistenceStore.ANY);
+            discardSnapshot(base);
+            LOGGER.fine(() -> "Unpublished " + run + ": deleted while being published");
+            return;
         }
         LOGGER.fine(() -> "Published " + run);
     }
@@ -272,6 +308,52 @@ public final class BuildRecords {
             seen(key, PersistenceStores.get().write(key, content, PersistenceStore.ANY));
         } else {
             seen(key, PersistenceStores.get().writeIfHeld(lease.getKey(), lease.getEpoch(), key, content, PersistenceStore.ANY));
+        }
+    }
+
+    /**
+     * Builds deleted here, by key, with when, so that a publication still in progress does not bring them back. Kept for
+     * {@link #DELETED_MILLIS} rather than up to a count: however many builds are deleted meanwhile (a discarder sweeping
+     * a big job), a publication stalled in its upload still finds its build's marker. A marker applies only to a build
+     * that started before it: a job made again under the name (its next build number moved away with a rename) can
+     * have a build of that number again, which is not the one deleted. The marker of a build being published is kept
+     * however old, until a later deletion after the publication: one stalled for longer still finds it.
+     */
+    private static final LinkedHashMap<String, Long> deleted = new LinkedHashMap<>();
+
+    /** Publications in progress, by build key: how many. Guarded by {@link #deleted}. */
+    private static final Map<String, Integer> publishing = new HashMap<>();
+
+    static /* non-final for tests */ long DELETED_MILLIS = TimeUnit.HOURS.toMillis(1);
+
+    private static boolean isDeleted(String base, Run<?, ?> run) {
+        synchronized (deleted) {
+            Long marked = deleted.get(base);
+            return marked != null && marked >= run.getTimeInMillis();
+        }
+    }
+
+    private static void markDeleted(String base) {
+        long now = System.currentTimeMillis();
+        synchronized (deleted) {
+            deleted.remove(base);
+            deleted.put(base, now);
+            for (var it = deleted.entrySet().iterator(); it.hasNext(); ) {
+                var marker = it.next();
+                if (marker.getValue() >= now - DELETED_MILLIS) {
+                    break; // in the order marked: the rest are newer
+                }
+                if (!publishing.containsKey(marker.getKey())) {
+                    it.remove();
+                }
+            }
+        }
+    }
+
+    private static void discardSnapshot(String base) throws IOException {
+        BlobStore blobs = PersistenceStores.getBlobStore();
+        if (blobs != null) {
+            blobs.delete(base);
         }
     }
 
@@ -316,6 +398,7 @@ public final class BuildRecords {
             return;
         }
         String base = builds + "/" + run.getNumber();
+        markDeleted(base);
         PersistenceStores.get().delete(base + "/" + RECORD, PersistenceStore.ANY);
         seen(base + "/" + RECORD, PersistenceStore.ABSENT);
         BlobStore blobs = PersistenceStores.getBlobStore();

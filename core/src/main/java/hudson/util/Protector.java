@@ -35,12 +35,17 @@ import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
 import javax.crypto.SecretKey;
 import javax.crypto.spec.IvParameterSpec;
+import jenkins.persistence.PersistenceStore;
+import jenkins.persistence.PersistenceStores;
+import jenkins.security.CryptoConfidentialKey;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 
 /**
  * Encrypt/decrypt data by using a "session" key that only lasts for
  * the duration of the server instance.
+ * With controllers sharing confidential keys through a {@link PersistenceStore}, a key they all have instead, so that
+ * what one protected (a form's hidden field, say) is read by whichever one the form is submitted to.
  *
  * @author Kohsuke Kawaguchi
  * @since 1.162 and restricted since 2.236
@@ -57,8 +62,7 @@ public class Protector {
         try {
             final byte[] iv = new byte[IV_BYTES];
             SR.nextBytes(iv);
-            Cipher cipher = Secret.getCipher(ALGORITHM_MODE);
-            cipher.init(Cipher.ENCRYPT_MODE, KEY, new IvParameterSpec(iv));
+            Cipher cipher = cipher(Cipher.ENCRYPT_MODE, iv);
             final byte[] encrypted = cipher.doFinal((secret + MAGIC).getBytes(StandardCharsets.UTF_8));
             byte[] result = new byte[iv.length + encrypted.length];
             System.arraycopy(iv, 0, result, 0, iv.length);
@@ -80,8 +84,7 @@ public class Protector {
             final byte[] value = Base64.getDecoder().decode(data.getBytes(StandardCharsets.UTF_8));
             final byte[] iv = Arrays.copyOfRange(value, 0, IV_BYTES);
             final byte[] encrypted = Arrays.copyOfRange(value, IV_BYTES, value.length);
-            Cipher cipher = Secret.getCipher(ALGORITHM_MODE);
-            cipher.init(Cipher.DECRYPT_MODE, KEY, new IvParameterSpec(iv));
+            Cipher cipher = cipher(Cipher.DECRYPT_MODE, iv);
             String plainText = new String(cipher.doFinal(encrypted), StandardCharsets.UTF_8);
             if (plainText.endsWith(MAGIC)) {
                 return plainText.substring(0, plainText.length() - MAGIC.length());
@@ -92,7 +95,19 @@ public class Protector {
         }
     }
 
+    private static Cipher cipher(int mode, byte[] iv) throws GeneralSecurityException {
+        PersistenceStore store = PersistenceStores.get();
+        if (store != null && store.storesConfidentialKeys()) {
+            return mode == Cipher.ENCRYPT_MODE ? SHARED_KEY.encrypt(iv) : SHARED_KEY.decrypt(iv);
+        }
+        Cipher cipher = Secret.getCipher(ALGORITHM_MODE);
+        cipher.init(mode, KEY, new IvParameterSpec(iv));
+        return cipher;
+    }
+
     private static final SecretKey KEY;
+
+    private static final CryptoConfidentialKey SHARED_KEY = new CryptoConfidentialKey(Protector.class, "shared");
 
     private static final SecureRandom SR = new SecureRandom();
 
