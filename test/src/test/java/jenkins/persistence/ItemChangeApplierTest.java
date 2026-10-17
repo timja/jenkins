@@ -371,6 +371,25 @@ class ItemChangeApplierTest {
         assertEquals("child changed before the move", x.getDescription());
     }
 
+    @Test
+    void aMoveIntoAFolderRenamedElsewhereSinceLeavesNoCopyBehind() throws Exception {
+        byte[] folderXml = Items.getConfigFile(r.createFolder("template5")).readRawBytes();
+        r.createFreeStyleProject("j5");
+        pauseApplier();
+        try {
+            other.write("jobs/f5/config.xml", folderXml, PersistenceStore.ABSENT);
+            other.move("jobs/j5", "jobs/f5/jobs/j5");
+            other.move("jobs/f5", "jobs/g5");
+        } finally {
+            resumeApplier();
+        }
+        awaitApplied();
+        assertNull(r.jenkins.getItem("j5"));
+        assertFalse(new File(r.jenkins.getRootDir(), "jobs/j5").exists());
+        assertNull(r.jenkins.getItem("f5"));
+        assertNotNull(r.jenkins.getItemByFullName("g5/j5", FreeStyleProject.class));
+    }
+
     /** While set, the first save of item "race" changes it elsewhere and waits for the applier to try adding it. */
     static volatile boolean racing;
 
