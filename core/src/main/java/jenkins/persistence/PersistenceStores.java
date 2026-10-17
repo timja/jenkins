@@ -169,11 +169,23 @@ public final class PersistenceStores {
      */
     @NonNull
     public static Set<String> storedItemNames(@NonNull File itemsDir) throws IOException {
+        return storedItemNames(itemsDir, Set.of());
+    }
+
+    /**
+     * As {@link #storedItemNames(File)}, but leaving out names the caller has already (listed locally, say): those
+     * are not read, which would take a round trip each for nothing.
+     */
+    @NonNull
+    public static Set<String> storedItemNames(@NonNull File itemsDir, @NonNull Set<String> skip) throws IOException {
         PersistenceStore store = get();
         String parent = store == null ? null : keyFor(itemsDir);
         Set<String> names = new TreeSet<>();
         if (parent != null) {
             for (String name : store.children(parent)) {
+                if (skip.contains(name)) {
+                    continue;
+                }
                 String config = parent + "/" + name + "/config.xml";
                 // children() also names directories with only deeper keys left (e.g. a deleted item's sub-items): an
                 // item is there only if its configuration is

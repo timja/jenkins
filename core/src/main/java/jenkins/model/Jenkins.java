@@ -3430,6 +3430,20 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
         }
     }
 
+    /** Loads an item found only in the persistence store; one which fails to load does not stop the others. */
+    private void loadStoredItem(File projectsDir, String name, Set<String> loadedNames) {
+        File subdir = new File(projectsDir, name);
+        try {
+            Util.createDirectories(subdir.toPath());
+            TopLevelItem item = (TopLevelItem) Items.load(Jenkins.this, subdir);
+            items.put(item.getName(), item);
+            loadedNames.add(item.getName());
+        } catch (IOException | RuntimeException | LinkageError e) {
+            // as with one task per item (a missing plugin class, say)
+            LOGGER.log(Level.WARNING, "Failed to load item " + name + " from the persistence store", e);
+        }
+    }
+
     private synchronized TaskBuilder loadTasks() throws IOException {
         File projectsDir = new File(root, "jobs");
         if (!projectsDir.getCanonicalFile().isDirectory() && !projectsDir.mkdirs()) {
@@ -3473,20 +3487,25 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
             for (File subdir : subdirs) {
                 local.add(subdir.getName());
             }
-            for (String name : PersistenceStores.storedItemNames(projectsDir)) {
-                if (local.contains(name)) {
-                    continue; // loaded by its own task
+            // the locally listed ones are loaded by their own tasks: not even read here
+            Set<String> storeOnly = PersistenceStores.storedItemNames(projectsDir, local);
+            if (!PARALLEL_LOAD || storeOnly.size() < 2) {
+                for (String name : storeOnly) {
+                    loadStoredItem(projectsDir, name, loadedNames);
                 }
-                File subdir = new File(projectsDir, name);
-                try {
-                    Util.createDirectories(subdir.toPath());
-                    TopLevelItem item = (TopLevelItem) Items.load(Jenkins.this, subdir);
-                    items.put(item.getName(), item);
-                    loadedNames.add(item.getName());
-                } catch (IOException | RuntimeException | LinkageError e) {
-                    // as with one task per item, one which fails to load (a missing plugin class, say) does not stop the others
-                    LOGGER.log(Level.WARNING, "Failed to load item " + name + " from the persistence store", e);
-                }
+                return;
+            }
+            // in parallel, as items with a local directory are (a fresh controller has none), all loaded before this ends
+            List<Future<?>> loads = new ArrayList<>();
+            for (String name : storeOnly) {
+                loads.add(threadPoolForLoad.submit(() -> {
+                    try (ACLContext ctx = ACL.as2(ACL.SYSTEM2)) {
+                        loadStoredItem(projectsDir, name, loadedNames);
+                    }
+                }));
+            }
+            for (Future<?> load : loads) {
+                load.get();
             }
         }));
 
