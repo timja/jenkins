@@ -284,6 +284,8 @@ public final class SharedQueue {
     private static final Set<Long> reconciling = ConcurrentHashMap.newKeySet();
     /** Items with a claim under way. */
     private static final Set<Long> claiming = ConcurrentHashMap.newKeySet();
+    /** Items with a local id which may start here: the store answered, and their job's exclusive lease is held ({@link QueueStartGate#claimLocal}). */
+    private static final Set<Long> readyLocal = ConcurrentHashMap.newKeySet();
 
     /**
      * A few threads: items are shared independently, so one waiting on a slow write does not hold up the others; the
@@ -405,6 +407,11 @@ public final class SharedQueue {
         @Override
         public void onEnterWaiting(Queue.WaitingItem wi) {
             if (PersistenceStores.isApplyingRemoteChange() || !shared(wi.task)) {
+                return;
+            }
+            if (wi.getId() >= Ids.LOCAL_RANGE) {
+                // a local id, taken while the cluster sequence was unreachable: another controller may have taken the
+                // same one, so it is never shared; it stays (and builds) here
                 return;
             }
             // under the queue lock (schedule2): only prepared here, shared by the outbox; it does not start meanwhile
@@ -545,6 +552,7 @@ public final class SharedQueue {
         public void onLeft(Queue.LeftItem li) {
             known.remove(li.getId());
             notClaimed.remove(li.getId());
+            readyLocal.remove(li.getId());
             if (li.isCancelled() && li.task instanceof Job<?, ?> job) {
                 // what a claim here held of its job's exclusive lease (not under the queue lock, which this holds); one
                 // still under way lets go of it when it ends
@@ -951,6 +959,19 @@ public final class SharedQueue {
             }
             // under the queue lock: from what is known only; the store is asked off the lock (claim below)
             long id = item.getId();
+            if (id >= Ids.LOCAL_RANGE) {
+                // a local id, never shared (see Publisher.onEnterWaiting): it builds here, once the store answers (its
+                // build number is taken there, after it has left the queue) and with its job's exclusive lease
+                if (readyLocal.contains(id)) {
+                    return null;
+                }
+                if (claiming.add(id)) {
+                    Job<?, ?> job = (Job<?, ?>) item.task;
+                    claims.submit(() -> claimLocal(job, id));
+                }
+                String why = notClaimed.get(id);
+                return new Blocked(why != null ? why : "Waiting for the persistence store");
+            }
             if (sharing.contains(id)) {
                 return new Blocked("Being shared with the other controllers");
             }
@@ -1043,6 +1064,43 @@ public final class SharedQueue {
                 }
             }
         }
+
+        /**
+         * Off the lock: readies an item with a local id (taken while the store was unreachable) to start here, as a claim
+         * does a shared item: once the store answers, so that its build number can be taken there (failing that once it
+         * has left the queue would lose it), and its job's exclusive lease taken, so that it does not run beside a build
+         * of the job on another controller. The store may still fail between this and the build number being taken.
+         */
+        private static void claimLocal(Job<?, ?> job, long id) {
+            String holder = claimHolder(id);
+            boolean changed = true;
+            try {
+                PersistenceStores.Route route = PersistenceStores.route(new java.io.File(job.getRootDir(), "nextBuildNumber"));
+                if (route != null) {
+                    route.peek(); // whether the store answers
+                }
+                if (!acquireExclusive(job, holder)) {
+                    notClaimed.put(id, "A build is already in progress on another controller");
+                    changed = false; // looked at again at the next maintenance, not at once
+                    return;
+                }
+                notClaimed.remove(id);
+                readyLocal.add(id);
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.FINE, "Cannot ready queue item " + id + " with a local id; not starting it for now", e);
+                notClaimed.put(id, "Waiting for the persistence store");
+                changed = false;
+            } finally {
+                claiming.remove(id);
+                if (leftWhileClaiming.remove(id)) {
+                    readyLocal.remove(id);
+                    releaseExclusive(job, holder); // cancelled meanwhile (Publisher.onLeft): the build will not start
+                }
+                if (changed) {
+                    Queue.getInstance().scheduleMaintenance();
+                }
+            }
+        }
     }
 
     /** Items cancelled here while being claimed, by id: the claim lets go of what it holds once it ends. */
@@ -1076,14 +1134,28 @@ public final class SharedQueue {
             if (cq == null || id <= 0) {
                 return;
             }
+            recordStart(cq, id, run.getNumber(), 0);
+        }
+
+        /**
+         * Marks the item started, retrying while the store is unreachable: an item left claimed would be put back into
+         * the queue (and built again) if this controller later went away (Target 14).
+         */
+        private static void recordStart(ClusterQueue cq, long id, int number, int attempt) {
             try {
                 ClusterQueue.Record r = cq.get(id);
                 if (r != null && origin().equals(r.claimedBy())) {
-                    cq.started(id, run.getNumber());
+                    cq.started(id, number);
                 }
                 Reservations.release(id);
             } catch (IOException | RuntimeException e) {
-                LOGGER.log(Level.WARNING, "Failed to record that " + run + " started", e);
+                if (attempt < 30) {
+                    LOGGER.log(Level.INFO, "Failed to record that queue item " + id + " started; retrying", e);
+                    jenkins.util.Timer.get().schedule(() -> recordStart(cq, id, number, attempt + 1),
+                            Math.min(30, 1L << Math.min(attempt, 5)), java.util.concurrent.TimeUnit.SECONDS);
+                } else {
+                    LOGGER.log(Level.WARNING, "Failed to record that queue item " + id + " started", e);
+                }
             }
         }
     }
@@ -1095,6 +1167,8 @@ public final class SharedQueue {
     @Extension(ordinal = 100)
     public static final class Ids extends QueueIdStrategy {
         private static final QueueIdStrategy LOCAL = new QueueIdStrategy.DefaultStrategy();
+        /** Local ids taken while the cluster sequence is unreachable are offset by this much (2^52). */
+        static final long LOCAL_RANGE = 1L << 52;
         /** The id of the mirror being created. */
         static final ThreadLocal<Long> MIRRORED = new ThreadLocal<>();
 
@@ -1109,7 +1183,10 @@ public final class SharedQueue {
                 try {
                     return nextId(cq);
                 } catch (IOException | RuntimeException e) {
+                    // the store is unreachable: an id from a range the cluster sequence never reaches, so that it
+                    // cannot collide with one handed out elsewhere (Target 14)
                     LOGGER.log(Level.WARNING, "Cannot get a cluster-wide queue id; using a local one", e);
+                    return LOCAL_RANGE + LOCAL.generateIdFor(project, actions);
                 }
             }
             return withoutSharedQueue().generateIdFor(project, actions);

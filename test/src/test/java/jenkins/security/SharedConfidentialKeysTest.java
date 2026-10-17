@@ -26,15 +26,19 @@ package jenkins.security;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
 import hudson.Functions;
 import java.io.File;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.logging.Level;
 import jenkins.persistence.ConflictException;
 import jenkins.persistence.InMemoryPersistenceStore;
@@ -57,6 +61,15 @@ class SharedConfidentialKeysTest {
     static volatile String racing;
     static volatile byte[] theirs;
     static volatile boolean storesKeys = true;
+    /** While set, reading a key from the store fails, as when it is unreachable. */
+    static volatile boolean unreachable;
+    /** A key whose next write is committed, then fails as if its answer was lost. */
+    static volatile String commitThenFail;
+
+    @SuppressWarnings("unchecked")
+    private static <E extends Throwable> RuntimeException sneaky(Throwable t) throws E {
+        throw (E) t; // a checked exception, which the store's read declares, from a method of the test store which does not
+    }
 
     static final InMemoryPersistenceStore STORE = new InMemoryPersistenceStore(key -> false) {
         @Override
@@ -66,6 +79,9 @@ class SharedConfidentialKeysTest {
 
         @Override
         public Entry read(String key) {
+            if (unreachable && key.startsWith("secrets/")) {
+                throw SharedConfidentialKeysTest.<RuntimeException>sneaky(new java.io.IOException("the store is unreachable"));
+            }
             Entry e = super.read(key);
             if (e == null && key.equals(racing)) {
                 racing = null;
@@ -76,6 +92,16 @@ class SharedConfidentialKeysTest {
                 }
             }
             return e;
+        }
+
+        @Override
+        public long write(String key, byte[] content, long expectedVersion) throws ConflictException {
+            long version = super.write(key, content, expectedVersion);
+            if (key.equals(commitThenFail)) {
+                commitThenFail = null;
+                throw SharedConfidentialKeysTest.<RuntimeException>sneaky(new java.io.IOException("the connection broke before the answer came"));
+            }
+            return version;
         }
     };
 
@@ -176,6 +202,98 @@ class SharedConfidentialKeysTest {
             assertEquals(mac, new HMACConfidentialKey("test.shared.k9").mac("x"), "kept locally, as without a store");
         } finally {
             storesKeys = true;
+        }
+    }
+
+    @Test
+    void aTemporaryKeyBecomesTheClustersOnceTheStoreIsBack(JenkinsRule r) throws Exception {
+        String mac;
+        unreachable = true;
+        try {
+            mac = new HMACConfidentialKey("test.shared.k11").mac("x");
+            assertEquals(mac, new HMACConfidentialKey("test.shared.k11").mac("x"), "the same temporary key for every use meanwhile");
+        } finally {
+            unreachable = false;
+        }
+        assertEquals(mac, new HMACConfidentialKey("test.shared.k11").mac("x"), "and after, until it is offered to the store");
+        ((DefaultConfidentialStore) ConfidentialStore.get()).publishTemporary(new HMACConfidentialKey("test.shared.k11")); // as the retry does
+        assertNotNull(STORE.read("secrets/test.shared.k11"), "the cluster's key now");
+        assertEquals(mac, new HMACConfidentialKey("test.shared.k11").mac("x"), "kept locally, so the same after a restart");
+        Files.delete(localFile(r, "test.shared.k11").toPath()); // as another controller, or a fresh home
+        assertEquals(mac, new HMACConfidentialKey("test.shared.k11").mac("x"), "the same from the store");
+    }
+
+    @Test
+    void aTemporaryKeyWhoseOfferWentThroughUnansweredIsKeptLocally(JenkinsRule r) throws Exception {
+        String mac;
+        unreachable = true;
+        try {
+            mac = new HMACConfidentialKey("test.shared.k15").mac("x");
+        } finally {
+            unreachable = false;
+        }
+        DefaultConfidentialStore store = (DefaultConfidentialStore) ConfidentialStore.get();
+        commitThenFail = "secrets/test.shared.k15";
+        assertThrows(java.io.IOException.class, () -> store.publishTemporary(new HMACConfidentialKey("test.shared.k15")));
+        assertNotNull(STORE.read("secrets/test.shared.k15"), "stored, its answer lost");
+        store.publishTemporary(new HMACConfidentialKey("test.shared.k15")); // as the retry does: a conflict, with its own value
+        assertTrue(localFile(r, "test.shared.k15").isFile(), "kept locally");
+        unreachable = true; // another outage
+        try {
+            assertEquals(mac, new HMACConfidentialKey("test.shared.k15").mac("x"), "the same key, not another temporary one");
+        } finally {
+            unreachable = false;
+        }
+    }
+
+    @Test
+    void aTemporaryKeyCreatedElsewhereMeanwhileIsKeptUntilARestart(JenkinsRule r) throws Exception {
+        HMACConfidentialKey first;
+        String mac;
+        unreachable = true;
+        try {
+            first = new HMACConfidentialKey("test.shared.k16");
+            mac = first.mac("x");
+        } finally {
+            unreachable = false;
+        }
+        new HMACConfidentialKey("test.shared.k17").mac("x"); // a key of the same kind, as another controller made k16
+        STORE.as("other-controller").write("secrets/test.shared.k16", STORE.read("secrets/test.shared.k17").content(), PersistenceStore.ABSENT);
+        ((DefaultConfidentialStore) ConfidentialStore.get()).publishTemporary(new HMACConfidentialKey("test.shared.k16"));
+        assertFalse(localFile(r, "test.shared.k16").exists(), "the cluster's value is not taken before a restart");
+        HMACConfidentialKey later = new HMACConfidentialKey("test.shared.k16");
+        assertEquals(mac, later.mac("x"), "a key instance made now agrees with the earlier ones");
+        assertTrue(later.checkMac("x", mac));
+        DefaultConfidentialStore.reconcile(); // as at the next startup
+        assertTrue(localFile(r, "test.shared.k16").isFile(), "the cluster's value from then on");
+    }
+
+    @Test
+    void onlyKeysAreCopiedDownFromTheStoreAndNeverThroughALink(JenkinsRule r, @TempDir Path elsewhere) throws Exception {
+        new HexStringConfidentialKey("test.shared.k12", 32).get();
+        byte[] key = STORE.read("secrets/test.shared.k12").content();
+        PersistenceStore them = STORE.as("other-controller");
+        List<String> notKeys = List.of("..\\escaped", ".hidden", "a b");
+        for (String name : notKeys) {
+            them.write("secrets/" + name, key, PersistenceStore.ABSENT);
+        }
+        them.write("secrets/test.shared.k13", key, PersistenceStore.ABSENT);
+        them.write("secrets/test.shared.k14", key, PersistenceStore.ABSENT);
+        Path target = elsewhere.resolve("written-through-a-link");
+        boolean links = !Functions.isWindows();
+        if (links) {
+            Files.createSymbolicLink(localFile(r, "test.shared.k14").toPath(), target); // dangling
+        }
+
+        DefaultConfidentialStore.reconcile();
+
+        assertArrayEquals(key, Files.readAllBytes(localFile(r, "test.shared.k13").toPath()), "a key is copied down");
+        for (String name : notKeys) {
+            assertFalse(Files.exists(localFile(r, name).toPath(), LinkOption.NOFOLLOW_LINKS), name);
+        }
+        if (links) {
+            assertFalse(Files.exists(target), "nothing written through a link");
+            assertTrue(Files.isSymbolicLink(localFile(r, "test.shared.k14").toPath()), "the link is left alone");
         }
     }
 

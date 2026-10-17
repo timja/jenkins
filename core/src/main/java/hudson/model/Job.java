@@ -313,7 +313,18 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
      */
     public boolean isBuilding() {
         RunT b = getLastBuild();
-        return b != null && b.isBuilding();
+        if (b != null && b.isBuilding()) {
+            return true;
+        }
+        if (jenkins.persistence.BuildRecords.hasUnpublished(this)) {
+            return true; // completed here, but other controllers still see it running until it is published
+        }
+        // or on another controller of a cluster sharing build records (e.g. renames are refused meanwhile, here too);
+        // under the queue lock (blocking on related jobs), from what is cached only: SharedBlocking waits for the rest
+        Jenkins j = Jenkins.getInstanceOrNull();
+        List<jenkins.persistence.RunningBuilds.Placeholder> elsewhere = j != null && j.getQueue().isLockHeldByCurrentThread()
+                ? jenkins.persistence.RunningBuilds.elsewhereCached(this) : jenkins.persistence.RunningBuilds.elsewhere(this);
+        return elsewhere != null && !elsewhere.isEmpty();
     }
 
     /**
@@ -796,6 +807,16 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
     @Exported(name = "builds")
     public RunList<RunT> getNewBuilds() {
         return getBuilds().limit(100);
+    }
+
+    /**
+     * Builds of this job running on other controllers of a cluster sharing its builds, newest first, for the REST API:
+     * a property of their own, so that {@code builds}, {@code allBuilds} and {@code lastBuild} keep their types.
+     */
+    @Exported(name = "buildsElsewhere")
+    @Restricted(NoExternalUse.class)
+    public List<jenkins.persistence.RunningBuilds.RemoteBuild> getBuildsElsewhereForApi() {
+        return jenkins.persistence.RunningBuilds.remoteBuilds(this);
     }
 
     /**

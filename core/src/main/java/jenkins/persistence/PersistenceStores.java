@@ -136,12 +136,24 @@ public final class PersistenceStores {
                     }
                     BlobStore blobs = null;
                     if (store != null) {
-                        for (BlobStoreProvider provider : blobProviders) {
-                            blobs = provider.create();
-                            if (blobs != null) {
-                                LOGGER.info(() -> "Using blob store " + provider.getClass().getName());
-                                break;
+                        try {
+                            for (BlobStoreProvider provider : blobProviders) {
+                                blobs = provider.create();
+                                if (blobs != null) {
+                                    LOGGER.info(() -> "Using blob store " + provider.getClass().getName());
+                                    break;
+                                }
                             }
+                        } catch (RuntimeException e) {
+                            // do not leave the store behind (it may already take part in the cluster as a member)
+                            if (store instanceof AutoCloseable c) {
+                                try {
+                                    c.close();
+                                } catch (Exception x) {
+                                    e.addSuppressed(x);
+                                }
+                            }
+                            throw e;
                         }
                     }
                     resolvedStore = store;
@@ -842,6 +854,34 @@ public final class PersistenceStores {
     }
 
     /**
+     * Reloads an object from an entry of its file read with {@link Route#peek}: {@linkplain #clearRemovedFields clears}
+     * the fields that entry removed, has {@code load} load the object from its content (and nothing else), and only then
+     * records that the object holds that version. If loading fails, the version is not taken as seen, so that the change
+     * is applied again when retried, and a save meanwhile conflicts with it instead of writing over it.
+     *
+     * @param load loads the object from {@code entry}'s content
+     */
+    @Restricted(NoExternalUse.class)
+    public static void reload(@NonNull XmlFile file, @NonNull Object o, @NonNull PersistenceStore.Entry entry, @NonNull ThrowingRunnable<IOException> load) throws IOException {
+        String key = keyFor(file.getPath());
+        if (key != null) {
+            clearRemovedFields(file, o, key, entry.content());
+        }
+        load.run();
+        if (key != null) {
+            loaded(key, entry);
+        }
+    }
+
+    /** Records that this JVM's object now holds an entry read with {@link Route#peek} (as {@link Route#read} does). */
+    @Restricted(NoExternalUse.class)
+    public static void loaded(@NonNull String key, @NonNull PersistenceStore.Entry entry) {
+        seen(key, entry.version());
+        remember(key, entry.version(), entry.content());
+        held(key, entry.content(), true);
+    }
+
+    /**
      * Prepares an object for reloading from its file, changed by another controller: clears the fields the new version
      * no longer has. Loading into a live object leaves alone the fields the file has no element for, and XStream writes
      * no element for a null field, so a value cleared elsewhere (a system message, an administrator address) would
@@ -865,8 +905,13 @@ public final class PersistenceStores {
         if (entry == null) {
             return PersistenceStore.ABSENT;
         }
-        Set<String> kept = topLevelElements(entry.content());
-        Set<String> had = elements.get(route.key());
+        clearRemovedFields(file, o, route.key(), entry.content());
+        return entry.version();
+    }
+
+    private static void clearRemovedFields(XmlFile file, Object o, String key, byte[] content) {
+        Set<String> kept = topLevelElements(content);
+        Set<String> had = elements.get(key);
         XStream xs = file.getXStream();
         for (String element : had == null ? Set.<String>of() : had) {
             if (kept.contains(element)) {
@@ -893,8 +938,7 @@ public final class PersistenceStores {
                 LOGGER.log(Level.FINE, "Could not clear " + f, e);
             }
         }
-        elements.put(route.key(), kept); // what it may hold once cleared; loading adds what it reads then
-        return entry.version();
+        elements.put(key, kept); // what it may hold once cleared; loading adds what it reads then
     }
 
     /**

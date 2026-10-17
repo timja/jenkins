@@ -253,6 +253,20 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
         properties.clear();
     }
 
+    /** As {@link #load()}, from content already read, failing instead of resetting the user if it cannot be loaded. */
+    private void loadFrom(byte[] content) throws IOException {
+        String userId = id;
+        clearExistingProperties();
+        try {
+            XSTREAM.unmarshal(XStream2.getDefaultDriver().createReader(new java.io.ByteArrayInputStream(content)), this);
+        } catch (RuntimeException | Error e) {
+            throw new IOException("Unable to load user " + userId, e);
+        } finally {
+            this.id = userId;
+        }
+        fixUpAfterLoad();
+    }
+
     private XmlFile getConfigFile() {
         return new XmlFile(XSTREAM, new File(getUserFolderFor(id), CONFIG_XML));
     }
@@ -1279,11 +1293,33 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
                 }
             }
         } else if (known != null) {
-            try {
-                PersistenceStores.reload(known.getConfigFile(), known, known::load); // a description cleared, say
-            } catch (IOException e) {
-                LOGGER.log(Level.WARNING, "Failed to read user " + dirName + ", changed elsewhere", e);
-                known.load();
+            // under the user's lock, as save() takes it, so a save never writes a half-reloaded user; and not while a
+            // save of it is pending here: that save conflicts and is merged instead (put off and retried, Target 14)
+            synchronized (known) {
+                if (jenkins.persistence.PersistenceStores.hasUnsavedChanges(known.getConfigFile(), known)) {
+                    throw new IllegalStateException("User " + known.id + " has a save pending; applying the change later");
+                }
+                // load() takes a read failure for "no configuration" and resets the user (its password, tokens) to
+                // defaults: read it once, peeking, and load it from what was read, so that a store unavailable now fails
+                // this change before the user is touched, and its version is taken as seen only once loaded; the retry
+                // then applies it (a version recorded on reading would make the retry skip it, and a save here write
+                // the old user over it)
+                jenkins.persistence.PersistenceStores.Route route = jenkins.persistence.PersistenceStores.route(known.getConfigFile().getPath());
+                try {
+                    if (route == null) {
+                        PersistenceStores.reload(known.getConfigFile(), known, known::load);
+                    } else {
+                        jenkins.persistence.PersistenceStore.Entry entry = route.peek();
+                        if (entry == null) {
+                            return; // deleted meanwhile: that deletion is applied in turn
+                        }
+                        User u = known;
+                        PersistenceStores.reload(known.getConfigFile(), known, entry, () -> u.loadFrom(entry.content())); // a description cleared, say
+                    }
+                } catch (IOException e) {
+                    throw new java.io.UncheckedIOException("Cannot read user " + known.id + " changed elsewhere; applying the change later", e);
+                }
+                jenkins.persistence.PersistenceStores.synced(known.getConfigFile(), known);
             }
         } else {
             XmlFile xml = new XmlFile(XSTREAM, new File(new File(getUsersDirectory(), dirName), CONFIG_XML));
@@ -1298,7 +1334,8 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
                     }
                 }
             } catch (IOException e) {
-                LOGGER.log(Level.WARNING, "Failed to load " + xml, e);
+                // retried by the applier: dropping it would leave the user missing here until it changes again
+                throw new java.io.UncheckedIOException("Failed to load " + xml + ", made elsewhere", e);
             }
         }
         UserDetailsCache.get().invalidateAll();

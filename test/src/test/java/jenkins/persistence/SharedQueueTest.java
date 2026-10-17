@@ -92,6 +92,15 @@ class SharedQueueTest {
         }
 
         @Override
+        public Entry read(String key) {
+            java.util.function.Predicate<String> fail = failReads;
+            if (fail != null && fail.test(key)) {
+                throw new java.io.UncheckedIOException(new java.io.IOException("the store is unreachable, for now"));
+            }
+            return super.read(key);
+        }
+
+        @Override
         public void delete(String key, long expectedVersion) throws ConflictException {
             java.util.concurrent.CountDownLatch l = slowRelease;
             if (l != null && key.startsWith("queue/reserved/")) {
@@ -104,6 +113,9 @@ class SharedQueueTest {
             super.delete(key, expectedVersion);
         }
     };
+
+    /** While set, reads of the keys it matches fail, as when the store is unreachable. */
+    static volatile java.util.function.Predicate<String> failReads;
 
     /** The controllers known to be alive, or null if that is not known. */
     static volatile Set<String> live;
@@ -225,6 +237,7 @@ class SharedQueueTest {
     @BeforeEach
     void setUp(JenkinsRule rule) {
         r = rule;
+        failReads = null;
         other = STORE.as("other-controller").clusterQueue();
     }
 
@@ -777,6 +790,70 @@ class SharedQueueTest {
         }
         assertNotNull(Queue.getInstance().getLocalItem(rec.id()), "mirrored once the job is here");
         other.cancel(rec.id()); // the store outlives this test
+    }
+
+    @Test
+    void anItemWithALocalIdBuildsHereUnshared() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("local-id");
+        // as when the cluster sequence was unreachable: an id from the local range, which another controller may have too
+        SharedQueue.Ids.MIRRORED.set(SharedQueue.Ids.LOCAL_RANGE + 7);
+        QueueTaskFuture<FreeStyleBuild> f;
+        try {
+            f = p.scheduleBuild2(0);
+        } finally {
+            SharedQueue.Ids.MIRRORED.remove();
+        }
+        r.assertBuildStatusSuccess(f);
+        assertEquals(SharedQueue.Ids.LOCAL_RANGE + 7, p.getLastBuild().getQueueId());
+        assertNull(STORE.clusterQueue().get(SharedQueue.Ids.LOCAL_RANGE + 7), "never shared");
+    }
+
+    /** Waits for the queue item of a job to be blocked for a reason, and checks that it has not started. */
+    private static void awaitBlocked(FreeStyleProject p, String why) throws Exception {
+        Queue.Item item = Queue.getInstance().getItem(p);
+        for (int i = 0; i < 300 && (item == null || !why.equals(item.getWhy())); i++) {
+            Thread.sleep(50);
+            item = Queue.getInstance().getItem(p);
+        }
+        assertNotNull(item, "still queued");
+        assertEquals(why, item.getWhy());
+        assertNull(p.getLastBuild(), "not started");
+    }
+
+    @Test
+    void anItemWithALocalIdWaitsWhileTheStoreIsUnreachable() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("local-id-outage");
+        // its build number would be taken from the store once it has left the queue, and fail: the request lost
+        failReads = k -> k.equals("jobs/local-id-outage/nextBuildNumber");
+        SharedQueue.Ids.MIRRORED.set(SharedQueue.Ids.LOCAL_RANGE + 11);
+        QueueTaskFuture<FreeStyleBuild> f;
+        try {
+            f = p.scheduleBuild2(0);
+        } finally {
+            SharedQueue.Ids.MIRRORED.remove();
+        }
+        awaitBlocked(p, "Waiting for the persistence store");
+        failReads = null;
+        r.assertBuildStatusSuccess(f);
+        assertEquals(1, p.getBuilds().size());
+    }
+
+    @Test
+    void anItemWithALocalIdWaitsWhileItsJobBuildsElsewhere() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("local-id-serial");
+        String lease = "jobs/local-id-serial/running/exclusive";
+        PersistenceStore elsewhere = STORE.as("other-controller");
+        long epoch = elsewhere.leases().acquire(lease); // a build of the job runs there
+        SharedQueue.Ids.MIRRORED.set(SharedQueue.Ids.LOCAL_RANGE + 12);
+        QueueTaskFuture<FreeStyleBuild> f;
+        try {
+            f = p.scheduleBuild2(0);
+        } finally {
+            SharedQueue.Ids.MIRRORED.remove();
+        }
+        awaitBlocked(p, "A build is already in progress on another controller");
+        elsewhere.leases().release(lease, epoch);
+        r.assertBuildStatusSuccess(f);
     }
 
     @Test

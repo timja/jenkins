@@ -27,6 +27,7 @@ package jenkins.persistence;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.greaterThan;
+import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -337,7 +338,9 @@ class ClusterCoordinationTest {
         Thread.sleep(6_000);
         assertNull(down.getLastBuild());
         Queue.Item item = Queue.getInstance().getItems()[0];
-        assertThat(item.getWhy(), containsString("Upstream project up is building on jenkins-b"));
+        // core's own check now sees the build running elsewhere (Job.isBuilding), before SharedBlocking's
+        assertThat(item.getWhy(), org.hamcrest.Matchers.anyOf(containsString("Upstream project up is building on jenkins-b"),
+                containsString("Upstream project ‘up’ is already building")));
 
         other.delete("jobs/up/running/1.xml", PersistenceStore.ANY);
         awaitApplied();
@@ -366,11 +369,13 @@ class ClusterCoordinationTest {
 
             slow.countDown();
             Queue.Item item = Queue.getInstance().getItems()[0];
-            for (int i = 0; i < 100 && !item.getWhy().contains("is building on jenkins-b"); i++) {
+            for (int i = 0; i < 100 && item.getWhy().contains("Checking"); i++) {
                 Thread.sleep(100);
                 item = Queue.getInstance().getItems()[0];
             }
-            assertThat(item.getWhy(), containsString("Upstream project slowup is building on jenkins-b"));
+            // said by AbstractProject (a job building elsewhere is building) or SharedBlocking, whichever looks first
+            assertThat(item.getWhy(), containsString("slowup"));
+            assertThat(item.getWhy(), not(containsString("Checking")));
             assertNull(down.getLastBuild());
 
             other.delete("jobs/slowup/running/1.xml", PersistenceStore.ANY);

@@ -299,7 +299,8 @@ public final class RunningBuilds {
                 }
             }
         } catch (IOException e) {
-            LOGGER.log(Level.WARNING, "Could not list running builds below " + runningKey, e);
+            // not cached: the next call asks the store again (Target 14)
+            throw new java.io.UncheckedIOException(e);
         }
         placeholders.sort(Comparator.comparingInt(Placeholder::getNumber).reversed());
         return List.copyOf(placeholders);
@@ -313,7 +314,12 @@ public final class RunningBuilds {
             return List.of();
         }
         String jobKey = runningKey.substring(0, runningKey.length() - PREFIX.length() - 1);
-        return cache.computeIfAbsent(jobKey, k -> load(store, runningKey));
+        try {
+            return cache.computeIfAbsent(jobKey, k -> load(store, runningKey));
+        } catch (java.io.UncheckedIOException e) {
+            LOGGER.log(Level.FINE, "Could not list running builds below " + runningKey, e.getCause());
+            return List.of();
+        }
     }
 
     /**
@@ -333,7 +339,8 @@ public final class RunningBuilds {
      * nothing is. The job's placeholders are then loaded off the lock, and the queue looked at again.
      */
     @CheckForNull
-    static List<Placeholder> elsewhereCached(@NonNull Job<?, ?> job) {
+    @Restricted(NoExternalUse.class)
+    public static List<Placeholder> elsewhereCached(@NonNull Job<?, ?> job) {
         String runningKey = runningKey(job);
         if (PersistenceStores.get() == null || runningKey == null) {
             return List.of();
@@ -415,10 +422,14 @@ public final class RunningBuilds {
                 epoch, Map.of(), PersistenceStore.ABSENT);
         long version = store.write(key, p.toBytes(), PersistenceStore.ANY);
         owned.put(key, new Placeholder(key, p.number, p.origin, p.controller, p.displayName, p.startTime, epoch, Map.of(), version));
+        invalidate(jobKeyOfRunning(runningKey(run.getParent())));
+        stopRequestedMeanwhile(run);
+    }
+
+    /** Stops a build asked to stop between its placeholder's write and its registration: that request was not taken as ours. */
+    private static void stopRequestedMeanwhile(@NonNull Run<?, ?> run) throws IOException {
         String jobKey = jobKeyOfRunning(runningKey(run.getParent()));
-        invalidate(jobKey);
-        // a stop requested between the placeholder's write and its registration above was not taken as ours
-        if (store.read(jobKey + "/" + PREFIX + "/" + run.getNumber() + STOP_SUFFIX) != null) {
+        if (PersistenceStores.get().read(jobKey + "/" + PREFIX + "/" + run.getNumber() + STOP_SUFFIX) != null) {
             stopRequested(jobKey, run.getNumber());
         }
     }
@@ -595,10 +606,15 @@ public final class RunningBuilds {
      */
     static void finished(@NonNull Run<?, ?> run) throws IOException {
         String key = placeholderKey(run);
-        if (key == null) {
-            return;
+        if (key != null) {
+            finished(key);
         }
-        Placeholder p = owned.remove(key);
+    }
+
+    /** {@link #finished(Run)} by the placeholder's key, for a build which may be gone (deleted) since. */
+    static void finished(@NonNull String key) throws IOException {
+        // kept until all is done: should a delete fail, the retry still knows the epoch to release the lease with
+        Placeholder p = owned.get(key);
         PersistenceStore store = PersistenceStores.get();
         store.delete(key, p == null ? PersistenceStore.ANY : p.version);
         store.delete(key.substring(0, key.length() - SUFFIX.length()) + STOP_SUFFIX, PersistenceStore.ANY);
@@ -606,7 +622,11 @@ public final class RunningBuilds {
         if (leases != null && p != null) {
             leases.release(key, p.epoch);
         }
-        invalidate(jobKeyOfRunning(runningKey(run.getParent())));
+        owned.remove(key);
+        String jobKey = jobKeyOf(key);
+        if (jobKey != null) {
+            invalidate(jobKey);
+        }
     }
 
     /**
@@ -676,6 +696,40 @@ public final class RunningBuilds {
     /** Lets a stopped build finish writing locally before its copy is discarded. */
     private static final int DISCARD_DELAY_SECONDS = 5;
 
+    /** Builds started here whose placeholder and lease could not be recorded (the store was unreachable): retried. */
+    private static final Map<String, Boolean> unregistered = new ConcurrentHashMap<>();
+
+    /** Records builds as running whose registration failed when they started (Target 14). */
+    static void registerPending() {
+        for (String id : List.copyOf(unregistered.keySet())) {
+            Run<?, ?> run = Run.fromExternalizableId(id);
+            if (run == null || !run.isLogUpdated()) {
+                unregistered.remove(id);
+                continue;
+            }
+            try {
+                String key = placeholderKey(run);
+                if (key != null && owned.containsKey(key)) {
+                    // recorded already, and only the look-up that followed failed: not written again, which would drop
+                    // what it recorded since (a save point)
+                    stopRequestedMeanwhile(run);
+                } else {
+                    started(run);
+                }
+                unregistered.remove(id);
+                if (!run.isLogUpdated()) {
+                    // it completed while being recorded, and may be being published under the lease just taken: completed
+                    // again a little later (published, then its placeholder removed, in that order), not cleaned up now
+                    BuildRecords.completeLater(run);
+                    continue;
+                }
+                LOGGER.info(() -> "Recorded " + run + " as running, after the store was back");
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.FINE, "Still cannot record " + run + " as running", e);
+            }
+        }
+    }
+
     /**
      * Checks that this controller still holds the leases of the builds it runs, and stops those it does not.
      */
@@ -695,6 +749,26 @@ public final class RunningBuilds {
         }
     }
 
+    private static final java.util.concurrent.atomic.AtomicBoolean sweeping = new java.util.concurrent.atomic.AtomicBoolean();
+
+    /**
+     * Adopts or closes the builds of controllers which are gone, now rather than at the next periodic sweep: for a store
+     * noticing that a controller has left the cluster (Target 14, faster failover).
+     */
+    @Restricted(Beta.class)
+    public static void sweepSoon() {
+        jenkins.util.Timer.get().submit(() -> {
+            try (hudson.security.ACLContext ignored = hudson.security.ACL.as2(hudson.security.ACL.SYSTEM2)) {
+                int n = removeStale();
+                if (n > 0) {
+                    LOGGER.info(() -> "Took care of " + n + " build(s) of controllers which left the cluster");
+                }
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.WARNING, "Could not sweep the builds of controllers which left", e);
+            }
+        });
+    }
+
     /**
      * Removes placeholders whose controller is no longer alive.
      *
@@ -702,6 +776,19 @@ public final class RunningBuilds {
      */
     @Restricted(NoExternalUse.class)
     public static int removeStale() throws IOException {
+        // one sweep at a time, whichever way it was started (the periodic one, or sweepSoon): leases are reentrant for
+        // this controller, so two at once could both adopt, and resume, the same build
+        if (!sweeping.compareAndSet(false, true)) {
+            return 0; // another sweep is under way; the periodic one follows anyway
+        }
+        try {
+            return sweep();
+        } finally {
+            sweeping.set(false);
+        }
+    }
+
+    private static int sweep() throws IOException {
         PersistenceStore store = PersistenceStores.get();
         Set<String> live = store == null ? null : store.liveOrigins();
         if (live == null) {
@@ -714,7 +801,7 @@ public final class RunningBuilds {
             Set<String> gone = new HashSet<>();
             int removedHere = 0;
             for (Placeholder p : all(job)) {
-                if (!live.contains(p.origin) && stillGone(store, p.origin, gone)) {
+                if (unsure.contains(p.key) || !live.contains(p.origin) && stillGone(store, p.origin, gone)) {
                     long epoch = 0;
                     if (leases != null) {
                         epoch = leases.acquire(p.key);
@@ -745,7 +832,12 @@ public final class RunningBuilds {
                             BuildRecords.publishLost(job, p.number, p.startTime,
                                     "This build was running on " + p.controller + ", which is gone, and could not be resumed elsewhere; it is closed as aborted.");
                         } catch (IOException | RuntimeException e) {
-                            LOGGER.log(Level.WARNING, "Could not close " + job.getFullName() + " #" + p.number + " as aborted", e);
+                            // keep the placeholder (and release the lease), so that the next sweep tries again (Target 14)
+                            LOGGER.log(Level.WARNING, "Could not close " + job.getFullName() + " #" + p.number + " as aborted; will retry", e);
+                            if (leases != null) {
+                                leases.release(p.key, epoch);
+                            }
+                            continue;
                         }
                         try {
                             // only as read: several controllers noticing at once is harmless, and a write since is kept
@@ -935,6 +1027,12 @@ public final class RunningBuilds {
         }
     }
 
+    /**
+     * Placeholders whose adoption here failed as it was written, so that it may have been written all the same: they
+     * name this controller, but nothing resumed them. Adopted again by the next sweep (or take-over).
+     */
+    private static final Set<String> unsure = ConcurrentHashMap.newKeySet();
+
     /** How many times adoption is retried when the placeholder changes under it. */
     private static final int ADOPTION_ATTEMPTS = 5;
 
@@ -972,6 +1070,7 @@ public final class RunningBuilds {
         for (int attempt = 0; attempt < ADOPTION_ATTEMPTS; attempt++) {
             PersistenceStore.Entry entry = store.read(key);
             if (entry == null) {
+                unsure.remove(key);
                 // completed meanwhile: nothing to adopt, nor to keep the lease for
                 BuildLeases leases = store.leases();
                 if (leases != null) {
@@ -984,6 +1083,9 @@ public final class RunningBuilds {
                 return Adoption.NONE;
             }
             Placeholder p = Placeholder.fromBytes(key, number, entry.content(), entry.version());
+            if (p != null && store.getOrigin().equals(p.origin) && !unsure.contains(key)) {
+                return Adoption.ADOPTED; // this controller has it already (a sweep listed it as it was): its lease stays
+            } // else written by an adoption here whose write seemed to fail: not resumed yet, so it carries on
             BuildAdopter.Adoption adoption = p == null ? null : prepare(job, p);
             if (adoption == null) {
                 return Adoption.NONE;
@@ -1020,9 +1122,13 @@ public final class RunningBuilds {
                 LOGGER.fine(() -> key + " changed while preparing its adoption; retrying");
                 continue;
             } catch (IOException | RuntimeException e) {
-                adoption.abandon(); // retried by the next sweep, which prepares it again
+                // perhaps written all the same (the answer lost): it then names this live controller, which a sweep
+                // would leave alone, while nothing runs it here; so the next one adopts it again
+                unsure.add(key);
+                adoption.abandon();
                 throw e;
             }
+            unsure.remove(key);
             owned.put(key, new Placeholder(key, number, mine.origin, mine.controller, p.displayName, p.startTime, epoch, p.properties, version));
             invalidate(jobKeyOfRunning(runningKey(job)));
             LOGGER.info(() -> "Adopting " + job.getFullName() + " #" + number + " from " + p.controller + " (" + p.origin + ")");
@@ -1211,7 +1317,8 @@ public final class RunningBuilds {
             try {
                 started(run);
             } catch (IOException | RuntimeException e) {
-                LOGGER.log(Level.WARNING, "Failed to record " + run + " as running", e);
+                LOGGER.log(Level.WARNING, "Failed to record " + run + " as running; will retry", e);
+                unregistered.put(run.getExternalizableId(), Boolean.TRUE);
             }
         }
     }
@@ -1232,6 +1339,7 @@ public final class RunningBuilds {
         @Override
         protected void execute(TaskListener listener) throws IOException {
             if (PersistenceStores.get() != null) {
+                registerPending();
                 checkOwnership();
                 removeStale();
             }
@@ -1241,6 +1349,135 @@ public final class RunningBuilds {
         protected Level getNormalLoggingLevel() {
             return Level.FINE;
         }
+    }
+
+    /**
+     * A build running on another controller, as the REST API shows it in a job's {@code buildsElsewhere} (Target 14):
+     * the main properties, with the same visibility, of a {@link Run} that is building. Its actions (parameters, causes, …) are
+     * known to the controller running it only: they are listed empty here, and its own URL (and API), which that
+     * controller answers, has them.
+     */
+    @ExportedBean
+    @Restricted(Beta.class)
+    public static final class RemoteBuild {
+        private final Job<?, ?> job;
+        private final Placeholder p;
+
+        RemoteBuild(Job<?, ?> job, Placeholder p) {
+            this.job = job;
+            this.p = p;
+        }
+
+        @Exported(visibility = 2)
+        public int getNumber() {
+            return p.number;
+        }
+
+        @Exported(visibility = 2)
+        public String getUrl() {
+            return Jenkins.get().getRootUrlFromRequest() + job.getUrl() + p.number + "/";
+        }
+
+        /** None known here: see the build's own API, which the controller running it answers. */
+        @Exported
+        public List<hudson.model.Action> getActions() {
+            return List.of();
+        }
+
+        @Exported
+        public String getId() {
+            return String.valueOf(p.number);
+        }
+
+        @Exported
+        public String getDisplayName() {
+            return p.displayName;
+        }
+
+        @Exported
+        public String getFullDisplayName() {
+            return job.getFullDisplayName() + " " + p.displayName;
+        }
+
+        @Exported
+        public boolean isBuilding() {
+            return true;
+        }
+
+        @Exported
+        public boolean isInProgress() {
+            return true;
+        }
+
+        @Exported
+        public Object getResult() {
+            return null;
+        }
+
+        @Exported
+        public long getTimestamp() {
+            return p.startTime;
+        }
+
+        @Exported
+        public long getDuration() {
+            return 0;
+        }
+
+        @Exported
+        public long getEstimatedDuration() {
+            return job.getEstimatedDuration();
+        }
+
+        @Exported
+        public String getDescription() {
+            return null;
+        }
+
+        @Exported
+        public boolean isKeepLog() {
+            return false;
+        }
+
+        @Exported
+        public long getQueueId() {
+            return -1;
+        }
+
+        @Exported
+        public Object getExecutor() {
+            return null;
+        }
+
+        @Exported
+        public List<Object> getArtifacts() {
+            return List.of();
+        }
+
+        /** Which controller runs it (not on a {@link Run}). */
+        @Exported
+        public String getController() {
+            return p.controller;
+        }
+    }
+
+    /** A job's builds running on other controllers, newest first, as the REST API shows them. */
+    @Restricted(NoExternalUse.class)
+    @NonNull
+    public static List<RemoteBuild> remoteBuilds(@NonNull Job<?, ?> job) {
+        List<RemoteBuild> builds = new ArrayList<>();
+        for (Placeholder p : elsewhere(job)) {
+            builds.add(new RemoteBuild(job, p));
+        }
+        return builds;
+    }
+
+    /** The number of the newest build of a job running on another controller, if newer than this controller's newest. */
+    @Restricted(Beta.class)
+    public static int newerElsewhere(@NonNull Job<?, ?> job) {
+        List<Placeholder> remote = elsewhere(job);
+        Run<?, ?> local = job.getLastBuild();
+        return !remote.isEmpty() && (local == null || remote.get(0).number > local.getNumber()) ? remote.get(0).number : 0;
     }
 
     /**

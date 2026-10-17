@@ -159,12 +159,25 @@ class RunningBuildsTest {
                 containsString("{\"controller\":\"jenkins-a\",\"number\":2}"));
         assertThat(wc.goTo("job/remote/").asNormalizedText(), containsString("#2 on jenkins-a"));
         assertEquals(hudson.model.BallColor.BLUE_ANIME, p.getIconColor(), "the job shows as building");
+        assertTrue(p.isBuilding(), "building elsewhere");
+        org.jvnet.hudson.test.JenkinsRule.WebClient rc = r.createWebClient().withThrowExceptionOnFailingStatusCode(false);
+        assertEquals(400, rc.getPage(rc.addCrumb(new org.htmlunit.WebRequest(new java.net.URL(r.getURL(), "job/remote/confirmRename?newName=renamed"), org.htmlunit.HttpMethod.POST))).getWebResponse().getStatusCode(),
+                "no rename while it builds on another controller");
         String history = wc.goTo("job/remote/buildHistory/ajax").getWebResponse().getContentAsString();
         assertThat("the build list shows it", history, containsString("Running on jenkins-a"));
         assertThat(history, containsString("running-elsewhere/stop?number=2"));
         // its links answer here too (no owner routing in core): the build, running there
         assertThat(wc.goTo("job/remote/2/").asNormalizedText(), containsString("Running on controller jenkins-a"));
         assertThat(wc.goTo("job/remote/2/console").asNormalizedText(), containsString("This build runs on controller jenkins-a"));
+        String api = wc.goTo("job/remote/api/json?tree=lastBuild[number,building],builds[number],buildsElsewhere[number,building,result,url]", "application/json")
+                .getWebResponse().getContentAsString();
+        assertThat("builds and lastBuild are this controller's, typed as ever", api,
+                containsString("\"builds\":[{\"_class\":\"hudson.model.FreeStyleBuild\",\"number\":1}]"));
+        assertThat(api, containsString("\"lastBuild\":{\"_class\":\"hudson.model.FreeStyleBuild\",\"building\":false,\"number\":1}"));
+        assertThat("the build running elsewhere has a property of its own", api, containsString("\"buildsElsewhere\":[{"
+                + "\"building\":true,\"number\":2,\"result\":null,\"url\":\"" + r.getURL() + "job/remote/2/\"}]"));
+        assertThat("the schema keeps the build types", wc.goTo("job/remote/api/schema", "application/xml").getWebResponse().getContentAsString(),
+                containsString("name=\"lastBuild\" type=\"hudson.model.Run\""));
 
         // the other controller completes it: record first, then the placeholder goes
         try (InputStream snapshot = BLOBS.get("jobs/remote/builds/1/files.tgz")) {
@@ -175,6 +188,8 @@ class RunningBuildsTest {
         awaitApplied();
         assertEquals(List.of(), elsewhere(p), "hidden once the completed record is known");
         assertEquals(hudson.model.BallColor.BLUE, p.getIconColor());
+        assertThat("once completed, the real build", wc.goTo("job/remote/api/json?tree=lastBuild[number,building]", "application/json").getWebResponse().getContentAsString(),
+                containsString("\"lastBuild\":{\"_class\":\"hudson.model.FreeStyleBuild\",\"building\":false,\"number\":2}"));
         assertEquals(2, p.getLastBuild().getNumber());
 
         other.delete("jobs/remote/running/2.xml", PersistenceStore.ANY);
