@@ -82,9 +82,7 @@ public final class StoredBuildNumberAssigner implements Job.BuildNumberAssigner 
             }
             try {
                 long version = store.write(key, ((number + 1) + "\n").getBytes(StandardCharsets.UTF_8), expected);
-                if (entry == null) {
-                    checkStillStored(store, key, version, job);
-                }
+                checkStillStored(store, key, version, entry, job.getFullName());
                 PersistenceStores.seen(key, version);
                 job.fastUpdateNextBuildNumber(number + 1);
                 return number;
@@ -96,23 +94,31 @@ public final class StoredBuildNumberAssigner implements Job.BuildNumberAssigner 
     }
 
     /**
-     * Undoes a counter just created if the job is no longer stored there. The counter is absent too when another
+     * Undoes a counter write if the job is no longer stored there. The configuration is absent when another
      * controller renamed (or deleted) the job and this one has not applied that yet: its sequence goes on at the new
-     * name, and numbers drawn here would be handed out there as well. The move takes the job's configuration and
-     * counter together, atomically: if it came first, the configuration is gone now; if it came after, it took this
-     * counter along and the sequence stays one.
+     * name, and numbers drawn here, from a counter this created or one already left at the old name, would be handed
+     * out there as well. The move takes the job's configuration and counter together, atomically: if it came first,
+     * the configuration is gone now; if it came after, it took this write along and the sequence stays one.
+     *
+     * @param previous the entry this write replaced, or null if it created the counter (which is then deleted again;
+     *                 a counter that was there is put back as it was)
      */
-    private static void checkStillStored(PersistenceStore store, String key, long version, Job<?, ?> job) throws IOException {
+    private static void checkStillStored(PersistenceStore store, String key, long version, PersistenceStore.Entry previous,
+                                         String name) throws IOException {
         String config = key.substring(0, key.length() - "nextBuildNumber".length()) + "config.xml";
         if (!store.owns(config) || store.read(config) != null) {
             return;
         }
         try {
-            store.delete(key, version);
+            if (previous == null) {
+                store.delete(key, version);
+            } else {
+                store.write(key, previous.content(), version);
+            }
         } catch (ConflictException e) {
-            // changed since: no longer the counter this created
+            // changed since: no longer the counter this wrote
         }
-        throw new IOException(job.getFullName() + " was renamed or deleted on another controller");
+        throw new IOException(name + " was renamed or deleted on another controller");
     }
 
     /**
@@ -144,6 +150,11 @@ public final class StoredBuildNumberAssigner implements Job.BuildNumberAssigner 
             try {
                 long version = store.write(route.key(), (wanted + "\n").getBytes(StandardCharsets.UTF_8),
                         entry == null ? PersistenceStore.ABSENT : entry.version());
+                if (entry == null) {
+                    // a counter created after a rename elsewhere would be left behind at the old name
+                    checkStillStored(store, route.key(), version, null,
+                            route.key().substring(0, route.key().length() - "/nextBuildNumber".length()));
+                }
                 PersistenceStores.seen(route.key(), version);
                 return true;
             } catch (ConflictException e) {
