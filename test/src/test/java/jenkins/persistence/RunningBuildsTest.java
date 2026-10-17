@@ -26,6 +26,7 @@ package jenkins.persistence;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.not;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -149,6 +150,8 @@ class RunningBuildsTest {
         FreeStyleProject p = r.createFreeStyleProject("remote");
         r.buildAndAssertSuccess(p);
         assertEquals(List.of(), elsewhere(p));
+        assertThat("none elsewhere: not in the REST API", r.createWebClient().goTo("job/remote/api/json", "application/json").getWebResponse().getContentAsString(),
+                not(containsString("buildsElsewhere")));
 
         other.write("jobs/remote/running/2.xml", placeholder("other-controller", "jenkins-a", 2), PersistenceStore.ABSENT);
         awaitApplied();

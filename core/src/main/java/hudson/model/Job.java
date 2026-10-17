@@ -811,12 +811,15 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
 
     /**
      * Builds of this job running on other controllers of a cluster sharing its builds, newest first, for the REST API:
-     * a property of their own, so that {@code builds}, {@code allBuilds} and {@code lastBuild} keep their types.
+     * a property of their own, so that {@code builds}, {@code allBuilds} and {@code lastBuild} keep their types. Left
+     * out when there are none (always, without a cluster).
      */
-    @Exported(name = "buildsElsewhere")
+    @Exported(name = "buildsElsewhere", skipNull = true)
     @Restricted(NoExternalUse.class)
+    @CheckForNull
     public List<jenkins.persistence.RunningBuilds.RemoteBuild> getBuildsElsewhereForApi() {
-        return jenkins.persistence.RunningBuilds.remoteBuilds(this);
+        List<jenkins.persistence.RunningBuilds.RemoteBuild> builds = jenkins.persistence.RunningBuilds.remoteBuilds(this);
+        return builds.isEmpty() ? null : builds;
     }
 
     /**
