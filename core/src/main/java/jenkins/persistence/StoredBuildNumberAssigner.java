@@ -67,6 +67,10 @@ public final class StoredBuildNumberAssigner implements Job.BuildNumberAssigner 
                 return r;
             }
         }
+        // store calls under the queue lock: an executor creates its build (createExecutable, so this) inside
+        // Queue.callWithLock. An exception to holding that lock as briefly as possible, without store calls (the
+        // shared queue, Target 5), as is taking a queue id when none were taken ahead: the number is needed now, and
+        // drawing it is one read and one compare-and-set write
         PersistenceStore store = route.store();
         String key = route.key();
         for (int attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
