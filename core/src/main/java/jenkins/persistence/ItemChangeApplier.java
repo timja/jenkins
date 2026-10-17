@@ -207,6 +207,7 @@ public final class ItemChangeApplier {
             // under the item's lock, as AbstractItem.save is: a save while the object is half reloaded would write a mix
             // of the two versions, as of the version just read, so nobody would notice (lost trigger, ET11 scenario 3)
             synchronized (existing) {
+                PersistenceStores.clearRemovedFields(existing.getConfigFile(), existing); // a display name cleared, say
                 existing.load();
             }
             ItemListener.fireOnUpdated(existing);
@@ -227,11 +228,18 @@ public final class ItemChangeApplier {
         Util.createDirectories(dir.toPath());
         LOGGER.fine(() -> "Loading " + fullName + " created elsewhere");
         if (parent == jenkins) {
-            jenkins.putItem((TopLevelItem) Items.load(jenkins, dir));
+            if (jenkins.addItemCreatedElsewhere((TopLevelItem) Items.load(jenkins, dir)) != null) {
+                // created here meanwhile (stored, then added, after the check above), and changed elsewhere since: that
+                // one is brought up to date, as a changed item is, rather than replaced by the copy just loaded
+                PersistenceStores.seen(e.key(), PersistenceStore.ANY); // the version read was the copy's
+                written(e);
+                return;
+            }
         } else if (parent instanceof AbstractItem folder) {
             // reloading the folder loads children which so far exist only in the store; under its lock, as items are
             // reloaded above, so that a save of the folder meanwhile does not store a mix of the two versions
             synchronized (folder) {
+                PersistenceStores.clearRemovedFields(folder.getConfigFile(), folder);
                 folder.load();
             }
             Item created = jenkins.getItemByFullName(fullName);
@@ -273,11 +281,13 @@ public final class ItemChangeApplier {
         if (to == null || from == null) {
             return;
         }
-        if (PersistenceStores.lastSeen(e.oldKey()) < e.version()) {
-            // nothing is stored at the old name now (unless made there since: kept), also for children moved along
+        // something made at the old name since the move (here, or loaded after it) is not what was moved: it stays
+        boolean madeSince = PersistenceStores.lastSeen(e.oldKey()) >= e.version();
+        if (!madeSince) {
+            // nothing is stored at the old name now, also for children moved along
             PersistenceStores.seen(e.oldKey(), PersistenceStore.ABSENT);
         }
-        Item item = jenkins.getItemByFullName(String.join("/", from));
+        Item item = madeSince ? null : jenkins.getItemByFullName(String.join("/", from));
         if (item instanceof AbstractItem existing) {
             LOGGER.fine(() -> "Moving " + existing.getFullName() + " to " + String.join("/", to) + " as done elsewhere");
             ItemGroup<?> destination = parentOf(to);
@@ -294,7 +304,7 @@ public final class ItemChangeApplier {
             }
             applied.incrementAndGet();
         }
-        // else moved along with an ancestor already, or never loaded here
+        // else moved along with an ancestor already, never loaded here, or made again since
         // whatever is at the new name now is reloaded (or loaded) from the store, recording the version read: a change
         // made just before the move was not applied to the old name, and a child moved along has its version recorded
         written(new ChangeEvent(ChangeEvent.Kind.WRITTEN, e.key(), null, e.version(), e.origin()));
@@ -312,6 +322,11 @@ public final class ItemChangeApplier {
         LOGGER.fine(() -> "Dropping " + placeholder.getFullName() + ", loaded before the move that brings it here was applied");
         group.remove(item);
         File dir = placeholder.getRootDir();
+        String key = PersistenceStores.keyFor(dir);
+        if (key != null) {
+            // the versions read for it and its children are not those of the moved item's: each is reloaded
+            PersistenceStores.forgetUnder(key);
+        }
         if (onlyWhatLoadingMakes(dir)) {
             Util.deleteRecursive(dir);
         } else {

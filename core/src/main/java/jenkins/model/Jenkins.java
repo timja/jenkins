@@ -3180,6 +3180,27 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
     }
 
     /**
+     * Adds an item another controller created, unless one of that name was created here meanwhile: creating an item
+     * stores it before adding it, under the lock taken here, so replacing it would delete the item its creator holds
+     * (and the directory both share).
+     *
+     * @return null if added; else the item of that name here, which the caller brings up to date instead
+     */
+    @CheckForNull
+    @Restricted(NoExternalUse.class)
+    public TopLevelItem addItemCreatedElsewhere(@NonNull TopLevelItem item) {
+        synchronized (itemGroupMixIn) {
+            TopLevelItem here = items.get(item.getName());
+            if (here != null) {
+                return here;
+            }
+            items.put(item.getName(), item);
+        }
+        ItemListener.fireOnCreated(item);
+        return null;
+    }
+
+    /**
      * Overwrites the existing item by new one.
      *
      * <p>

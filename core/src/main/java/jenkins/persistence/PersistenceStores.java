@@ -24,12 +24,20 @@
 
 package jenkins.persistence;
 
+import com.thoughtworks.xstream.XStream;
+import com.thoughtworks.xstream.io.HierarchicalStreamReader;
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.ExtensionList;
+import hudson.XmlFile;
 import hudson.init.InitMilestone;
+import hudson.util.XStream2;
+import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.Modifier;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
@@ -323,10 +331,82 @@ public final class PersistenceStores {
     }
 
     /**
+     * Forgets the versions read or written of every key below a prefix, such as an item's directory and everything in
+     * it, so that each is applied again when next changed elsewhere, whatever the version: what was read there no
+     * longer stands for what this controller has (an item loaded there and then dropped, say).
+     */
+    @Restricted(NoExternalUse.class)
+    public static void forgetUnder(@NonNull String prefix) {
+        versions.keySet().removeIf(k -> k.startsWith(prefix + "/"));
+    }
+
+    /**
      * Number of conflicting writes detected (and, under the {@code warn} policy, overwritten) by this JVM.
      */
     public static long getConflictCount() {
         return conflicts.get();
+    }
+
+    /**
+     * Prepares an object for reloading from its file, changed by another controller: nulls the fields the new version
+     * no longer has. Loading into a live object leaves alone the fields the file has no element for, and XStream writes
+     * no element for a null field, so a value cleared elsewhere (a system message, an administrator address) would
+     * survive here and be brought back everywhere by the next save here. Only top-level fields this object serialises
+     * now (as last saved or reloaded, unless changed here since) and the new version lacks are nulled: a field the file
+     * never had keeps its default. Call it just before loading, so that what loading derives sees them cleared.
+     */
+    @Restricted(NoExternalUse.class)
+    public static void clearRemovedFields(@NonNull XmlFile file, @NonNull Object o) throws IOException {
+        if (!file.exists()) {
+            return;
+        }
+        XStream xs = file.getXStream();
+        Set<String> kept = topLevelElements(file.readRawBytes());
+        Set<String> removed = topLevelElements(xs.toXML(o).getBytes(StandardCharsets.UTF_8));
+        removed.removeAll(kept);
+        for (String element : removed) {
+            Field f = fieldFor(xs, o.getClass(), element);
+            int m = f == null ? 0 : f.getModifiers();
+            if (f == null || f.getType().isPrimitive() || Modifier.isStatic(m) || Modifier.isFinal(m) || Modifier.isTransient(m)) {
+                continue;
+            }
+            try {
+                f.setAccessible(true);
+                f.set(o, null);
+                LOGGER.fine(() -> "Cleared " + f + ", removed elsewhere from " + file);
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                LOGGER.log(Level.FINE, "Could not clear " + f, e);
+            }
+        }
+    }
+
+    private static Set<String> topLevelElements(byte[] xml) {
+        Set<String> names = new TreeSet<>();
+        HierarchicalStreamReader r = XStream2.getDefaultDriver().createReader(new ByteArrayInputStream(xml));
+        try {
+            while (r.hasMoreChildren()) {
+                r.moveDown();
+                if (r.getAttribute("defined-in") == null) { // a field hidden by one of a subclass: left alone
+                    names.add(r.getNodeName());
+                }
+                r.moveUp();
+            }
+        } finally {
+            r.close();
+        }
+        return names;
+    }
+
+    @CheckForNull
+    private static Field fieldFor(XStream xs, Class<?> type, String element) {
+        for (Class<?> c = type; c != null && c != Object.class; c = c.getSuperclass()) {
+            try {
+                return c.getDeclaredField(xs.getMapper().realMember(c, element));
+            } catch (NoSuchFieldException e) {
+                // declared further up, or not a field (an implicit collection's item)
+            }
+        }
+        return null;
     }
 
     /** Files being created afresh, by key (see {@link #creating}). */

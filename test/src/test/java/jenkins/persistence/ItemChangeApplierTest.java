@@ -307,6 +307,108 @@ class ItemChangeApplierTest {
         }
     }
 
+    @Test
+    void aFieldClearedElsewhereIsClearedHere() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("named");
+        p.setDisplayName("Shown");
+        other.write("jobs/named/config.xml", project("display name cleared elsewhere"), PersistenceStore.ANY);
+        awaitApplied();
+        assertEquals("display name cleared elsewhere", p.getDescription());
+        assertNull(p.getDisplayNameOrNull());
+    }
+
+    @Test
+    void aMoveOfAnItemMadeAgainHereSinceLeavesThatAlone() throws Exception {
+        pauseApplier();
+        FreeStyleProject a;
+        try {
+            other.write("jobs/remade-here/config.xml", project("moved elsewhere"), PersistenceStore.ABSENT);
+            other.move("jobs/remade-here", "jobs/remade-here-moved");
+            a = r.createFreeStyleProject("remade-here");
+            a.setDescription("made again here");
+        } finally {
+            resumeApplier();
+        }
+        awaitApplied();
+        assertThat(r.jenkins.getItem("remade-here"), sameInstance(a));
+        assertEquals("made again here", a.getDescription());
+        assertEquals("moved elsewhere", r.jenkins.getItemByFullName("remade-here-moved", FreeStyleProject.class).getDescription());
+    }
+
+    @Test
+    void aJobChangedElsewhereJustBeforeItIsMovedIntoAFolderJustCreatedIsReloaded() throws Exception {
+        byte[] folderXml = Items.getConfigFile(r.createFolder("template3")).readRawBytes();
+        FreeStyleProject j = r.createFreeStyleProject("j3");
+        pauseApplier();
+        try {
+            other.write("jobs/j3/config.xml", project("changed before the move"), PersistenceStore.ANY);
+            other.write("jobs/newf3/config.xml", folderXml, PersistenceStore.ABSENT);
+            other.move("jobs/j3", "jobs/newf3/jobs/j3");
+        } finally {
+            resumeApplier();
+        }
+        awaitApplied();
+        assertThat(r.jenkins.getItemByFullName("newf3/j3"), sameInstance(j));
+        assertEquals("changed before the move", j.getDescription());
+    }
+
+    @Test
+    void aChildChangedElsewhereJustBeforeItsFolderIsMovedIntoAFolderJustCreatedIsReloaded() throws Exception {
+        byte[] folderXml = Items.getConfigFile(r.createFolder("template4")).readRawBytes();
+        MockFolder f = r.createFolder("mf");
+        FreeStyleProject x = f.createProject(FreeStyleProject.class, "x");
+        pauseApplier();
+        try {
+            other.write("jobs/mf/jobs/x/config.xml", project("child changed before the move"), PersistenceStore.ANY);
+            other.write("jobs/md/config.xml", folderXml, PersistenceStore.ABSENT);
+            other.move("jobs/mf", "jobs/md/jobs/mf");
+        } finally {
+            resumeApplier();
+        }
+        awaitApplied();
+        assertThat(r.jenkins.getItemByFullName("md/mf"), sameInstance(f));
+        assertThat(r.jenkins.getItemByFullName("md/mf/x"), sameInstance(x));
+        assertEquals("child changed before the move", x.getDescription());
+    }
+
+    /** While set, the first save of item "race" changes it elsewhere and waits for the applier to try adding it. */
+    static volatile boolean racing;
+
+    @TestExtension("anItemCreatedHereAndChangedElsewhereBeforeItIsAddedIsKept")
+    public static class ChangeElsewhereWhileCreating extends SaveableListener {
+        @Override
+        public void onChange(Saveable o, XmlFile file) {
+            if (racing && o instanceof FreeStyleProject p && p.getName().equals("race")) {
+                racing = false;
+                try {
+                    STORE.as("other-controller").write("jobs/race/config.xml", project("changed elsewhere"), PersistenceStore.ANY);
+                    // until the applier, having loaded it, waits to add it
+                    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                    while (!applierBlocked() && System.nanoTime() < deadline) {
+                        Thread.sleep(20);
+                    }
+                } catch (IOException | InterruptedException e) {
+                    throw new AssertionError(e);
+                }
+            }
+        }
+
+        private static boolean applierBlocked() {
+            return Thread.getAllStackTraces().keySet().stream()
+                    .anyMatch(t -> t.getName().equals("Persistence store item change applier") && t.getState() == Thread.State.BLOCKED);
+        }
+    }
+
+    @Test
+    void anItemCreatedHereAndChangedElsewhereBeforeItIsAddedIsKept() throws Exception {
+        racing = true;
+        FreeStyleProject p = r.createFreeStyleProject("race");
+        awaitApplied();
+        assertThat(r.jenkins.getItem("race"), sameInstance(p));
+        assertTrue(p.getRootDir().isDirectory());
+        assertEquals("changed elsewhere", p.getDescription());
+    }
+
     /** While set, saves of folder "lockf" wait for it once written. */
     static volatile CountDownLatch saving;
     static volatile CountDownLatch savingEntered;
