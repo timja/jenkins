@@ -136,6 +136,27 @@ class PersistenceStoreItemEnumerationTest {
     }
 
     @Test
+    void aStoredNameThatIsNoFileNameIsNoItem() throws Exception {
+        MockFolder f = r.createFolder("dots");
+        f.createProject(FreeStyleProject.class, "x");
+        // written by anything but a controller: ".." would be the folder itself, loaded again as its own child
+        byte[] project = "<?xml version='1.1' encoding='UTF-8'?><project/>".getBytes(StandardCharsets.UTF_8);
+        STORE.write("jobs/dots/jobs/../config.xml", project, PersistenceStore.ANY);
+        STORE.write("jobs/dots/jobs/./config.xml", project, PersistenceStore.ANY);
+        STORE.write("jobs/../config.xml", project, PersistenceStore.ANY);
+        try {
+            assertEquals(Set.of("x"), PersistenceStores.storedItemNames(new File(r.jenkins.getRootDir(), "jobs/dots/jobs")));
+            assertFalse(PersistenceStores.storedItemNames(new File(r.jenkins.getRootDir(), "jobs")).contains(".."));
+            r.jenkins.reload();
+            assertEquals(List.of("x"), r.jenkins.getItemByFullName("dots", MockFolder.class).getItems().stream().map(Item::getName).toList());
+        } finally {
+            STORE.delete("jobs/dots/jobs/../config.xml", PersistenceStore.ANY);
+            STORE.delete("jobs/dots/jobs/./config.xml", PersistenceStore.ANY);
+            STORE.delete("jobs/../config.xml", PersistenceStore.ANY);
+        }
+    }
+
+    @Test
     void oneUnreadableItemDoesNotHideTheOthers() throws Exception {
         STORE.write("jobs/a/config.xml", "<?xml version='1.1' encoding='UTF-8'?><project/>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
         STORE.write("jobs/b/config.xml", "<?xml version='1.1' encoding='UTF-8'?><project/>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);

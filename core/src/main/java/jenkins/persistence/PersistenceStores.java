@@ -162,6 +162,27 @@ public final class PersistenceStores {
     }
 
     /**
+     * Whether one segment of a store key can name a file in the directory of the key's parent. Keys come from other
+     * controllers, or from anything else writing to the store: a segment such as {@code ..} must never become a path here.
+     */
+    @Restricted(NoExternalUse.class)
+    public static boolean isSafeName(@CheckForNull String name) {
+        return name != null && !name.isEmpty() && !name.equals(".") && !name.equals("..")
+                && name.indexOf('/') < 0 && name.indexOf('\\') < 0 && name.indexOf('\0') < 0;
+    }
+
+    /** Whether every segment of a store key {@linkplain #isSafeName can name a file}. */
+    @Restricted(NoExternalUse.class)
+    public static boolean isSafeKey(@NonNull String key) {
+        for (String segment : key.split("/", -1)) {
+            if (!isSafeName(segment)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
      * Names of the items stored below a directory which holds one subdirectory per item,
      * such as {@code JENKINS_HOME/jobs} or a folder's {@code jobs} directory.
      * Use in addition to listing the directory itself: on a fresh controller, items may exist only in the store.
@@ -185,6 +206,11 @@ public final class PersistenceStores {
         if (parent != null) {
             for (String name : store.children(parent)) {
                 if (skip.contains(name)) {
+                    continue;
+                }
+                if (!isSafeName(name)) {
+                    // whatever else can write to the store wrote it: never a directory here (".." is the parent's)
+                    LOGGER.warning(() -> "Ignoring " + parent + "/" + name + " in the persistence store: not a name");
                     continue;
                 }
                 String config = parent + "/" + name + "/config.xml";
