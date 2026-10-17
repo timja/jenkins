@@ -32,11 +32,16 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import hudson.Launcher;
+import hudson.model.AbstractBuild;
+import hudson.model.BuildListener;
 import hudson.model.FreeStyleBuild;
 import hudson.model.FreeStyleProject;
 import hudson.model.Job;
 import hudson.model.Run;
 import hudson.model.listeners.RunListener;
+import hudson.model.queue.QueueTaskFuture;
+import hudson.util.OneShotEvent;
 import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.InputStream;
@@ -54,6 +59,7 @@ import jenkins.model.PeepholePermalink;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
+import org.jvnet.hudson.test.TestBuilder;
 import org.jvnet.hudson.test.TestExtension;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 
@@ -182,6 +188,65 @@ class RemoteBuildEventsTest {
         assertEquals(1, p.getLastSuccessfulBuild().getNumber());
         assertEquals(1, p.getLastBuild().getNumber());
         assertEquals(deletesBefore, RemoteDeletes.count.get(), "RunListener.onDeleted is not fired for a remote deletion");
+    }
+
+    @Test
+    void staleDeletionLeavesABuildStoredAgainAlone() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("stale-deletion");
+        r.buildAndAssertSuccess(p);
+        // a deletion of an earlier job's #1, applied late after this name was reused here
+        BuildRecords.deletedElsewhere(p, 1);
+        assertNotNull(p.getBuildByNumber(1));
+        assertTrue(new File(p.getBuildDir(), "1/build.xml").isFile());
+    }
+
+    @Test
+    void staleDeletionLeavesABuildRunningHereAlone() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("running-deletion");
+        OneShotEvent release = new OneShotEvent();
+        p.getBuildersList().add(new TestBuilder() {
+            @Override
+            public boolean perform(AbstractBuild<?, ?> build, Launcher launcher, BuildListener listener) throws InterruptedException {
+                release.block();
+                return true;
+            }
+        });
+        QueueTaskFuture<FreeStyleBuild> f = p.scheduleBuild2(0);
+        FreeStyleBuild b = f.waitForStart();
+        BuildRecords.deletedElsewhere(p, b.getNumber());
+        assertTrue(b.getRootDir().isDirectory(), "a running build's directory is kept");
+        assertEquals(b, p.getBuildByNumber(b.getNumber()));
+        release.signal();
+        r.assertBuildStatusSuccess(f);
+    }
+
+    @Test
+    void editMadeElsewhereBeforeARenameIsApplied() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("edited-before");
+        r.buildAndAssertSuccess(p);
+        synchronized (p._getRuns()) {
+            // the edit is applied here only after the rename that follows it elsewhere is stored
+            other.write("jobs/edited-before/builds/1/build.xml", record("edited-before", 1).replaceFirst("<build>", "<build>\n  <description>set elsewhere</description>")
+                    .getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+            BLOBS.move("jobs/edited-before", "jobs/edited-after");
+            other.move("jobs/edited-before", "jobs/edited-after");
+        }
+        awaitApplied();
+        assertEquals("edited-after", p.getName());
+        assertEquals("set elsewhere", p.getBuildByNumber(1).getDescription());
+    }
+
+    @Test
+    void buildNotMaterializedOnceIsRetriedWhenChangedElsewhere() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("retried");
+        r.buildAndAssertSuccess(p);
+        publishElsewhere("retried", 1, 2, record("retried", 1));
+        // its snapshot is not there (moving, say) when first opened
+        BLOBS.delete("jobs/retried/builds/2");
+        assertNull(p.getBuildByNumber(2));
+        publishElsewhere("retried", 1, 2, record("retried", 1).replaceFirst("<build>", "<build>\n  <description>again</description>"));
+        assertNotNull(p.getBuildByNumber(2), "the build is looked for again");
+        assertEquals("again", p.getBuildByNumber(2).getDescription());
     }
 
     @Test
