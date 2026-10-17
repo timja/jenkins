@@ -355,6 +355,36 @@ class BuildRecordsTest {
     }
 
     @Test
+    void buildDeletedWhilePublishedForLongerThanMarkersAreKeptStaysDeleted() throws Exception {
+        FreeStyleProject p = project(r, "stalled");
+        FreeStyleBuild b1 = r.buildAndAssertSuccess(p);
+        FreeStyleBuild b2 = r.buildAndAssertSuccess(p);
+        String key = "jobs/stalled/builds/1/build.xml";
+        long kept = BuildRecords.DELETED_MILLIS;
+        // the build is discarded as its record is being written, and by the time the write is done (a stalled write)
+        // its marker is old enough to go when another build is deleted
+        beforeWrite = k -> {
+            if (k.equals(key)) {
+                beforeWrite = null;
+                try {
+                    BuildRecords.delete(b1);
+                    BuildRecords.DELETED_MILLIS = -1;
+                    BuildRecords.delete(b2);
+                } catch (IOException x) {
+                    throw new UncheckedIOException(x);
+                }
+            }
+        };
+        try {
+            BuildRecords.publish(b1);
+        } finally {
+            beforeWrite = null;
+            BuildRecords.DELETED_MILLIS = kept;
+        }
+        assertNull(record(key), "not brought back by the publication still running");
+    }
+
+    @Test
     void aBuildOfAJobMadeAgainUnderTheNameOfOneWhoseBuildWasDeletedIsPublished() throws Exception {
         FreeStyleProject p = project(r, "reused");
         r.buildAndAssertSuccess(p);
