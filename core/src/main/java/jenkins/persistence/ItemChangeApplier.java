@@ -309,6 +309,10 @@ public final class ItemChangeApplier {
         if (!BuildRecords.isShared(job)) {
             return true; // the store does not share this job's builds: nothing here changes
         }
+        BuildRecords.seen(e.key(), e.kind() == ChangeEvent.Kind.DELETED ? PersistenceStore.ABSENT : e.version());
+        if (e.oldKey() != null) {
+            BuildRecords.seen(e.oldKey(), PersistenceStore.ABSENT);
+        }
         if (e.kind() == ChangeEvent.Kind.DELETED) {
             BuildRecords.deletedElsewhere(job, record.number());
         } else if (e.kind() == ChangeEvent.Kind.MOVED) {
