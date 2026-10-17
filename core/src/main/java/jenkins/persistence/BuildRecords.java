@@ -1016,6 +1016,19 @@ public final class BuildRecords {
     /** Publishes a completed build's record, then removes its running placeholder; queues a retry if either fails. */
     static void complete(@NonNull Run<?, ?> run) {
         String key = run.getParent().getFullName() + "#" + run.getNumber();
+        // as on finalizing: a build lost to another controller meanwhile (a retry or a later completion of one whose
+        // registration raced its completion) is that owner's to publish, and its placeholder that owner's
+        if (RunningBuilds.wasLost(run) || RunningBuilds.wasDiscarded(run)) {
+            unpublished.remove(key); // being discarded, or discarded already
+            return;
+        }
+        if (!RunningBuilds.owns(run)) {
+            LOGGER.warning(() -> "Not publishing " + run + ": it is owned by another controller");
+            unpublished.remove(key);
+            RunningBuilds.lost(run);
+            RunningBuilds.discard(run);
+            return;
+        }
         if (isShared(run.getParent()) && !new File(run.getRootDir(), RECORD).isFile()) {
             // nothing to publish: keep its placeholder rather than let it vanish everywhere without a record (it is
             // closed as aborted elsewhere once this controller is gone)
