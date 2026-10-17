@@ -35,6 +35,7 @@ import hudson.Functions;
 import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.logging.Level;
 import jenkins.persistence.ConflictException;
 import jenkins.persistence.InMemoryPersistenceStore;
 import jenkins.persistence.PersistenceStore;
@@ -42,6 +43,7 @@ import jenkins.persistence.PersistenceStoreProvider;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.jvnet.hudson.test.JenkinsRule;
+import org.jvnet.hudson.test.LogRecorder;
 import org.jvnet.hudson.test.TestExtension;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 
@@ -139,6 +141,16 @@ class SharedConfidentialKeysTest {
         assertNull(STORE.read("secrets/initialAdminPassword"));
         assertNull(STORE.read("secrets/some.d"));
         assertNotNull(STORE.read("secrets/test.shared.k8"), "a key still is");
+    }
+
+    @Test
+    void aTruncatedKeyInTheStoreFallsBackToALocalOne(JenkinsRule r) throws Exception {
+        // 15 bytes: not a whole number of cipher blocks
+        STORE.as("other-controller").write("secrets/test.shared.truncated", new byte[15], PersistenceStore.ABSENT);
+        LogRecorder logging = new LogRecorder().record(DefaultConfidentialStore.class, Level.WARNING).capture(10);
+        String mac = new HMACConfidentialKey("test.shared.truncated").mac("x");
+        assertTrue(logging.getMessages().stream().anyMatch(m -> m.contains("Cannot decrypt test.shared.truncated")), logging.getMessages().toString());
+        assertEquals(mac, new HMACConfidentialKey("test.shared.truncated").mac("x"), "a local key, kept");
     }
 
     @Test
