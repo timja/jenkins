@@ -380,7 +380,10 @@ public abstract class LazyBuildMixIn<JobT extends Job<JobT, RunT> & Queue.Task &
     }
 
     @Restricted(DoNotUse.class)
-    @Extension public static final class ItemListenerImpl extends ItemListener {
+    // before listeners which look at builds (e.g. Fingerprint.ProjectRenameListener), so they do not load them from the old
+    // location; but after Job.SubItemBuildsLocationImpl, which moves a builds directory outside the job's, so they are not
+    // looked for in the new location before they are there
+    @Extension(ordinal = Double.MAX_VALUE / 2) public static final class ItemListenerImpl extends ItemListener {
         @Override public void onLocationChanged(Item item, String oldFullName, String newFullName) {
             if (item instanceof LazyLoadingJob) {
                 RunMap<?> builds = ((LazyLoadingJob) item).getLazyBuildMixIn().builds;

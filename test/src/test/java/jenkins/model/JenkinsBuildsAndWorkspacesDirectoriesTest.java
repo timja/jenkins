@@ -140,6 +140,20 @@ class JenkinsBuildsAndWorkspacesDirectoriesTest {
         });
     }
 
+    @Test
+    void renameWithCustomBuildsDirKeepsBuildsNotLoaded() throws Throwable {
+        setRawBuildsDir("${JENKINS_HOME}/builds/${ITEM_FULL_NAME}/builds");
+        story.then(j -> {
+            final FreeStyleProject p = j.createFreeStyleProject("p");
+            j.buildAndAssertSuccess(p);
+            p._getRuns().purgeCache();
+            p.renameTo("renamed");
+            FreeStyleBuild b = p.getBuildByNumber(1);
+            assertNotNull(b, "a build not in memory during the rename is found in the moved directory");
+            assertTrue(b.getRootDir().isDirectory());
+        });
+    }
+
     @Issue("JENKINS-44657")
     @Test
     void testRenameWithCustomBuildsDirWithBuildsIntact() throws Throwable {
