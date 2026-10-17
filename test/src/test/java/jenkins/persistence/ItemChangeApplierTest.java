@@ -159,6 +159,25 @@ class ItemChangeApplierTest {
     }
 
     @Test
+    void aChangePutOffWhoseRetryFindsItSeenAlreadyDoesNotHoldUpLaterOnes() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("seen-meanwhile");
+        String key = "jobs/seen-meanwhile/config.xml";
+        String base = text(key);
+        try (hudson.BulkChange bc = new hudson.BulkChange(p)) {
+            p.setDescription("here"); // never saved
+            other.write(key, withQuietPeriod(base, 1), PersistenceStore.ANY);
+            Thread.sleep(200); // put off
+            PersistenceStores.seen(key, STORE.read(key).version()); // read here before its retry, as a reload here would
+            Thread.sleep(1_500); // its retry finds it seen already
+            other.write(key, withQuietPeriod(base, 2), PersistenceStore.ANY);
+            for (int i = 0; i < 100 && p.getQuietPeriod() != 2; i++) {
+                Thread.sleep(100);
+            }
+            assertEquals(2, p.getQuietPeriod(), "applied once put off enough, as any change");
+        }
+    }
+
+    @Test
     void anItemLoadedAtStartupIsNotReloadedOverAChangeNotSavedYet() throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("loaded");
         String key = "jobs/loaded/config.xml";
