@@ -1,0 +1,12 @@
+<?jelly escape-by-default='true'?>
+<!--
+  Notices that extensions show on the plugin manager's pages: the notice.jelly view of each visible PluginManagerNotice.
+-->
+<j:jelly xmlns:j="jelly:core" xmlns:st="jelly:stapler">
+  <j:invokeStatic var="notices" className="jenkins.plugins.PluginManagerNotice" method="all"/>
+  <j:forEach var="notice" items="${notices}">
+    <j:if test="${notice.visible}">
+      <st:include it="${notice}" page="notice.jelly"/>
+    </j:if>
+  </j:forEach>
+</j:jelly>
