@@ -25,7 +25,6 @@
 package jenkins.persistence;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -64,6 +63,17 @@ class DeletedJobNumberingTest {
         public boolean storesBuildRecords(String jobKey) {
             return true;
         }
+
+        @Override
+        public Set<String> children(String parentKey) {
+            Runnable r = whileCleaningUp;
+            if (r != null && parentKey.endsWith("/running")
+                    && StackWalker.getInstance().walk(frames -> frames.anyMatch(f -> f.getMethodName().equals("deleteAll")))) {
+                whileCleaningUp = null;
+                r.run();
+            }
+            return super.children(parentKey);
+        }
     };
     static final InMemoryBlobStore BLOBS = new InMemoryBlobStore();
 
@@ -74,6 +84,7 @@ class DeletedJobNumberingTest {
         r = rule;
         BLOBS.clear();
         whileDeleting = null;
+        whileCleaningUp = null;
     }
 
     private static String stored(String key) {
@@ -152,6 +163,9 @@ class DeletedJobNumberingTest {
     /** Run once by {@link RecreateWhileDeleting} after a job's directory is deleted here, before its builds are cleaned up. */
     static volatile Runnable whileDeleting;
 
+    /** Run once while the builds of a deleted job are cleaned up, once its records are deleted, before its snapshots are. */
+    static volatile Runnable whileCleaningUp;
+
     @Test
     void jobRecreatedElsewhereWhileDeletingHereKeepsItsBuilds() throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("remade");
@@ -191,6 +205,7 @@ class DeletedJobNumberingTest {
             // deleted elsewhere, which cleans up build 1; build 2 is published late from here
             other.delete("jobs/late/config.xml", PersistenceStore.ANY);
             other.delete("jobs/late/builds/1/build.xml", PersistenceStore.ANY);
+            BLOBS.delete("jobs/late/builds/1");
             // the deletion is being applied here (waiting for this lock) when the job is made again elsewhere
             for (int i = 0; i < 500 && !ItemDeletion.isRegistered(p); i++) {
                 Thread.sleep(10);
@@ -203,9 +218,105 @@ class DeletedJobNumberingTest {
         awaitApplied();
 
         assertEquals(List.of("3"), builds("late"), "the late build of the deleted job removed, the new job's kept");
-        assertTrue(BLOBS.keys().contains("jobs/late/builds/3/files.tgz"));
-        assertFalse(BLOBS.keys().contains("jobs/late/builds/2/files.tgz"));
+        assertEquals(Set.of("jobs/late/builds/3/files.tgz"), Set.copyOf(BLOBS.keys()));
         STORE.delete("jobs/late/config.xml", PersistenceStore.ANY); // not loaded by the next tests
+    }
+
+    @Test
+    void deletionAppliedAfterARenameOntoTheNameKeepsTheRenamedJobsBuilds() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("onto");
+        for (int i = 0; i < 3; i++) {
+            r.buildAndAssertSuccess(p);
+        }
+        byte[] config = STORE.read("jobs/onto/config.xml").content();
+        byte[] record = STORE.read("jobs/onto/builds/1/build.xml").content();
+        PersistenceStore other = STORE.as("other-controller");
+        synchronized (p) { // this controller finishes applying the deletion only once all of this happened
+            // deleted elsewhere, which cleans up builds 1 and 2; build 3 is published late from here
+            other.delete("jobs/onto/config.xml", PersistenceStore.ANY);
+            for (int n = 1; n <= 2; n++) {
+                other.delete("jobs/onto/builds/" + n + "/build.xml", PersistenceStore.ANY);
+                BLOBS.delete("jobs/onto/builds/" + n);
+            }
+            for (int i = 0; i < 500 && !ItemDeletion.isRegistered(p); i++) {
+                Thread.sleep(10);
+            }
+            assertTrue(ItemDeletion.isRegistered(p), "deletion under way");
+            // then another job is renamed to the name, with its build 1, which keeps its number (as a move stores it)
+            other.write("jobs/onto/config.xml", config, PersistenceStore.ABSENT);
+            BLOBS.put("jobs/onto/builds/1/files.tgz", new ByteArrayInputStream(new byte[] {1}), 1);
+            other.write("jobs/onto/builds/1/build.xml", record, PersistenceStore.ABSENT);
+        }
+        awaitApplied();
+
+        assertEquals(List.of("1"), builds("onto"), "the renamed job's build kept, the late build of the deleted job removed");
+        assertEquals(Set.of("jobs/onto/builds/1/files.tgz"), Set.copyOf(BLOBS.keys()));
+        STORE.delete("jobs/onto/config.xml", PersistenceStore.ANY); // not loaded by the next tests
+    }
+
+    @Test
+    void jobRecreatedElsewhereWhileItsBuildsAreCleanedUpKeepsItsSnapshots() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("again");
+        r.buildAndAssertSuccess(p);
+        r.buildAndAssertSuccess(p);
+        byte[] config = STORE.read("jobs/again/config.xml").content();
+        byte[] record = STORE.read("jobs/again/builds/2/build.xml").content();
+        PersistenceStore other = STORE.as("other-controller");
+        whileCleaningUp = () -> {
+            try {
+                // the other controller makes the job again, and runs a build, once the records are deleted here
+                other.write("jobs/again/config.xml", config, PersistenceStore.ABSENT);
+                BLOBS.put("jobs/again/builds/3/files.tgz", new ByteArrayInputStream(new byte[] {1}), 1);
+                other.write("jobs/again/builds/3/build.xml", record, PersistenceStore.ABSENT);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        };
+        p.delete();
+        awaitApplied();
+
+        assertNull(whileCleaningUp, "made again during the cleanup");
+        assertEquals(List.of("3"), builds("again"));
+        assertEquals(Set.of("jobs/again/builds/3/files.tgz"), Set.copyOf(BLOBS.keys()), "the new job's snapshot kept");
+        STORE.delete("jobs/again/config.xml", PersistenceStore.ANY); // not loaded by the next tests
+    }
+
+    @Test
+    void cutoffIsTheStoredSequenceWhenOtherControllersBuiltSince() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("x");
+        r.buildAndAssertSuccess(p);
+        byte[] config = STORE.read("jobs/x/config.xml").content();
+        byte[] record = STORE.read("jobs/x/builds/1/build.xml").content();
+        PersistenceStore other = STORE.as("other-controller");
+        // the other controller ran #2 of this job, which this controller's own next build number does not know of
+        other.write("jobs/x/nextBuildNumber", "3\n".getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        other.write("jobs/x/builds/2/build.xml", record, PersistenceStore.ABSENT);
+        whileDeleting = () -> {
+            try {
+                // and makes the job again, with its build #3, while the directory is deleted here
+                other.write("jobs/x/config.xml", config, PersistenceStore.ABSENT);
+                other.write("jobs/x/nextBuildNumber", "4\n".getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+                other.write("jobs/x/builds/3/build.xml", record, PersistenceStore.ABSENT);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        };
+        p.delete();
+        awaitApplied();
+
+        assertEquals(List.of("3"), builds("x"), "the deleted job's #2 removed too");
+        STORE.delete("jobs/x/config.xml", PersistenceStore.ANY); // not loaded by the next tests
+    }
+
+    @Test
+    void storedNamesParseToTheirNumberOrAboveAny() {
+        assertEquals(5, BuildRecords.numberOf("5"));
+        assertEquals(5, BuildRecords.numberOf("5.xml"));
+        assertEquals(1000000000, BuildRecords.numberOf("1000000000"));
+        assertEquals(1000000000, BuildRecords.numberOf("1000000000.xml"));
+        assertEquals(Integer.MAX_VALUE, BuildRecords.numberOf("99999999999"));
+        assertEquals(Integer.MAX_VALUE, BuildRecords.numberOf("9999999999999999999999"));
+        assertEquals(Integer.MAX_VALUE, BuildRecords.numberOf("lastStable"));
     }
 
     /** The numbers of the builds of a job stored. */
