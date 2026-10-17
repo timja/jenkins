@@ -144,7 +144,8 @@ public final class SharedQueue {
         for (Action a : actions) {
             if (a instanceof ParametersAction pa) {
                 for (ParameterValue v : pa.getParameters()) {
-                    parameters.add(encode(v));
+                    // while queued a ParametersAction may hold nulls; one field cannot pass for a parameter's three
+                    parameters.add(v == null ? encode("null") : encode(v));
                 }
             } else if (a instanceof Queue.QueueAction || a instanceof FoldableAction && !(a instanceof CauseAction)) {
                 others.add(encode(a.getClass().getName(), Queue.XSTREAM.toXML(a)));
@@ -385,8 +386,25 @@ public final class SharedQueue {
         }
 
         private static ClusterQueue.Record record(Queue.Item item, List<Action> actions) {
+            String key = dedupKey(item.task, actions);
+            if (keptApart(actions)) {
+                key += "#apart:" + item.getId(); // folds into nothing
+            }
             return new ClusterQueue.Record(item.getId(), ((Job<?, ?>) item.task).getFullName(),
-                    dedupKey(item.task, actions), toXml(actions), dueOf(item), ClusterQueue.State.WAITING, origin(), pinnedTo(actions), null, 0);
+                    key, toXml(actions), dueOf(item), ClusterQueue.State.WAITING, origin(), pinnedTo(actions), null, 0);
+        }
+
+        /**
+         * Whether the local queue would keep a request apart even from an item with equal actions: one of its
+         * {@link Queue.QueueAction}s (such as a replay's) asks for a new item whatever is queued.
+         */
+        private static boolean keptApart(List<Action> actions) {
+            for (Action a : actions) {
+                if (a instanceof Queue.QueueAction qa && qa.shouldSchedule(new ArrayList<>(actions))) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         /**
@@ -423,9 +441,16 @@ public final class SharedQueue {
                     // the same job and parameters were already waiting (scheduled elsewhere at the same time): fold into
                     // that item, then drop this one, which has not started (the gate held it)
                     LOGGER.fine(() -> item + " folds into queue item " + stored.id() + " from " + stored.origin());
-                    fold(cq, stored.id(), actions, dueOf(item), record.pinnedTo());
+                    if (!fold(cq, stored.id(), actions, dueOf(item), record.pinnedTo())) {
+                        // taken meanwhile: this one is kept, and, nothing being known under its id, the gate has it
+                        // published again (as an item of its own, or folded into another waiting one)
+                        return;
+                    }
+                    // requests folded into this one here meanwhile, shared after this, go where it went
+                    foldedInto.put(id, stored.id());
                     // by id: with no quiet period, it may be blocked or buildable by now
                     PersistenceStores.applyingRemoteChange(() -> Queue.getInstance().cancelLocal(id));
+                    outbox(id).submit(() -> foldedInto.remove(id)); // after those: none come once it is cancelled
                     Mirror.mirror(stored.id());
                 }
             } catch (IOException | RuntimeException e) {
@@ -443,25 +468,30 @@ public final class SharedQueue {
          * Merges a request into a waiting item, compare-and-set: one fold elsewhere at the same time is kept.
          *
          * @param pinTo pins the item to this controller, unless it is pinned already: the request must run here
+         * @return whether the request was merged into it
          */
-        private static void fold(ClusterQueue cq, long id, List<Action> actions, long due, @CheckForNull String pinTo) throws IOException {
+        private static boolean fold(ClusterQueue cq, long id, List<Action> actions, long due, @CheckForNull String pinTo) throws IOException {
             for (int attempt = 0; attempt < 20; attempt++) {
                 ClusterQueue.Record now = cq.get(id);
                 if (now == null || now.state() != ClusterQueue.State.WAITING) {
                     if (pinTo != null && now != null && !pinTo.equals(now.claimedBy())) {
                         LOGGER.info(() -> "Queue item " + id + " was taken by " + now.claimedBy() + " before a request needing this controller was folded into it");
                     }
-                    return; // started (or cancelled) meanwhile, as a request folded a moment later would have found
+                    return false; // started (or cancelled) meanwhile, as a request folded a moment later would have found
                 }
                 if (cq.update(id, now.actions(), toXml(merge(fromXml(now.actions()), actions)), Math.min(now.dueAt(), due), pinTo)) {
                     if (pinTo != null && now.pinnedTo() != null && !pinTo.equals(now.pinnedTo())) {
                         LOGGER.info(() -> "Queue item " + id + " is pinned to " + now.pinnedTo() + "; a request needing this controller was folded into it");
                     }
-                    return;
+                    return true;
                 }
             }
             LOGGER.warning(() -> "Queue item " + id + " kept changing; a request folded into it may lack its cause");
+            return false;
         }
+
+        /** Local items folded into an item from elsewhere when shared, by id: the item folded into, by the time it was. */
+        private static final Map<Long, Long> foldedInto = new ConcurrentHashMap<>();
 
         @Override
         public void onFolded(Queue.Item item, List<Action> request) {
@@ -475,7 +505,7 @@ public final class SharedQueue {
             // after the item's publication (the same outbox thread): only the request is merged into what is stored
             outbox(id).submit(() -> {
                 try {
-                    fold(queue(), id, actions, due, pinTo);
+                    fold(queue(), foldedInto.getOrDefault(id, id), actions, due, pinTo);
                 } catch (IOException | RuntimeException e) {
                     LOGGER.log(Level.WARNING, "Failed to share changes to queue item " + id, e);
                 }

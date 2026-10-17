@@ -93,6 +93,9 @@ class SharedQueueTest {
     /** Publishing an item of job "flaky" fails after the store took it: the answer is lost. */
     static final String FLAKY = "flaky";
 
+    /** If set, called with the id of an item about to be updated (folded into). */
+    static volatile java.util.function.LongConsumer beforeUpdate;
+
     private static ClusterQueue slowFor(ClusterQueue cq) {
         return new ClusterQueue() {
             @Override
@@ -125,6 +128,10 @@ class SharedQueueTest {
 
             @Override
             public boolean update(long id, String expectedActions, String actions, long dueAt, String pinTo) throws java.io.IOException {
+                java.util.function.LongConsumer hook = beforeUpdate;
+                if (hook != null) {
+                    hook.accept(id);
+                }
                 return cq.update(id, expectedActions, actions, dueAt, pinTo);
             }
 
@@ -563,6 +570,80 @@ class SharedQueueTest {
     }
 
     @Test
+    void aRequestWithANullParameterIsSharedAndStarts() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("null-parameter");
+        // while queued, a ParametersAction keeps the nulls it was given
+        QueueTaskFuture<FreeStyleBuild> f = p.scheduleBuild2(0, new ParametersAction(java.util.Arrays.asList(new StringParameterValue("a", "x"), null)));
+        // it starts (how the build then copes with the null is up to it, as without a shared queue)
+        r.waitForCompletion(f.getStartCondition().get(60, java.util.concurrent.TimeUnit.SECONDS));
+        assertEquals(STORE.getOrigin(), awaitShared(p.getLastBuild().getQueueId(), x -> x.state() == ClusterQueue.State.STARTED).claimedBy());
+    }
+
+    @Test
+    void aRequestWhoseItemWasTakenAsItFoldedIsSharedOnItsOwn() throws Exception {
+        String name = "slow-taken-meanwhile";
+        FreeStyleProject slow = r.createFreeStyleProject(name);
+        slowPublish = new java.util.concurrent.CountDownLatch(1);
+        ClusterQueue.Record rec;
+        long here;
+        try {
+            slow.scheduleBuild2(0, new CauseAction(new Cause.UserIdCause("here")));
+            here = Queue.getInstance().getItems()[0].getId();
+            ClusterQueue.Record there = publishElsewhere(name, 60_000, "there");
+            rec = there;
+            // the other controller claims its item just as this one's request is folded into it
+            beforeUpdate = id -> {
+                if (id == there.id()) {
+                    beforeUpdate = null;
+                    try {
+                        assertTrue(other.claim(there.id()));
+                    } catch (java.io.IOException e) {
+                        throw new java.io.UncheckedIOException(e);
+                    }
+                }
+            };
+            slowPublish.countDown();
+            for (int i = 0; i < 100 && slow.getLastBuild() == null; i++) {
+                Thread.sleep(100);
+            }
+        } finally {
+            beforeUpdate = null;
+            slowPublish.countDown();
+            slowPublish = null;
+        }
+        assertNotNull(slow.getLastBuild(), "the request is not lost");
+        r.waitForCompletion(slow.getLastBuild());
+        assertEquals(here, slow.getLastBuild().getQueueId(), "shared as an item of its own");
+        assertNotNull(slow.getLastBuild().getCause(Cause.UserIdCause.class));
+        assertEquals("here", slow.getLastBuild().getCause(Cause.UserIdCause.class).getUserId());
+        other.cancel(rec.id()); // the store outlives this test (claimed by the other controller, which never starts it)
+    }
+
+    @Test
+    void aRequestFoldedHereWhileItsItemFoldsIntoOneFromElsewhereFollowsIt() throws Exception {
+        String name = "slow-folded-follows";
+        FreeStyleProject slow = r.createFreeStyleProject(name);
+        slowPublish = new java.util.concurrent.CountDownLatch(1);
+        ClusterQueue.Record rec;
+        try {
+            slow.scheduleBuild2(60, new CauseAction(new Cause.UserIdCause("uma")));
+            // folded locally (as a build step's request: its action is added to the item), shared after
+            slow.scheduleBuild2(60, new CauseAction(new Cause.UserIdCause("vic")), new Folds("follows"));
+            rec = publishElsewhere(name, 60_000, "wes"); // while this one's publication waits
+            slowPublish.countDown();
+            ClusterQueue.Record now = awaitShared(rec.id(), x -> x.actions().contains("follows"));
+            assertThat(now.actions(), containsString("follows"));
+            assertThat(causes(now), containsString("wes"));
+            assertThat(causes(now), containsString("uma"));
+            assertThat(causes(now), containsString("vic"));
+        } finally {
+            slowPublish.countDown();
+            slowPublish = null;
+        }
+        other.cancel(rec.id()); // the store outlives this test
+    }
+
+    @Test
     void dedupKeysAreUnambiguousAndKeepSensitiveValuesOut() throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("keys");
         String one = SharedQueue.dedupKey(p, List.of(new ParametersAction(new StringParameterValue("a", "x\nb=y"))));
@@ -581,12 +662,15 @@ class SharedQueueTest {
         FreeStyleProject p = r.createFreeStyleProject("apart");
         p.scheduleBuild2(60, new KeptApart("one"));
         p.scheduleBuild2(60, new KeptApart("two"));
-        assertEquals(2, Queue.getInstance().getItems().length, "kept apart here");
+        // equal requests too (as replaying a Pipeline twice with the same script): asked, the action keeps them apart
+        p.scheduleBuild2(60, new KeptApart("same"));
+        p.scheduleBuild2(60, new KeptApart("same"));
+        assertEquals(4, Queue.getInstance().getItems().length, "kept apart here");
         for (Queue.Item item : Queue.getInstance().getItems()) {
             assertEquals(item.getId(), awaitShared(item.getId(), x -> true).id(), "shared as an item of its own");
         }
         Thread.sleep(500); // a fold would have cancelled one by now
-        assertEquals(2, Queue.getInstance().getItems().length, "both still waiting");
+        assertEquals(4, Queue.getInstance().getItems().length, "all still waiting");
         Queue.getInstance().clear();
     }
 
