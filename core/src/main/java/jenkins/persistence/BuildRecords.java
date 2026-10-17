@@ -540,6 +540,18 @@ public final class BuildRecords {
         if (runs == null || builds == null) {
             return;
         }
+        Run<?, ?> running = runs.getLoadedBuilds().get(number);
+        if (running != null && running.isBuilding()) {
+            // a record of a build running here is stored only by a controller which took it over (this one cut off
+            // meanwhile): never put over the running build, which is stopped once the lease says it is lost; its copy
+            // here is then discarded, and the record recognised
+            if (!RunningBuilds.owns(running)) {
+                RunningBuilds.lost(running);
+            } else {
+                LOGGER.warning(() -> "Not applying the record of " + running + " stored elsewhere: it runs here, under this controller's lease");
+            }
+            return;
+        }
         File dir = new File(job.getBuildDir(), String.valueOf(number));
         // under the lock materialization holds (RunMap.retrieve): one in progress is waited for and then refreshed,
         // rather than taken for not there yet and left with the record it read before this change

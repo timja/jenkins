@@ -34,6 +34,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -315,6 +316,35 @@ class BuildLeasesTest {
         assertFalse(dir.exists(), "local copy discarded");
         assertNull(p.getBuildByNumber(1));
         forget("partitioned");
+    }
+
+    @Test
+    void aRecordStoredElsewhereForABuildRunningHereStopsItRatherThanReplacingIt() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        FreeStyleProject p = blocking(r, "overtaken", started, release);
+        QueueTaskFuture<FreeStyleBuild> f = p.scheduleBuild2(0);
+        assertTrue(started.await(60, TimeUnit.SECONDS));
+        FreeStyleBuild b = p.getBuildByNumber(1);
+        String key = "jobs/overtaken/running/1.xml";
+        // cut off: another controller took it over and completed it, and its record arrives before this controller's
+        // next ownership check
+        live = Set.of("dead-controller");
+        long theirs = dead.leases().acquire(key);
+        dead.write(key, placeholder("dead-controller", 1, theirs, ""), PersistenceStore.ANY);
+        live = null;
+        dead.write("jobs/overtaken/builds/1/build.xml", "<?xml version='1.1' encoding='UTF-8'?><build><result>SUCCESS</result></build>"
+                .getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+        for (int i = 0; i < 300 && !ItemChangeApplier.isIdle(); i++) {
+            Thread.sleep(10);
+        }
+        assertSame(b, p.getBuildByNumber(1), "the running build is not replaced by the record");
+        release.countDown();
+        FreeStyleBuild done = f.get(60, TimeUnit.SECONDS);
+        assertEquals(Result.ABORTED, done.getResult(), "stopped: lost");
+        assertThat(done.getLog(), containsString("Another controller took over this build"));
+        STORE.delete("jobs/overtaken/builds/1/build.xml", PersistenceStore.ANY);
+        forget("overtaken");
     }
 
     /** Removes what a test left in the store, which outlives it, so that later tests neither load nor sweep it. */
