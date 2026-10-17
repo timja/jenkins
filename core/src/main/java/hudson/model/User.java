@@ -939,6 +939,7 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
         if (route != null) {
             route.delete();
         }
+        jenkins.persistence.ItemFiles.userDeleted(getUserFolderFor(id)); // and its shared plugin files: a user made again with this id takes none
         Util.deleteRecursive(getUserFolderFor(id));
         UserDetailsCache.get().invalidate(idKey);
     }
@@ -1258,6 +1259,10 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
         }
     }
 
+    /** How many times applying a change made elsewhere was put off, by user id, because a save was pending here. */
+    private static final Map<String, Integer> PUT_OFF = new ConcurrentHashMap<>();
+    private static final int MAX_PUT_OFF = 3;
+
     /**
      * Applies a change another controller made to a user's configuration in a shared persistence store:
      * reloads the user if known here, loads it if new, or forgets it if deleted. Nothing is saved.
@@ -1286,6 +1291,7 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
             }
             File dir = new File(getUsersDirectory(), dirName);
             if (!dirName.equals(".") && !dirName.equals("..") && getUsersDirectory().equals(dir.getParentFile())) {
+                jenkins.persistence.ItemFiles.userDeleted(dir); // what was shared of it is forgotten here
                 try {
                     Util.deleteRecursive(dir); // its local copy too: nothing here brings it back
                 } catch (IOException e) {
@@ -1297,7 +1303,14 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
             // save of it is pending here: that save conflicts and is merged instead (put off and retried, Target 14)
             synchronized (known) {
                 if (jenkins.persistence.PersistenceStores.hasUnsavedChanges(known.getConfigFile(), known)) {
-                    throw new IllegalStateException("User " + known.id + " has a save pending; applying the change later");
+                    // put off a few times (the applier retries with backoff), then applied anyway, as items are: an
+                    // object changed in memory and never saved (e.g. JCasC re-hashing a declared password on each
+                    // controller) would otherwise never get changes made elsewhere again
+                    if (PUT_OFF.merge(known.id, 1, Integer::sum) <= MAX_PUT_OFF) {
+                        throw new IllegalStateException("User " + known.id + " has a save pending; applying the change later");
+                    }
+                    String id = known.id;
+                    LOGGER.fine(() -> "Applying a change to " + id + " although it still has unsaved changes");
                 }
                 // load() takes a read failure for "no configuration" and resets the user (its password, tokens) to
                 // defaults: read it once, peeking, and load it from what was read, so that a store unavailable now fails
@@ -1319,6 +1332,7 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
                 } catch (IOException e) {
                     throw new java.io.UncheckedIOException("Cannot read user " + known.id + " changed elsewhere; applying the change later", e);
                 }
+                PUT_OFF.remove(known.id);
                 jenkins.persistence.PersistenceStores.synced(known.getConfigFile(), known);
             }
         } else {

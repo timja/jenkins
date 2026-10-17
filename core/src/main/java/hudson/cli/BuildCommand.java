@@ -174,7 +174,17 @@ public class BuildCommand extends CLICommand {
             if (f == null) {
                 throw new IllegalStateException(BUILD_SCHEDULING_REFUSED);
             }
-            Run<?, ?> b = f.waitForStart();    // wait for the start
+            Run<?, ?> b;
+            try {
+                b = f.waitForStart();    // wait for the start
+            } catch (java.util.concurrent.CancellationException e) {
+                // on a cluster of controllers (Target 15), another may have started it: this one's item is then cancelled
+                int number = jenkins.persistence.SharedQueue.startedElsewhere(item.getId(), 30);
+                if (number < 0) {
+                    throw e;
+                }
+                return followElsewhere(job, number);
+            }
             stdout.println("Started " + b.getFullDisplayName());
             stdout.flush();
 
@@ -221,6 +231,37 @@ public class BuildCommand extends CLICommand {
         }
 
         return 0;
+    }
+
+    /** {@code build -s/-f/-v} for a build another controller started (Target 15). */
+    private int followElsewhere(Job<?, ?> job, int number) throws Exception {
+        stdout.println("Started " + job.getFullDisplayName() + " #" + number + " (on another controller)");
+        stdout.flush();
+        if (!(sync || follow)) {
+            return 0;
+        }
+        Run<?, ?> done;
+        try {
+            if (consoleOutput) {
+                jenkins.persistence.RunningBuilds.followElsewhere(job, number, true, stdout);
+            }
+            do {
+                done = jenkins.persistence.RunningBuilds.awaitRecord(job, number, 60);
+            } while (done == null);
+        } catch (InterruptedException e) {
+            // as for a build running here: -f leaves it running, -s stops it (if allowed)
+            if (follow) {
+                return 125;
+            }
+            if (job.hasPermission(Item.CANCEL)) {
+                jenkins.persistence.RunningBuilds.requestStop(job, number, Jenkins.getAuthentication2().getName());
+            }
+            Exception myException = new AbortException();
+            myException.initCause(e);
+            throw myException;
+        }
+        stdout.println("Completed " + done.getFullDisplayName() + " : " + done.getResult());
+        return done.getResult().ordinal;
     }
 
     @Override

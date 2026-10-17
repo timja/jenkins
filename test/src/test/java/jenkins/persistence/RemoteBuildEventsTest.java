@@ -123,6 +123,25 @@ class RemoteBuildEventsTest {
             BLOBS.put("jobs/" + job + "/builds/" + number + "/files.tgz", new ByteArrayInputStream(bytes), bytes.length);
         }
         other.write("jobs/" + job + "/builds/" + number + "/build.xml", recordXml.getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        // as the controller completing a build does, it then updates the shared permalinks (StoredPermalinks)
+        boolean ok = recordXml.contains("<result>SUCCESS</result>");
+        String key = "jobs/" + job + "/builds/permalinks";
+        PersistenceStore.Entry e = other.read(key);
+        java.util.Map<String, String> links = new java.util.TreeMap<>();
+        if (e != null) {
+            for (String line : new String(e.content(), StandardCharsets.UTF_8).split("\n")) {
+                if (line.contains(" ")) {
+                    links.put(line.substring(0, line.indexOf(' ')), line.substring(line.indexOf(' ') + 1));
+                }
+            }
+        }
+        for (String id : ok ? List.of("lastCompletedBuild", "lastSuccessfulBuild", "lastStableBuild")
+                : List.of("lastCompletedBuild", "lastFailedBuild", "lastUnsuccessfulBuild")) {
+            links.put(id, String.valueOf(number));
+        }
+        StringBuilder sb = new StringBuilder();
+        links.forEach((id, n) -> sb.append(id).append(' ').append(n).append('\n'));
+        other.write(key, sb.toString().getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
         awaitApplied();
     }
 

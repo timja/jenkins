@@ -292,6 +292,10 @@ public abstract class ItemGroupMixIn {
         final File rootDir = result.getRootDir();
         result = Items.callWhileUpdatingByXml(() -> (T) Items.load(parent, rootDir));
         result.onCopiedFrom(src);
+        if (result instanceof AbstractItem copy) {
+            copy.newItemUuid(); // a copy is another item (it had the source's from the copied configuration)
+            copy.save();
+        }
 
         add(result);
         ItemListener.fireOnCopied(src, result);
@@ -338,6 +342,12 @@ public abstract class ItemGroupMixIn {
             }
             if (!applicableIn) {
                 throw new AccessDeniedException(result.getDescriptor().clazz.getName() + " is not applicable in " + parent.getFullName());
+            }
+            if (result instanceof AbstractItem created) {
+                // a new item, whatever identity the posted configuration had: as for a copy (another controller of a
+                // cluster may have been given the same configuration, and the item it made the same identity)
+                created.newItemUuid();
+                created.save();
             }
 
             add(result);

@@ -87,7 +87,19 @@ class StaticStateApplierTest {
             ReadHook hook = onRead;
             return hook == null ? super.read(key) : hook.read(key, () -> super.read(key));
         }
+
+        @Override
+        public long write(String key, byte[] content, long expectedVersion) throws ConflictException {
+            if (key.equals(failWrite)) {
+                failWrite = null;
+                throw new java.io.UncheckedIOException(new java.io.IOException("the store is unreachable, this time"));
+            }
+            return super.write(key, content, expectedVersion);
+        }
     };
+
+    /** A key whose next write here fails. */
+    static volatile String failWrite;
 
     /** Reads made here, which a test can delay or precede with a change made elsewhere. */
     interface ReadHook {
@@ -112,6 +124,7 @@ class StaticStateApplierTest {
     @BeforeEach
     void setUp(JenkinsRule rule) {
         onRead = null;
+        failWrite = null;
         r = rule;
         other = STORE.as("other-controller");
     }
@@ -188,6 +201,16 @@ class StaticStateApplierTest {
         assertNull(r.jenkins.getSystemMessage());
         r.jenkins.save();
         assertFalse(text("config.xml").contains("<systemMessage>"));
+    }
+
+    @Test
+    void theExecutorsFollowTheirNumberWhenItsSaveFails() throws Exception {
+        r.jenkins.setNumExecutors(2);
+        failWrite = "config.xml";
+        org.junit.jupiter.api.Assertions.assertThrows(Exception.class, () -> r.jenkins.setNumExecutors(3));
+        assertNull(failWrite, "the save failed");
+        assertEquals(3, r.jenkins.getNumExecutors());
+        assertEquals(3, r.jenkins.toComputer().getNumExecutors(), "computers updated all the same");
     }
 
     @Test
@@ -500,6 +523,24 @@ class StaticStateApplierTest {
         assertThrows(UsernameNotFoundException.class, () -> realm.loadUserByUsername2("carol"));
         JenkinsRule.WebClient wc = r.createWebClient();
         assertThrows(Exception.class, () -> wc.login("carol", "carol-password-1"));
+    }
+
+    @Test
+    void aUserChangedInMemoryAndNeverSavedStillGetsChangesMadeElsewhere() throws Exception {
+        User carol = User.getById("carol", true);
+        carol.setFullName("Carol");
+        carol.save();
+        Method folder = User.class.getDeclaredMethod("getUserFolderNameFor", String.class);
+        folder.setAccessible(true);
+        String key = "users/" + folder.invoke(null, "carol") + "/config.xml";
+        // changed here and never saved (as JCasC re-hashing a declared password does on each controller)
+        carol.setDescription("changed here, not saved");
+        other.write(key, text(key).replace("<fullName>Carol</fullName>", "<fullName>Carol Elsewhere</fullName>")
+                .getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        for (int i = 0; i < 300 && !"Carol Elsewhere".equals(User.getById("carol", false).getFullName()); i++) {
+            Thread.sleep(100);
+        }
+        assertEquals("Carol Elsewhere", User.getById("carol", false).getFullName(), "applied after being put off a few times");
     }
 
     @Test

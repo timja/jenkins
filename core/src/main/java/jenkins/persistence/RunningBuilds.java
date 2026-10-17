@@ -42,6 +42,7 @@ import hudson.security.ACL;
 import hudson.security.ACLContext;
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.StringReader;
 import java.io.StringWriter;
 import java.net.InetAddress;
@@ -98,6 +99,8 @@ public final class RunningBuilds {
     static final String PREFIX = "running";
     private static final String SUFFIX = ".xml";
     private static final String STOP_SUFFIX = ".stop";
+    /** Deliveries for a running build's steps: {@code running/<N>.deliver-<id>} (Target 15). */
+    private static final String DELIVER_INFIX = ".deliver-";
 
     /**
      * How this controller is named in placeholders; defaults to the host name.
@@ -111,6 +114,9 @@ public final class RunningBuilds {
 
     /** Placeholders per job key, kept up to date by change events; loaded from the store on first use. */
     private static final Map<String, List<Placeholder>> cache = new ConcurrentHashMap<>();
+
+    /** The placeholder property recording a completed build's result until its record is published. */
+    static final String RESULT = "result";
 
     private RunningBuilds() {}
 
@@ -390,6 +396,12 @@ public final class RunningBuilds {
      * or a Pipeline's execution) may be saved after its key is no longer {@link #lost}, and must never be published.
      */
     private static final Set<Run<?, ?>> discarded = Collections.synchronizedSet(Collections.newSetFromMap(new WeakHashMap<>()));
+    /**
+     * One lock per owned build, so that its placeholder is updated by one thread at a time: two updates at once (a
+     * Pipeline's last save point, and its result as it completes) would each compare-and-set the same version, and the
+     * one failing would take the build for lost.
+     */
+    private static final Map<String, Object> updating = new ConcurrentHashMap<>();
 
     @CheckForNull
     private static String placeholderKey(@NonNull Run<?, ?> run) {
@@ -434,6 +446,16 @@ public final class RunningBuilds {
         }
     }
 
+    /** Whether a build's saved record says it completed (a record of a running build has no result yet). */
+    private static boolean completedLocally(File buildXml) {
+        try {
+            String xml = java.nio.file.Files.readString(buildXml.toPath(), java.nio.charset.StandardCharsets.UTF_8);
+            return xml.contains("<result>") && !xml.contains("<completed>false</completed>");
+        } catch (IOException | RuntimeException e) {
+            return false;
+        }
+    }
+
     /**
      * Takes over the lease of a build this controller's previous incarnation (the same name, another origin) was running,
      * before it is loaded from this home.
@@ -450,16 +472,26 @@ public final class RunningBuilds {
         if (owned.containsKey(key)) {
             return true;
         }
+        // first what costs nothing: a fresh home has no copy of most builds (asked of each stored number at startup,
+        // 20,000 per job with a long history: no store calls for them, which a busy store made take minutes)
+        File local = new File(new File(job.getBuildDir(), String.valueOf(number)), "build.xml");
+        if (!local.isFile()) {
+            return true; // nothing of a previous run here
+        }
         Placeholder cached = null;
         for (Placeholder p : all(job)) {
             if (p.number == number) {
                 cached = p;
             }
         }
-        if (cached == null || !CONTROLLER_NAME.equals(cached.controller) || store.getOrigin().equals(cached.origin)
-                || !new File(new File(job.getBuildDir(), String.valueOf(number)), "build.xml").isFile()) {
-            return true; // not one this controller was running before a restart
+        if (cached != null && store.getOrigin().equals(cached.origin)) {
+            return true; // this very process runs it
         }
+        if (cached == null && completedLocally(local)) {
+            return true; // not running anywhere (the placeholders listed may be stale: a running build is checked below)
+        }
+        // a build this home has, running somewhere: this controller's previous run had it, and another controller may
+        // have adopted it meanwhile (a restart takes longer than seeing a controller gone): ask the store, not the cache
         PersistenceStore.Entry entry = store.read(key);
         Placeholder p = entry == null ? null : Placeholder.fromBytes(key, number, entry.content(), entry.version());
         if (p == null || !CONTROLLER_NAME.equals(p.controller)) {
@@ -467,7 +499,17 @@ public final class RunningBuilds {
                 LOGGER.info(() -> job.getFullName() + " #" + number + " was adopted by " + p.controller + " while this controller restarted; not resuming it here");
                 return false;
             }
-            return true; // completed meanwhile
+            if (completedLocally(local)) {
+                return true; // completed here before the restart
+            }
+            // no placeholder, and the copy here says running: it completed elsewhere (adopted while this controller was
+            // down): load its record, not this copy, which would resume it a second time
+            if (BuildRecords.materialize(job, local.getParentFile())) {
+                LOGGER.info(() -> job.getFullName() + " #" + number + " completed elsewhere while this controller restarted; loading its record");
+                return true;
+            }
+            LOGGER.info(() -> job.getFullName() + " #" + number + " is neither running nor recorded anywhere; not resuming it here");
+            return false;
         }
         if (store.getOrigin().equals(p.origin)) {
             return true;
@@ -503,6 +545,8 @@ public final class RunningBuilds {
             invalidate(jobKeyOfRunning(runningKey));
             LOGGER.info(() -> "Reclaimed " + job.getFullName() + " #" + number + " from this controller's previous run (" + p.origin + ") with epoch " + epoch);
             reclaimed = true;
+            // e.g. a downstream build completed while this controller was down: its delivery's event was not received
+            pendingDeliveriesOf(jobKeyOfRunning(runningKey), number, 0);
             return true;
         } finally {
             if (!reclaimed) {
@@ -546,7 +590,8 @@ public final class RunningBuilds {
     }
 
     /**
-     * Records properties of a running build in its placeholder, for example where its latest save point is.
+     * Records properties of a running build in its placeholder, for example where its latest save point is; those
+     * recorded before are kept unless given again.
      * Conditional on this controller still owning the build: the write is a compare-and-set on the placeholder
      * as this controller last wrote it, so it fails if another controller has adopted the build since.
      *
@@ -558,21 +603,28 @@ public final class RunningBuilds {
         if (key != null && lost.contains(key)) {
             throw new ConflictException(key, PersistenceStore.ANY, PersistenceStore.ANY); // no longer owned here (lost forgets it)
         }
-        Placeholder p = key == null ? null : owned.get(key);
-        if (p == null) {
+        if (key == null || !owned.containsKey(key)) {
             return;
         }
-        if (lost.contains(key) || !owns(run)) {
-            throw new ConflictException(key, p.version, PersistenceStore.ANY);
+        synchronized (updating.computeIfAbsent(key, k -> new Object())) {
+            Placeholder p = owned.get(key);
+            if (p == null) {
+                return;
+            }
+            if (lost.contains(key) || !owns(run)) {
+                throw new ConflictException(key, p.version, PersistenceStore.ANY);
+            }
+            Map<String, String> merged = new java.util.HashMap<>(p.properties);
+            merged.putAll(properties); // e.g. the latest save point and, once completed, the result
+            Placeholder next = p.withOwner(p.origin, p.controller, p.epoch, merged);
+            long version;
+            try {
+                version = PersistenceStores.get().writeIfHeld(key, p.epoch, key, next.toBytes(), p.version);
+            } catch (LeaseLostException e) {
+                throw new ConflictException(key, p.version, PersistenceStore.ANY); // taken over since it was checked
+            }
+            owned.put(key, new Placeholder(key, p.number, p.origin, p.controller, p.displayName, p.startTime, p.epoch, merged, version));
         }
-        Placeholder next = p.withOwner(p.origin, p.controller, p.epoch, properties);
-        long version;
-        try {
-            version = PersistenceStores.get().writeIfHeld(key, p.epoch, key, next.toBytes(), p.version);
-        } catch (LeaseLostException e) {
-            throw new ConflictException(key, p.version, PersistenceStore.ANY); // taken over since it was checked
-        }
-        owned.put(key, new Placeholder(key, p.number, p.origin, p.controller, p.displayName, p.startTime, p.epoch, properties, version));
     }
 
     /**
@@ -586,6 +638,7 @@ public final class RunningBuilds {
             return;
         }
         owned.remove(key);
+        updating.remove(key);
         LOGGER.warning(() -> "Ownership of " + run + " was lost to another controller; stopping it here");
         Executor executor = run.getExecutor();
         if (executor != null && run.isLogUpdated()) { // not once completed: only fenced then
@@ -618,11 +671,20 @@ public final class RunningBuilds {
         PersistenceStore store = PersistenceStores.get();
         store.delete(key, p == null ? PersistenceStore.ANY : p.version);
         store.delete(key.substring(0, key.length() - SUFFIX.length()) + STOP_SUFFIX, PersistenceStore.ANY);
+        String base = key.substring(0, key.length() - SUFFIX.length());
+        String dir = base.substring(0, base.lastIndexOf('/'));
+        String prefix = base.substring(base.lastIndexOf('/') + 1) + DELIVER_INFIX;
+        for (String name : store.children(dir)) {
+            if (name.startsWith(prefix)) {
+                store.delete(dir + "/" + name, PersistenceStore.ANY); // too late to deliver: the build is done
+            }
+        }
         BuildLeases leases = store.leases();
         if (leases != null && p != null) {
             leases.release(key, p.epoch);
         }
         owned.remove(key);
+        updating.remove(key);
         String jobKey = jobKeyOf(key);
         if (jobKey != null) {
             invalidate(jobKey);
@@ -723,6 +785,8 @@ public final class RunningBuilds {
                     BuildRecords.completeLater(run);
                     continue;
                 }
+                // a delivery stored before it was registered was not taken as ours (it is not looked at again)
+                pendingDeliveriesOf(jobKeyOfRunning(runningKey(run.getParent())), run.getNumber(), 0);
                 LOGGER.info(() -> "Recorded " + run + " as running, after the store was back");
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.FINE, "Still cannot record " + run + " as running", e);
@@ -801,7 +865,10 @@ public final class RunningBuilds {
             Set<String> gone = new HashSet<>();
             int removedHere = 0;
             for (Placeholder p : all(job)) {
-                if (unsure.contains(p.key) || !live.contains(p.origin) && stillGone(store, p.origin, gone)) {
+                // never this controller's own: its heartbeat can be late under load, and it would adopt (and resume a
+                // second time) a build it is still running; a membership that really lapsed is fenced (checkOwnership).
+                // Except an adoption here that may have been written although its write failed: nothing runs it here
+                if (unsure.contains(p.key) || !live.contains(p.origin) && !p.origin.equals(store.getOrigin()) && stillGone(store, p.origin, gone)) {
                     long epoch = 0;
                     if (leases != null) {
                         epoch = leases.acquire(p.key);
@@ -828,9 +895,19 @@ public final class RunningBuilds {
                     if (now != null && (leases == null || leases.holds(p.key, epoch))) {
                         LOGGER.info(() -> "Removing placeholder of " + job.getFullName() + " #" + p.number + " left by " + p.controller + " (" + p.origin + "), which is gone");
                         try {
-                            // nothing can resume it: close it as aborted rather than let it vanish (Target 12)
-                            BuildRecords.publishLost(job, p.number, p.startTime,
-                                    "This build was running on " + p.controller + ", which is gone, and could not be resumed elsewhere; it is closed as aborted.");
+                            // its result as stored now: the placeholder listed may be older than its owner's last write
+                            Placeholder fresh = Placeholder.fromBytes(p.key, p.number, now.content(), now.version());
+                            String completed = (fresh != null ? fresh : p).properties.get(RESULT);
+                            if (completed != null) {
+                                // it completed, but its owner was gone before publishing its record: publish it with its result
+                                BuildRecords.publishLost(job, p.number, p.startTime,
+                                        "This build completed on " + p.controller + ", which was gone before publishing its record; it is closed with its result.",
+                                        Result.fromString(completed));
+                            } else {
+                                // nothing can resume it: close it as aborted rather than let it vanish (Target 12)
+                                BuildRecords.publishLost(job, p.number, p.startTime,
+                                        "This build was running on " + p.controller + ", which is gone, and could not be resumed elsewhere; it is closed as aborted.");
+                            }
                         } catch (IOException | RuntimeException e) {
                             // keep the placeholder (and release the lease), so that the next sweep tries again (Target 14)
                             LOGGER.log(Level.WARNING, "Could not close " + job.getFullName() + " #" + p.number + " as aborted; will retry", e);
@@ -878,6 +955,269 @@ public final class RunningBuilds {
         }
         gone.add(origin);
         return true;
+    }
+
+    /**
+     * Something for a running build, from another controller (Target 15): typically the outcome a step of it waits for,
+     * such as a {@code build} step's downstream build completing on another controller. Delivered by
+     * {@link #deliver} to whichever controller owns the build, now or once one adopts it.
+     */
+    @Restricted(Beta.class)
+    public interface Delivery extends hudson.ExtensionPoint {
+        /**
+         * @param run the build, owned and running here
+         * @param id as given to {@link #deliver}
+         * @return true once handled (the delivery is then forgotten); false if not for this handler, or not possible yet
+         *     (it is offered again a few seconds later, for a while)
+         */
+        boolean deliver(@NonNull Run<?, ?> run, @NonNull String id, @NonNull String payload) throws Exception;
+    }
+
+    /**
+     * Delivers something to a running build wherever it runs (Target 15): handled here at once if this controller
+     * owns it; else stored for its owner, which handles it when told of it, or after adopting the build.
+     *
+     * @param id unique for this build and purpose; must not end with {@code .xml}
+     */
+    @Restricted(Beta.class)
+    public static void deliver(@NonNull Job<?, ?> job, int number, @NonNull String id, @NonNull String payload) throws IOException {
+        String runningKey = runningKey(job);
+        if (runningKey == null) {
+            return;
+        }
+        PersistenceStores.get().write(runningKey + "/" + number + DELIVER_INFIX + id, payload.getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        if (owned.containsKey(runningKey + "/" + number + SUFFIX)) {
+            String jobKey = jobKeyOfRunning(runningKey);
+            Timer.get().submit(() -> delivered(jobKey, number, id, 0));
+        }
+    }
+
+    /** Parsed key of a delivery: {@code jobs/j/running/5.deliver-x} → job key {@code jobs/j}, number 5, id {@code x}. */
+    record DeliveryKey(String jobKey, int number, String id) {
+        @CheckForNull
+        static DeliveryKey parse(String key) {
+            String[] segments = key.split("/");
+            int n = segments.length;
+            if (n < 4 || !segments[n - 2].equals(PREFIX)) {
+                return null;
+            }
+            String file = segments[n - 1];
+            int at = file.indexOf(DELIVER_INFIX);
+            if (at <= 0 || !file.substring(0, at).matches("[0-9]+")) {
+                return null;
+            }
+            return new DeliveryKey(String.join("/", Arrays.copyOf(segments, n - 2)), Integer.parseInt(file.substring(0, at)),
+                    file.substring(at + DELIVER_INFIX.length()));
+        }
+    }
+
+    private static final int DELIVERY_ATTEMPTS = 60;
+
+    /** Hands a stored delivery to the {@link Delivery} handlers, if the build is owned and running here. */
+    static void delivered(@NonNull String jobKey, int number, @NonNull String id, int attempt) {
+        if (!owned.containsKey(jobKey + "/" + PREFIX + "/" + number + SUFFIX)) {
+            return; // not ours: its owner handles it, now or after adopting the build
+        }
+        String key = jobKey + "/" + PREFIX + "/" + number + DELIVER_INFIX + id;
+        try {
+            PersistenceStore store = PersistenceStores.get();
+            PersistenceStore.Entry e = store.read(key);
+            if (e == null) {
+                return; // handled already
+            }
+            List<String> names = ItemChangeApplier.itemPath(jobKey + "/config.xml");
+            Job<?, ?> job = names == null ? null : Jenkins.get().getItemByFullName(String.join("/", names), Job.class);
+            Run<?, ?> run = job == null ? null : job.getBuildByNumber(number);
+            if (run != null && run.isLogUpdated()) {
+                String payload = new String(e.content(), StandardCharsets.UTF_8);
+                for (Delivery d : ExtensionList.lookup(Delivery.class)) {
+                    if (d.deliver(run, id, payload)) {
+                        store.delete(key, PersistenceStore.ANY);
+                        LOGGER.fine(() -> "Delivered " + id + " to " + run);
+                        return;
+                    }
+                }
+            }
+        } catch (Exception x) {
+            LOGGER.log(Level.WARNING, "Could not deliver " + key, x);
+        }
+        if (attempt < DELIVERY_ATTEMPTS) {
+            Timer.get().schedule(() -> delivered(jobKey, number, id, attempt + 1), 5, TimeUnit.SECONDS);
+        } else {
+            LOGGER.warning(() -> "Gave up delivering " + key);
+        }
+    }
+
+    /** Deliveries stored for a build while nobody owned it (its owner died). */
+    /** {@link #pendingDeliveries} of a build adopted here, looking again later if the store cannot tell now. */
+    private static void pendingDeliveriesOf(String jobKey, int number, int attempt) {
+        try {
+            pendingDeliveries(jobKey, number);
+        } catch (IOException | RuntimeException e) {
+            if (attempt < STOP_ATTEMPTS) {
+                LOGGER.log(Level.WARNING, "Could not list what was delivered to " + jobKey + " #" + number + "; looking again later", e);
+                Timer.get().schedule(() -> pendingDeliveriesOf(jobKey, number, attempt + 1), Math.min(30, 1L << attempt), TimeUnit.SECONDS);
+            } else {
+                LOGGER.log(Level.WARNING, "Could not list what was delivered to " + jobKey + " #" + number, e);
+            }
+        }
+    }
+
+    private static void pendingDeliveries(String jobKey, int number) throws IOException {
+        for (String name : PersistenceStores.get().children(jobKey + "/" + PREFIX)) {
+            if (name.startsWith(number + DELIVER_INFIX)) {
+                String id = name.substring((number + DELIVER_INFIX).length());
+                Timer.get().schedule(() -> delivered(jobKey, number, id, 0), 1, TimeUnit.SECONDS); // once resumed
+            }
+        }
+    }
+
+    /**
+     * The log of a build running on another controller, readable here (Target 15): e.g. from where its owner ships it.
+     */
+    @Restricted(Beta.class)
+    public interface RemoteLog extends hudson.ExtensionPoint {
+        /**
+         * Copies a build's log from {@code offset}.
+         *
+         * @return the offset after what was copied, or -1 if this extension cannot read that build's log
+         */
+        long copy(@NonNull Job<?, ?> job, int number, long offset, @NonNull java.io.OutputStream out) throws IOException;
+    }
+
+    /** Whether a build of a job is running on another controller. */
+    @Restricted(Beta.class)
+    public static boolean isRunningElsewhere(@NonNull Job<?, ?> job, int number) {
+        for (Placeholder p : elsewhere(job)) {
+            if (p.getNumber() == number) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Writes the log of a build running on another controller (Target 15), for the CLI's {@code console} and
+     * {@code build -f}; with {@code follow}, until it completes, then the rest from its record.
+     *
+     * @return false if the build does not run elsewhere, or no {@link RemoteLog} can read its log
+     */
+    @Restricted(Beta.class)
+    public static boolean followElsewhere(@NonNull Job<?, ?> job, int number, boolean follow, @NonNull java.io.OutputStream out)
+            throws IOException, InterruptedException {
+        return followElsewhere(job, number, follow, out, -1);
+    }
+
+    /**
+     * {@link #followElsewhere(Job, int, boolean, java.io.OutputStream)} from its last {@code lines} lines (as
+     * {@code console -n}), or all of it if negative.
+     */
+    @Restricted(Beta.class)
+    public static boolean followElsewhere(@NonNull Job<?, ?> job, int number, boolean follow, @NonNull java.io.OutputStream out, int lines)
+            throws IOException, InterruptedException {
+        if (runningKey(job) == null) {
+            return false; // no builds of it run elsewhere (no store, or one not sharing its builds): "no such build"
+        }
+        // a build another controller just started (as the shared queue told build -s) may not be known here yet: when
+        // following, wait a little for its placeholder, or for its record if it completed meanwhile
+        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(follow ? 15 : 0);
+        while (!isRunningElsewhere(job, number)) {
+            if (System.nanoTime() >= until) {
+                return false;
+            }
+            Run<?, ?> done = job.getBuildByNumber(number);
+            if (done != null && !done.isLogUpdated()) {
+                copyRecorded(done, 0, lines, out);
+                out.flush();
+                return true;
+            }
+            Thread.sleep(500);
+            invalidate(jobKeyOfRunning(runningKey(job)));
+        }
+        long offset = 0;
+        boolean tail = lines >= 0; // until the first part is written
+        while (true) {
+            long next = -1;
+            for (RemoteLog l : ExtensionList.lookup(RemoteLog.class)) {
+                if (tail) {
+                    // the last lines of what was shipped so far, from where they start
+                    java.io.ByteArrayOutputStream shipped = new java.io.ByteArrayOutputStream();
+                    next = l.copy(job, number, offset, shipped);
+                    if (next >= 0) {
+                        byte[] b = shipped.toByteArray();
+                        int from = (int) hudson.cli.ConsoleCommand.tailOffset(new java.io.ByteArrayInputStream(b), lines);
+                        out.write(b, from, b.length - from);
+                        tail = false;
+                        break;
+                    }
+                    continue;
+                }
+                next = l.copy(job, number, offset, out);
+                if (next >= 0) {
+                    break;
+                }
+            }
+            if (next < 0 && !follow) {
+                return offset > 0; // nobody can read it
+            }
+            Run<?, ?> recorded = next < 0 ? job.getBuildByNumber(number) : null;
+            if (next < 0 && (recorded == null || recorded.isLogUpdated()) && isRunningElsewhere(job, number)) {
+                // following a build whose log cannot be read now (not shipped yet, or not for a moment): it still runs,
+                // so wait for it, rather than for a record that only comes when it completes
+                Thread.sleep(1000);
+                invalidate(jobKeyOfRunning(runningKey(job)));
+                continue;
+            }
+            if (next >= 0) {
+                offset = next;
+                out.flush();
+                if (!follow) {
+                    return true;
+                }
+                invalidate(jobKeyOfRunning(runningKey(job)));
+            }
+            // a shipped log that is gone (next < 0) was deleted once the build completed: the rest is in its record
+            if (next < 0 || !isRunningElsewhere(job, number)) {
+                Run<?, ?> done = awaitRecord(job, number, 60);
+                if (done != null) {
+                    copyRecorded(done, offset, tail ? lines : -1, out);
+                }
+                out.flush();
+                return true;
+            }
+            Thread.sleep(1000);
+        }
+    }
+
+    /** Copies the log of a completed build from {@code offset}, or if {@code lines} is not negative its last lines. */
+    private static void copyRecorded(Run<?, ?> done, long offset, int lines, java.io.OutputStream out) throws IOException {
+        long from = offset;
+        if (lines >= 0) {
+            try (InputStream in = done.getLogInputStream()) {
+                from = hudson.cli.ConsoleCommand.tailOffset(in, lines);
+            }
+        }
+        try (InputStream in = done.getLogInputStream()) {
+            in.skipNBytes(Math.min(from, done.getLogText().length()));
+            in.transferTo(out);
+        } catch (java.io.EOFException e) {
+            // the record's log is shorter than what was shipped (e.g. a lost build's)
+        }
+    }
+
+    /** The record of a build which completed on another controller, once published here (waiting up to {@code seconds}). */
+    @Restricted(Beta.class)
+    @CheckForNull
+    public static Run<?, ?> awaitRecord(@NonNull Job<?, ?> job, int number, int seconds) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(seconds);
+        while (System.nanoTime() < deadline) {
+            Run<?, ?> run = job.getBuildByNumber(number);
+            if (run != null && !run.isLogUpdated()) {
+                return run;
+            }
+            Thread.sleep(500);
+        }
+        return null;
     }
 
     /**
@@ -1086,6 +1426,9 @@ public final class RunningBuilds {
             if (p != null && store.getOrigin().equals(p.origin) && !unsure.contains(key)) {
                 return Adoption.ADOPTED; // this controller has it already (a sweep listed it as it was): its lease stays
             } // else written by an adoption here whose write seemed to fail: not resumed yet, so it carries on
+            if (p != null && p.properties.containsKey(RESULT)) {
+                return Adoption.NONE; // it completed; its owner was gone before publishing its record: nothing to resume
+            }
             BuildAdopter.Adoption adoption = p == null ? null : prepare(job, p);
             if (adoption == null) {
                 return Adoption.NONE;
@@ -1140,7 +1483,9 @@ public final class RunningBuilds {
             SharedQueue.resumedExclusive(job, number); // loaded now (or not resumed, and let go of): the queue sees it
             // asked to stop while its owner was gone; it runs here now whatever this finds, so nothing below throws: a
             // caller takes an exception for "not resumed", and releases the lease
-            stopIfRequested(jobKeyOfRunning(runningKey(job)), number, 0);
+            String jobKey = jobKeyOfRunning(runningKey(job));
+            stopIfRequested(jobKey, number, 0);
+            pendingDeliveriesOf(jobKey, number, 0); // e.g. a downstream build completed while its owner was gone
             return Adoption.ADOPTED;
         }
         // its owner kept changing it: not as gone as it seemed; a later sweep looks again
@@ -1308,6 +1653,26 @@ public final class RunningBuilds {
 
         /** How long a build not reclaimed after a restart waits before it is tried again. */
         static /* non-final for tests */ long RECLAIM_RETRY_SECONDS = 30;
+
+        /**
+         * Records the result in the placeholder as soon as a build completes, before its record is published: should
+         * this controller die in between, the build is then closed with that result instead of resumed elsewhere
+         * (Target 15, ET17: a resumed Pipeline that had completed never ran on).
+         */
+        @Override
+        public void onCompleted(Run<?, ?> run, @NonNull TaskListener listener) {
+            Result result = run.getResult();
+            if (result == null || PersistenceStores.isApplyingRemoteChange() || ownedPlaceholder(run) == null) {
+                return;
+            }
+            try {
+                update(run, Map.of(RESULT, result.toString()));
+            } catch (ConflictException e) {
+                LOGGER.fine(() -> run + " completed after another controller took it over");
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.WARNING, "Could not record the result of " + run + " in its placeholder", e);
+            }
+        }
 
         @Override
         public void onStarted(Run<?, ?> run, TaskListener listener) {
@@ -1569,6 +1934,26 @@ public final class RunningBuilds {
 
         public boolean isStoppable() {
             return job.hasPermission(Item.CANCEL);
+        }
+
+        /** What it has printed so far, as shipped by the controller running it ({@link RemoteLog}), or null if unknown. */
+        @CheckForNull
+        public String getLog() throws IOException {
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            for (RemoteLog l : ExtensionList.lookup(RemoteLog.class)) {
+                if (l.copy(job, placeholder.number, 0, out) >= 0) {
+                    return out.toString(StandardCharsets.UTF_8);
+                }
+                out.reset();
+            }
+            return null;
+        }
+
+        /** {@link #getLog} as plain text, as a build's own {@code consoleText} is. */
+        public void doConsoleText(org.kohsuke.stapler.StaplerResponse2 rsp) throws IOException {
+            rsp.setContentType("text/plain;charset=UTF-8");
+            String log = getLog();
+            rsp.getWriter().write(log == null ? "" : log);
         }
 
         /** Stops it: asks the controller running it to. */

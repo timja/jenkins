@@ -12,6 +12,8 @@ import java.io.InputStreamReader;
 import java.io.OutputStreamWriter;
 import java.io.PrintStream;
 import org.apache.commons.io.IOUtils;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.Option;
 
@@ -48,12 +50,20 @@ public class ConsoleCommand extends CLICommand {
         try {
             int n = Integer.parseInt(build);
             run = job.getBuildByNumber(n);
+            if (run == null && jenkins.persistence.RunningBuilds.followElsewhere(job, n, follow, stdout, this.n)) {
+                return 0; // running on another controller of a cluster (Target 15)
+            }
             if (run == null)
                 throw new IllegalArgumentException("No such build #" + n);
         } catch (NumberFormatException e) {
             // maybe a permalink?
             Permalink p = job.getPermalinks().get(build);
             if (p != null) {
+                // the last build may be running on another controller of a cluster, newer than any here (Target 15)
+                int elsewhere = p.getId().equals("lastBuild") ? jenkins.persistence.RunningBuilds.newerElsewhere(job) : 0;
+                if (elsewhere > 0 && jenkins.persistence.RunningBuilds.followElsewhere(job, elsewhere, follow, stdout, this.n)) {
+                    return 0;
+                }
                 run = p.resolve(job);
                 if (run == null)
                     throw new IllegalStateException("Permalink " + build + " produced no build", e);
@@ -68,7 +78,12 @@ public class ConsoleCommand extends CLICommand {
 
         OutputStreamWriter w = new OutputStreamWriter(stdout, getClientCharset());
         try {
-            long pos = n >= 0 ? seek(run) : 0;
+            long pos = 0;
+            if (n >= 0) {
+                try (InputStream in = run.getLogInputStream()) {
+                    pos = tailOffset(in, n);
+                }
+            }
 
             if (follow) {
                 AnnotatedLargeText logText;
@@ -94,7 +109,8 @@ public class ConsoleCommand extends CLICommand {
     /**
      * Find the byte offset in the log input stream that marks "last N lines".
      */
-    private long seek(Run<?, ?> run) throws IOException {
+    @Restricted(NoExternalUse.class)
+    public static long tailOffset(InputStream in, int n) throws IOException {
         class RingBuffer {
             long[] lastNlines = new long[n];
             int ptr = 0;
@@ -118,26 +134,24 @@ public class ConsoleCommand extends CLICommand {
 
         RingBuffer rb = new RingBuffer();
 
-        try (InputStream in = run.getLogInputStream()) {
-            byte[] buf = new byte[4096];
-            int len;
-            byte prev = 0;
-            long pos = 0;
-            boolean prevIsNL = false;
-            while ((len = in.read(buf)) >= 0) {
-                for (int i = 0; i < len; i++) {
-                    byte ch = buf[i];
-                    boolean isNL = ch == '\r' || ch == '\n';
-                    if (!isNL && prevIsNL)  rb.add(pos);
-                    if (isNL && prevIsNL && !(prev == '\r' && ch == '\n'))  rb.add(pos);
-                    pos++;
-                    prev = ch;
-                    prevIsNL = isNL;
-                }
+        byte[] buf = new byte[4096];
+        int len;
+        byte prev = 0;
+        long pos = 0;
+        boolean prevIsNL = false;
+        while ((len = in.read(buf)) >= 0) {
+            for (int i = 0; i < len; i++) {
+                byte ch = buf[i];
+                boolean isNL = ch == '\r' || ch == '\n';
+                if (!isNL && prevIsNL)  rb.add(pos);
+                if (isNL && prevIsNL && !(prev == '\r' && ch == '\n'))  rb.add(pos);
+                pos++;
+                prev = ch;
+                prevIsNL = isNL;
             }
-
-            return rb.get();
         }
+
+        return rb.get();
     }
 
     @Override

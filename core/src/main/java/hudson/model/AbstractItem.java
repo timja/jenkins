@@ -56,9 +56,11 @@ import java.io.OutputStream;
 import java.io.StringReader;
 import java.io.StringWriter;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.ListIterator;
+import java.util.UUID;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.xml.transform.Source;
@@ -82,6 +84,7 @@ import org.apache.tools.ant.Project;
 import org.apache.tools.ant.taskdefs.Copy;
 import org.apache.tools.ant.types.FileSet;
 import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.Beta;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.kohsuke.args4j.Argument;
 import org.kohsuke.args4j.CmdLineException;
@@ -126,6 +129,12 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
      */
     protected volatile String description;
 
+    /**
+     * This item's identity, unchanged by renames and moves (Target 15): for data kept about it elsewhere, such as test
+     * results in a database, which would otherwise be keyed by its name. See {@link #getItemUuid}.
+     */
+    private volatile String itemUuid;
+
     @XStreamNotDeserializable
     private transient ItemGroup parent;
 
@@ -134,6 +143,7 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
     protected AbstractItem(ItemGroup parent, String name) {
         this.parent = parent;
         doSetName(name);
+        this.itemUuid = UUID.randomUUID().toString(); // a new item (loading one does not run the constructor)
     }
 
     @NonNull
@@ -195,8 +205,10 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
     }
 
     public void setDisplayName(String displayName) throws IOException {
-        this.displayName = Util.fixEmptyAndTrim(displayName);
-        save();
+        synchronized (this) { // as save() and a reload of a change made elsewhere are: neither sees half of the other
+            this.displayName = Util.fixEmptyAndTrim(displayName);
+            save();
+        }
     }
 
     @Override
@@ -227,8 +239,10 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
      * Sets the project description HTML.
      */
     public void setDescription(String description) throws IOException {
-        this.description = description;
-        save();
+        synchronized (this) { // as save() and a reload of a change made elsewhere are: neither sees half of the other
+            this.description = description;
+            save();
+        }
         ItemListener.fireOnUpdated(this);
     }
 
@@ -372,6 +386,10 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
 
         if (!isNameEditable()) {
             throw new IOException("Trying to rename an item that does not support this operation.");
+        }
+
+        if (newName != null && !newName.equals(this.name)) {
+            keepDerivedUuids(this);
         }
 
         // always synchronize from bigger objects first
@@ -548,6 +566,70 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
     public void onLoad(ItemGroup<? extends Item> parent, String name) throws IOException {
         this.parent = parent;
         doSetName(name);
+        if (itemUuid == null) {
+            // saved before items had one: derived from its name, so every controller sharing it derives the same one
+            // (and it is kept from now on, whatever the item is renamed to, once saved)
+            itemUuid = legacyItemUuid(getFullName());
+            derivedUuid = true;
+        }
+    }
+
+    /** Whether {@link #itemUuid} was derived from the name this item was loaded with, and is not saved yet. */
+    private transient volatile boolean derivedUuid;
+
+    /**
+     * Saves an item about to be renamed or moved, and the items in it, whose identity was derived from their names when
+     * they were loaded and is not saved yet: it would otherwise be derived again from the new names when loaded next (on
+     * another controller, or here after a restart), and be another one.
+     */
+    @Restricted(NoExternalUse.class)
+    public static void keepDerivedUuids(@NonNull Item item) throws IOException {
+        if (PersistenceStores.isApplyingRemoteChange()) {
+            return; // moved elsewhere: that controller saved them
+        }
+        List<AbstractItem> derived = new ArrayList<>();
+        if (item instanceof AbstractItem ai && ai.derivedUuid) {
+            derived.add(ai);
+        }
+        if (item instanceof ItemGroup<?> group) {
+            for (AbstractItem child : Items.allItems2(ACL.SYSTEM2, group, AbstractItem.class)) {
+                if (child.derivedUuid) {
+                    derived.add(child);
+                }
+            }
+        }
+        for (AbstractItem ai : derived) {
+            ai.save();
+            ai.derivedUuid = false;
+        }
+    }
+
+    /**
+     * An identity of this item that renames and moves do not change, unlike {@link #getFullName}: a UUID, kept in its
+     * configuration. A new item gets a random one, as do a copy and an item created from posted configuration; an item saved before items had one gets one derived
+     * from its full name when first loaded.
+     *
+     * @since TODO
+     */
+    @Override
+    @Restricted(Beta.class)
+    public String getItemUuid() {
+        String id = itemUuid;
+        if (id == null) {
+            id = itemUuid = UUID.randomUUID().toString(); // not loaded yet: e.g. just created
+        }
+        return id;
+    }
+
+    /** Gives this item a new identity, as for a copy or a clash with another item's. */
+    @Restricted(NoExternalUse.class)
+    public void newItemUuid() {
+        itemUuid = UUID.randomUUID().toString();
+    }
+
+    @Restricted(NoExternalUse.class)
+    public static String legacyItemUuid(String fullName) {
+        return UUID.nameUUIDFromBytes(("jenkins-item:" + fullName).getBytes(StandardCharsets.UTF_8)).toString();
     }
 
     /**
@@ -963,6 +1045,7 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
             throw new IOException("Failed to process config.xml", e);
         }
 
+        String uuid = itemUuid; // configuration posted without it (as most is) keeps the item's identity
         // try to reflect the changes by reloading
         Object o = Items.XSTREAM2.unmarshal(XStream2.getDefaultDriver().createReader(new StringReader(out.getBuffer().toString())), this, null, true);
         if (o != this) {
@@ -971,6 +1054,9 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
             throw new IOException("Expecting " + this.getClass() + " but got " + o.getClass() + " instead");
         }
 
+        if (itemUuid == null) {
+            itemUuid = uuid;
+        }
         Items.runWhileUpdatingByXml(() -> onLoad(getParent(), getRootDir().getName()));
         Jenkins.get().rebuildDependencyGraphAsync();
 

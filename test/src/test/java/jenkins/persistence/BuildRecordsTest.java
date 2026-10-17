@@ -450,6 +450,148 @@ class BuildRecordsTest {
     }
 
     @Test
+    void lateFilesAddedOnTwoControllersAreBothKept() throws Exception {
+        FreeStyleProject p = project(r, "both-late");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p);
+        String key = "jobs/both-late/builds/1/build.xml";
+        String snapshot = "jobs/both-late/builds/1/files.tgz";
+        Files.writeString(new File(b.getRootDir(), "b.txt").toPath(), "added here");
+        // meanwhile another controller added a.txt to its copy, and republished the build with it
+        Path elsewhere = Files.createTempDirectory("elsewhere");
+        try {
+            try (InputStream in = BLOBS.get(snapshot)) {
+                new hudson.FilePath(elsewhere.toFile()).untarFrom(in, hudson.FilePath.TarCompression.GZIP);
+            }
+            Files.writeString(elsewhere.resolve("a.txt"), "added elsewhere");
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (java.io.OutputStream out = new GZIPOutputStream(bytes)) {
+                new hudson.FilePath(elsewhere.toFile()).tar(out, "**");
+            }
+            BLOBS.put(snapshot, new ByteArrayInputStream(bytes.toByteArray()), bytes.size());
+        } finally {
+            Util.deleteRecursive(elsewhere.toFile());
+        }
+        STORE.as("other-controller").write(key, (record(key) + "\n<!-- files updated 1 -->").getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        for (int i = 0; i < 300 && !ItemChangeApplier.isIdle(); i++) {
+            Thread.sleep(100);
+        }
+        assertTrue(ItemChangeApplier.isIdle());
+        List<String> names = new ArrayList<>();
+        try (TarInputStream tar = new TarInputStream(new GZIPInputStream(BLOBS.get(snapshot)))) {
+            for (TarEntry e = tar.getNextEntry(); e != null; e = tar.getNextEntry()) {
+                names.add(e.getName());
+            }
+        }
+        assertThat(names, hasItem("b.txt"));
+        assertThat("the file added elsewhere is not dropped by publishing this copy", names, hasItem("a.txt"));
+    }
+
+    @Test
+    void aSaveHereWithFilesAddedKeepsTheFilesAddedElsewhere() throws Exception {
+        FreeStyleProject p = project(r, "saved-late");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p);
+        String key = "jobs/saved-late/builds/1/build.xml";
+        String snapshot = "jobs/saved-late/builds/1/files.tgz";
+        // another controller added a.txt to its copy and republished the build with it; this one has not applied that
+        // yet (the record marked as this controller, so that it is never applied here)
+        Path elsewhere = Files.createTempDirectory("elsewhere");
+        try {
+            try (InputStream in = BLOBS.get(snapshot)) {
+                new hudson.FilePath(elsewhere.toFile()).untarFrom(in, hudson.FilePath.TarCompression.GZIP);
+            }
+            Files.writeString(elsewhere.resolve("a.txt"), "added elsewhere");
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (java.io.OutputStream out = new GZIPOutputStream(bytes)) {
+                new hudson.FilePath(elsewhere.toFile()).tar(out, "**");
+            }
+            BLOBS.put(snapshot, new ByteArrayInputStream(bytes.toByteArray()), bytes.size());
+        } finally {
+            Util.deleteRecursive(elsewhere.toFile());
+        }
+        STORE.write(key, (record(key) + "\n<!-- files updated 1 -->").getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        // here b.txt is added, and the build saved
+        Files.writeString(new File(b.getRootDir(), "b.txt").toPath(), "added here");
+        b.setDescription("saved here");
+        List<String> names = new ArrayList<>();
+        try (TarInputStream tar = new TarInputStream(new GZIPInputStream(BLOBS.get(snapshot)))) {
+            for (TarEntry e = tar.getNextEntry(); e != null; e = tar.getNextEntry()) {
+                names.add(e.getName());
+            }
+        }
+        assertThat(names, hasItem("b.txt"));
+        assertThat("the file added elsewhere is not dropped by publishing this copy", names, hasItem("a.txt"));
+        assertThat(record(key), containsString("saved here"));
+    }
+
+    @Test
+    void aSaveHereWithFilesAddedDoesNotBringBackABuildDeletedElsewhereMeanwhile() throws Exception {
+        FreeStyleProject p = project(r, "deleted-meanwhile");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p);
+        String key = "jobs/deleted-meanwhile/builds/1/build.xml";
+        Files.writeString(new File(b.getRootDir(), "late.txt").toPath(), "added later");
+        // another controller deletes the build just after the publication read its record (deleted as this controller,
+        // so that it is never applied here)
+        afterRead = k -> {
+            if (k.equals(key) && StackWalker.getInstance().walk(f -> f.anyMatch(x -> x.getClassName().equals(BuildRecords.class.getName())
+                    && x.getMethodName().equals("publish")))) {
+                afterRead = null;
+                try {
+                    STORE.delete(key, PersistenceStore.ANY);
+                } catch (IOException e) {
+                    throw new java.io.UncheckedIOException(e);
+                }
+            }
+        };
+        try {
+            b.setDescription("saved here");
+        } finally {
+            afterRead = null;
+        }
+        assertNull(record(key), "not brought back");
+        assertNull(BLOBS.get("jobs/deleted-meanwhile/builds/1/files.tgz"));
+    }
+
+    @Test
+    void fileAddedLongAfterIsPublishedWhenTheBuildIsSaved() throws Exception {
+        FreeStyleProject p = project(r, "later");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p);
+        BuildRecords.recentlyPublished.clear(); // an hour later, or after a restart
+        java.nio.file.Files.writeString(new java.io.File(b.getRootDir(), "late.txt").toPath(), "added much later");
+        b.setDescription("kept");
+        wipeAndReload(r);
+        b = r.jenkins.getItemByFullName("later", FreeStyleProject.class).getBuildByNumber(1);
+        assertEquals("kept", b.getDescription());
+        assertEquals("added much later", java.nio.file.Files.readString(new java.io.File(b.getRootDir(), "late.txt").toPath()));
+    }
+
+    @Test
+    void fileAddedLongAfterIsFoundByTheScan() throws Exception {
+        FreeStyleProject p = project(r, "scanned");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p);
+        BuildRecords.recentlyPublished.clear();
+        java.nio.file.Files.writeString(new java.io.File(b.getRootDir(), "late.txt").toPath(), "found by the scan");
+        hudson.model.AsyncPeriodicWork.all().get(BuildRecords.LateFiles.class).execute(hudson.model.TaskListener.NULL);
+        wipeAndReload(r);
+        b = r.jenkins.getItemByFullName("scanned", FreeStyleProject.class).getBuildByNumber(1);
+        assertEquals("found by the scan", java.nio.file.Files.readString(new java.io.File(b.getRootDir(), "late.txt").toPath()));
+    }
+
+    @Test
+    void fileAddedToAFetchedCopyIsPublished() throws Exception {
+        FreeStyleProject p = project(r, "fetched");
+        r.buildAndAssertSuccess(p);
+        wipeAndReload(r); // as on a controller which did not run the build
+        FreeStyleBuild b = r.jenkins.getItemByFullName("fetched", FreeStyleProject.class).getBuildByNumber(1);
+        java.nio.file.Files.writeString(new java.io.File(b.getRootDir(), "late.txt").toPath(), "added to a fetched copy");
+        b.setDescription("described here");
+        wipeAndReload(r);
+        b = r.jenkins.getItemByFullName("fetched", FreeStyleProject.class).getBuildByNumber(1);
+        assertEquals("added to a fetched copy", java.nio.file.Files.readString(new java.io.File(b.getRootDir(), "late.txt").toPath()));
+        assertThat("the manifest is local, not part of the snapshot",
+                BuildRecords.Manifest.filesAdded(b.getRootDir()), org.hamcrest.Matchers.is(false));
+    }
+
+    @Test
     void deletedJobIsDroppedFromTheLateFilesSweep() throws Exception {
         FreeStyleProject p = project(r, "gone");
         r.buildAndAssertSuccess(p);
@@ -516,6 +658,30 @@ class BuildRecordsTest {
         FreeStyleBuild lost = r.jenkins.getItemByFullName("lost-twice", FreeStyleProject.class).getBuildByNumber(2);
         assertEquals(hudson.model.Result.ABORTED, lost.getResult());
         assertThat(lost.getLog(), containsString("a controller which is gone"));
+    }
+
+    @Test
+    void aClosedBuildKeepsWhatItPrinted() throws Exception {
+        FreeStyleProject p = project(r, "shipped");
+        r.buildAndAssertSuccess(p);
+        ShippedLogs.LOGS.put("jobs/shipped/builds/2", "tick 1\ntick 2\n");
+        BuildRecords.publishLost(p, 2, System.currentTimeMillis(), "It was running on a controller which is gone.");
+        wipeAndReload(r);
+        String log = r.jenkins.getItemByFullName("shipped", FreeStyleProject.class).getBuildByNumber(2).getLog();
+        assertThat(log, org.hamcrest.Matchers.containsString("tick 1\ntick 2"));
+        assertThat(log, org.hamcrest.Matchers.containsString("a controller which is gone"));
+        assertTrue(log.indexOf("tick 2") < log.indexOf("a controller which is gone"), "what it printed, then why it ended");
+    }
+
+    @TestExtension("aClosedBuildKeepsWhatItPrinted")
+    public static final class ShippedLogs implements BuildRecords.LostLog {
+        static final java.util.Map<String, String> LOGS = new java.util.concurrent.ConcurrentHashMap<>();
+
+        @Override
+        public java.io.InputStream shippedLog(String base) {
+            String log = LOGS.get(base);
+            return log == null ? null : new java.io.ByteArrayInputStream(log.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        }
     }
 
     @Test

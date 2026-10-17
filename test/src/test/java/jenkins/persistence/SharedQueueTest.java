@@ -126,6 +126,9 @@ class SharedQueueTest {
     /** While set, the store has no queue (each controller has its own). */
     static volatile boolean noQueue;
 
+    /** While set, looking up a shared queue item fails. */
+    static volatile boolean failGets;
+
     /** Ids taken one at a time, as when the pool of ids taken ahead ran dry. */
     static final java.util.concurrent.atomic.AtomicInteger singleIds = new java.util.concurrent.atomic.AtomicInteger();
 
@@ -207,6 +210,9 @@ class SharedQueueTest {
 
             @Override
             public Record get(long id) throws java.io.IOException {
+                if (failGets) {
+                    throw new java.io.IOException("the store is unreachable, for now");
+                }
                 return cq.get(id);
             }
 
@@ -238,6 +244,7 @@ class SharedQueueTest {
     void setUp(JenkinsRule rule) {
         r = rule;
         failReads = null;
+        failGets = false;
         other = STORE.as("other-controller").clusterQueue();
     }
 
@@ -306,6 +313,7 @@ class SharedQueueTest {
         other.cancel(rec.id());
         awaitMirrored();
         assertTrue(Queue.getInstance().isEmpty());
+        assertFalse(SharedQueue.takenElsewhere(rec.id()), "cancelled, not taken");
     }
 
     @Test
@@ -475,6 +483,37 @@ class SharedQueueTest {
         assertNull(p.getLastBuild(), "never started here");
         assertTrue(Queue.getInstance().isEmpty());
         assertEquals("other-controller", STORE.clusterQueue().get(rec.id()).claimedBy());
+        assertTrue(SharedQueue.takenElsewhere(rec.id()), "its local copy left because the other controller took it");
+    }
+
+    @Test
+    void anItemTakenElsewhereIsKnownToBeAsItLeavesEvenIfTheStoreCannotBeAsked() throws Exception {
+        r.createFreeStyleProject("taken-offline");
+        ClusterQueue.Record rec = publishElsewhere("taken-offline", 60_000, "carol");
+        assertNotNull(Queue.getInstance().getLocalItem(rec.id()));
+        failGets = true;
+        try {
+            assertTrue(other.claim(rec.id()));
+            awaitMirrored();
+            for (int i = 0; i < 500 && Queue.getInstance().getLocalItem(rec.id()) != null; i++) {
+                Thread.sleep(10);
+            }
+            assertEquals(Boolean.TRUE, TakenOnLeft.answers.get(rec.id()), "taken elsewhere, as answered to its onLeft listeners");
+        } finally {
+            failGets = false;
+        }
+    }
+
+    @TestExtension("anItemTakenElsewhereIsKnownToBeAsItLeavesEvenIfTheStoreCannotBeAsked")
+    public static final class TakenOnLeft extends hudson.model.queue.QueueListener {
+        static final java.util.Map<Long, Boolean> answers = new java.util.concurrent.ConcurrentHashMap<>();
+
+        @Override
+        public void onLeft(Queue.LeftItem li) {
+            if (li.isCancelled()) {
+                answers.put(li.getId(), SharedQueue.takenElsewhere(li.getId()));
+            }
+        }
     }
 
     @Test
@@ -1025,6 +1064,29 @@ class SharedQueueTest {
         awaitMirrored();
         assertNotNull(Queue.getInstance().getLocalItem(rec.id()), "mirrored at startup, and kept");
         other.cancel(rec.id()); // the store outlives this test
+    }
+
+    @Test
+    void anItemPinnedToAControllerThatIsGoneIsClaimedHere() throws Exception {
+        long grace = SharedQueue.ORIGIN_GRACE_MILLIS;
+        SharedQueue.ORIGIN_GRACE_MILLIS = 0;
+        live = Set.of(STORE.getOrigin(), "other-controller"); // not the controller it is pinned to
+        try {
+            FreeStyleProject p = r.createFreeStyleProject("pinned-to-gone");
+            List<Action> actions = List.of(new CauseAction(new Cause.UserIdCause("cid")));
+            long id = other.nextId();
+            other.publish(new ClusterQueue.Record(id, "pinned-to-gone", "pinned-to-gone", SharedQueue.toXml(actions),
+                    System.currentTimeMillis(), ClusterQueue.State.WAITING, "other-controller", "gone-controller", null, 0));
+            for (int i = 0; i < 300 && p.getLastBuild() == null; i++) {
+                Thread.sleep(100);
+            }
+            assertNotNull(p.getLastBuild(), "a pin to a controller that is gone does not keep it waiting");
+            assertEquals(id, p.getLastBuild().getQueueId());
+            r.waitForCompletion(p.getLastBuild());
+        } finally {
+            live = null;
+            SharedQueue.ORIGIN_GRACE_MILLIS = grace;
+        }
     }
 
     @Test

@@ -1,0 +1,10 @@
+<?jelly escape-by-default='true'?>
+<!--
+  Notices that plugins add to the plugin manager's pages: the pluginManager.jelly view of a PageDecorator, if it has one
+  (e.g. that changes made here apply to a whole cluster of controllers).
+-->
+<j:jelly xmlns:j="jelly:core" xmlns:st="jelly:stapler">
+  <j:forEach var="pd" items="${h.pageDecorators}">
+    <st:include it="${pd}" page="pluginManager.jelly" optional="true"/>
+  </j:forEach>
+</j:jelly>

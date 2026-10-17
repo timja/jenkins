@@ -34,6 +34,7 @@ import hudson.Util;
 import hudson.XmlFile;
 import hudson.model.Item;
 import hudson.model.Job;
+import hudson.model.Result;
 import hudson.model.Run;
 import hudson.model.RunMap;
 import hudson.model.Saveable;
@@ -110,7 +111,7 @@ public final class BuildRecords {
      * Never part of a snapshot: the record itself, artifacts (use an external {@link jenkins.model.ArtifactManager}),
      * and state only needed while a build runs.
      */
-    static final List<String> DEFAULT_EXCLUDES = List.of(RECORD, "archive/**", "program.dat", "workflow/**", "stashes/**", "**/*.tmp");
+    static final List<String> DEFAULT_EXCLUDES = List.of(RECORD, "archive/**", "program.dat", "workflow/**", "stashes/**", "**/*.tmp", Manifest.NAME);
 
     /** Set while this thread loads a build, so that saves made while loading are not republished. */
     private static final ThreadLocal<Boolean> LOADING = new ThreadLocal<>();
@@ -244,6 +245,15 @@ public final class BuildRecords {
      *     so that it gets a new version, and other controllers fetch the new snapshot
      */
     private static void publish(@NonNull Run<?, ?> run, boolean filesChanged) throws IOException {
+        publish(run, filesChanged, false);
+    }
+
+    /**
+     * @param filesChanged its files changed since it was published: other controllers are to fetch them again
+     * @param recordChanged its record was saved here too (not only files added): this controller's record is written,
+     *     as a republish does, rather than the stored one marked
+     */
+    private static void publish(@NonNull Run<?, ?> run, boolean filesChanged, boolean recordChanged) throws IOException {
         String builds = buildsKey(run.getParent());
         if (builds == null) {
             return;
@@ -253,7 +263,7 @@ public final class BuildRecords {
             publishing.merge(base, 1, Integer::sum);
         }
         try {
-            publish(run, base, filesChanged);
+            publish(run, base, filesChanged, recordChanged);
         } finally {
             synchronized (deleted) {
                 publishing.computeIfPresent(base, (k, n) -> n == 1 ? null : n - 1);
@@ -261,7 +271,7 @@ public final class BuildRecords {
         }
     }
 
-    private static void publish(Run<?, ?> run, String base, boolean filesChanged) throws IOException {
+    private static void publish(Run<?, ?> run, String base, boolean filesChanged, boolean recordChanged) throws IOException {
         File dir = run.getRootDir();
         Path record = new File(dir, RECORD).toPath();
         if (!Files.isRegularFile(record)) {
@@ -273,6 +283,11 @@ public final class BuildRecords {
         RunningBuilds.Placeholder lease = PersistenceStores.get().leases() == null ? null : RunningBuilds.ownedPlaceholder(run);
         // uploaded under a name of its own first, which a controller that lost the build cannot put over the owner's
         String upload = lease == null ? SNAPSHOT : SNAPSHOT + "." + lease.getEpoch();
+        if (filesChanged) {
+            // files added to the build elsewhere since this copy was last in sync are kept in what it publishes, whichever
+            // way it is published (a save here before the change elsewhere is applied, late files)
+            addFilesAddedElsewhere(base, dir);
+        }
         // before the snapshot: a file added while it is made and uploaded then differs from this, and is published later
         String signature = signature(dir);
         BlobStore blobs = PersistenceStores.getBlobStore();
@@ -314,12 +329,13 @@ public final class BuildRecords {
             PersistenceStore.Entry stored = filesChanged ? store.read(base + "/" + RECORD) : null;
             if (filesChanged && stored == null) {
                 // deleted elsewhere, which this controller has not applied yet: not brought back for files added here
+                // (nor for its record saved here with them)
                 discardSnapshot(base);
                 recentlyPublished.remove(base);
                 LOGGER.fine(() -> "Not publishing files added to " + run + ": deleted elsewhere");
                 return;
             }
-            if (stored != null) {
+            if (stored != null && !recordChanged) {
                 // only the files changed: mark the stored record (telling other controllers to fetch the snapshot again),
                 // rather than writing this controller's copy over an edit made elsewhere since
                 byte[] marked = (new String(stored.content(), StandardCharsets.UTF_8).replaceAll("\n<!-- files updated \\d+ -->$", "")
@@ -331,18 +347,41 @@ public final class BuildRecords {
                     return;
                 }
                 recentlyPublished.put(base, new Published(new java.lang.ref.WeakReference<>(run), signature, System.currentTimeMillis()));
+                Manifest.write(dir, signature);
                 LOGGER.fine(() -> "Published files added to " + run);
                 return;
             }
-            publishRecord(lease, base + "/" + RECORD, published);
+            byte[] content = published;
+            if (filesChanged) {
+                // the record saved here, marked so that other controllers fetch the files too even if it did not change
+                content = (new String(content, StandardCharsets.UTF_8) + "\n<!-- files updated " + System.currentTimeMillis() + " -->")
+                        .getBytes(StandardCharsets.UTF_8);
+            }
+            // over the record read above (or a later edit of it), when there is one: a build deleted elsewhere since is
+            // not brought back
+            Long version = stored != null ? writeOver(lease, base + "/" + RECORD, content, stored.version())
+                    : Long.valueOf(publishRecord(lease, base + "/" + RECORD, content, PersistenceStore.ANY));
+            if (version == null) {
+                discardSnapshot(base);
+                recentlyPublished.remove(base);
+                LOGGER.fine(() -> "Not publishing the record of " + run + " saved here: deleted elsewhere");
+                return;
+            }
             recentlyPublished.put(base, new Published(new java.lang.ref.WeakReference<>(run), signature, System.currentTimeMillis()));
+            Manifest.write(dir, signature);
             // a save made while publishing found no record yet, so republish left it to this: include it
             for (int i = 0; i < 10; i++) {
                 byte[] now = Files.readAllBytes(record);
                 if (Arrays.equals(now, published)) {
                     break;
                 }
-                publishRecord(lease, base + "/" + RECORD, now);
+                version = writeOver(lease, base + "/" + RECORD, now, version);
+                if (version == null) {
+                    discardSnapshot(base);
+                    recentlyPublished.remove(base);
+                    LOGGER.fine(() -> "Not publishing " + run + " further: deleted elsewhere");
+                    return;
+                }
                 published = now;
             }
         } catch (NoSuchFileException e) {
@@ -362,12 +401,39 @@ public final class BuildRecords {
         LOGGER.fine(() -> "Published " + run);
     }
 
-    /** Writes a build record, while holding the build's lease if it has one (the store checks it with the write). */
-    private static void publishRecord(@CheckForNull RunningBuilds.Placeholder lease, String key, byte[] content) throws IOException {
-        if (lease == null) {
-            seen(key, PersistenceStores.get().write(key, content, PersistenceStore.ANY));
-        } else {
-            seen(key, PersistenceStores.get().writeIfHeld(lease.getKey(), lease.getEpoch(), key, content, PersistenceStore.ANY));
+    /**
+     * Writes a build record, while holding the build's lease if it has one (the store checks it with the write).
+     *
+     * @return its new version
+     */
+    private static long publishRecord(@CheckForNull RunningBuilds.Placeholder lease, String key, byte[] content, long expected) throws IOException {
+        long version = lease == null ? PersistenceStores.get().write(key, content, expected)
+                : PersistenceStores.get().writeIfHeld(lease.getKey(), lease.getEpoch(), key, content, expected);
+        seen(key, version);
+        return version;
+    }
+
+    /**
+     * Writes a build record over the version expected, or over a later one if it changed meanwhile (as {@link #republish}
+     * does), but never brings it back once deleted.
+     *
+     * @return its new version, or null if it was deleted (elsewhere: this controller has not applied that yet)
+     */
+    @CheckForNull
+    private static Long writeOver(@CheckForNull RunningBuilds.Placeholder lease, String key, byte[] content, long expected) throws IOException {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return publishRecord(lease, key, content, expected);
+            } catch (ConflictException x) {
+                if (attempt == 5) {
+                    throw x;
+                }
+                PersistenceStore.Entry e = PersistenceStores.get().read(key);
+                if (e == null) {
+                    return null;
+                }
+                expected = e.version();
+            }
         }
     }
 
@@ -387,7 +453,7 @@ public final class BuildRecords {
             files.filter(Files::isRegularFile).sorted().forEach(f -> {
                 String rel = root.relativize(f).toString().replace(File.separatorChar, '/');
                 if (rel.equals(RECORD) || rel.startsWith("archive/") || rel.startsWith("workflow/") || rel.startsWith("stashes/")
-                        || rel.equals("program.dat") || rel.endsWith(".tmp")) {
+                        || rel.equals("program.dat") || rel.endsWith(".tmp") || rel.equals(Manifest.NAME)) {
                     return;
                 }
                 b.append(rel).append(' ').append(f.toFile().length()).append(' ').append(f.toFile().lastModified()).append('\n');
@@ -414,9 +480,19 @@ public final class BuildRecords {
             return java.util.concurrent.TimeUnit.SECONDS.toMillis(Long.getLong(BuildRecords.class.getName() + ".lateFilesPeriodSeconds", 60));
         }
 
+        /** Builds looked at by the broader scan per run, at most; the next run carries on (Target 15). */
+        static final int SCAN_LIMIT = Integer.getInteger(BuildRecords.class.getName() + ".lateFilesScanLimit", 1000);
+        static final long SCAN_MILLIS = java.util.concurrent.TimeUnit.MINUTES.toMillis(10);
+        private long lastScan;
+        private int scanFrom;
+
         @Override
         protected void execute(hudson.model.TaskListener listener) {
             long now = System.currentTimeMillis();
+            if (now - lastScan > SCAN_MILLIS) {
+                lastScan = now;
+                scanLoaded();
+            }
             for (Map.Entry<String, Published> e : recentlyPublished.entrySet()) {
                 Published p = e.getValue();
                 Run<?, ?> run = p.run().get();
@@ -436,9 +512,101 @@ public final class BuildRecords {
             }
         }
 
+        /**
+         * Builds held in memory here, whichever controller published them and however long ago, whose directories
+         * gained files since (compared with their {@link Manifest}): plugins add files through a loaded build.
+         */
+        private void scanLoaded() {
+            List<Run<?, ?>> loaded = new ArrayList<>();
+            for (Job<?, ?> job : jenkins.model.Jenkins.get().allItems(Job.class)) {
+                RunMap<?> runs = runsOf(job);
+                if (runs != null && buildsKey(job) != null) {
+                    loaded.addAll(runs.getLoadedBuilds().values());
+                }
+            }
+            int n = loaded.size();
+            int from = n == 0 ? 0 : scanFrom % n;
+            int count = Math.min(n, SCAN_LIMIT);
+            for (int i = 0; i < count; i++) {
+                Run<?, ?> run = loaded.get((from + i) % n);
+                if (run.isBuilding() || !Manifest.filesAdded(run.getRootDir())) {
+                    continue;
+                }
+                try {
+                    if (PersistenceStores.get().read(recordKeyOf(run)) != null && !isDeleted(baseOf(run), run)) {
+                        LOGGER.fine(() -> "Republishing " + run + ": files were added to it");
+                        publish(run, true);
+                    }
+                } catch (IOException | RuntimeException x) {
+                    LOGGER.log(Level.WARNING, "Could not republish " + run, x);
+                }
+            }
+            scanFrom = from + count;
+        }
+
         @Override
         protected Level getNormalLoggingLevel() {
             return Level.FINE;
+        }
+    }
+
+    @CheckForNull
+    private static String baseOf(Run<?, ?> run) {
+        String builds = buildsKey(run.getParent());
+        return builds == null ? null : builds + "/" + run.getNumber();
+    }
+
+    @NonNull
+    private static String recordKeyOf(Run<?, ?> run) {
+        String base = baseOf(run);
+        return base == null ? "" : base + "/" + RECORD;
+    }
+
+    /**
+     * What a build directory held when it was last published or fetched here: {@link #signature} of it, in a file the
+     * snapshot leaves out (Target 15). Files added later (by a plugin, possibly long after the build) are told apart
+     * from it, also after a restart and on a controller which did not publish the build.
+     */
+    static final class Manifest {
+        static final String NAME = ".cnj-published";
+
+        static void write(File dir, String signature) {
+            try {
+                Files.writeString(new File(dir, NAME).toPath(), signature, StandardCharsets.UTF_8);
+            } catch (IOException e) {
+                LOGGER.log(Level.FINE, "Could not record what " + dir + " holds", e);
+            }
+        }
+
+        /** The files the directory held when the manifest was written (empty if there is none). */
+        static Set<String> paths(File dir) {
+            Set<String> paths = new java.util.HashSet<>();
+            try {
+                for (String line : Files.readString(new File(dir, NAME).toPath(), StandardCharsets.UTF_8).split("\n")) {
+                    // path size modified
+                    int modified = line.lastIndexOf(' ');
+                    int size = modified < 0 ? -1 : line.lastIndexOf(' ', modified - 1);
+                    if (size > 0) {
+                        paths.add(line.substring(0, size));
+                    }
+                }
+            } catch (IOException e) {
+                // none
+            }
+            return paths;
+        }
+
+        /** Whether files were added or changed since the manifest was written (false if there is none). */
+        static boolean filesAdded(File dir) {
+            Path manifest = new File(dir, NAME).toPath();
+            if (!Files.isRegularFile(manifest)) {
+                return false;
+            }
+            try {
+                return !Files.readString(manifest, StandardCharsets.UTF_8).equals(signature(dir));
+            } catch (IOException e) {
+                return false;
+            }
         }
     }
 
@@ -448,6 +616,15 @@ public final class BuildRecords {
      */
     @Restricted(NoExternalUse.class)
     public static void publishLost(@NonNull Job<?, ?> job, int number, long startTime, @NonNull String reason) throws IOException {
+        publishLost(job, number, startTime, reason, Result.ABORTED);
+    }
+
+    /**
+     * As {@link #publishLost(Job, int, long, String)}, with the result the build had when it completed, for one whose
+     * controller was gone before publishing its record.
+     */
+    public static void publishLost(@NonNull Job<?, ?> job, int number, long startTime, @NonNull String reason, @NonNull Result result)
+            throws IOException {
         String builds = buildsKey(job);
         if (builds == null) {
             return;
@@ -464,14 +641,28 @@ public final class BuildRecords {
         }
         String tag = Run.XSTREAM2.getMapper().serializedClass(buildClass);
         String record = "<?xml version='1.1' encoding='UTF-8'?>\n<" + tag + ">\n  <actions/>\n  <timestamp>" + startTime + "</timestamp>\n"
-                + "  <startTime>" + startTime + "</startTime>\n  <result>ABORTED</result>\n  <duration>0</duration>\n"
+                + "  <startTime>" + startTime + "</startTime>\n  <result>" + result + "</result>\n  <duration>0</duration>\n"
                 + "  <charset>UTF-8</charset>\n  <keepLog>false</keepLog>\n  <completed>true</completed>\n</" + tag + ">";
         BlobStore blobs = PersistenceStores.getBlobStore();
         if (blobs != null) {
             Path dir = Files.createTempDirectory("lost-build");
             Path snapshot = Files.createTempFile("lost-build", ".tgz");
             try {
-                Files.writeString(dir.resolve("log"), reason + "\nFinished: ABORTED\n", StandardCharsets.UTF_8);
+                // what the build had printed, if its log was shipped while it ran (Target 15), then why it ended
+                try (OutputStream log = Files.newOutputStream(dir.resolve("log"))) {
+                    for (LostLog l : ExtensionList.lookup(LostLog.class)) {
+                        try (InputStream shipped = l.shippedLog(base)) {
+                            if (shipped != null) {
+                                shipped.transferTo(log);
+                                log.write('\n');
+                                break;
+                            }
+                        } catch (IOException | RuntimeException x) {
+                            LOGGER.log(Level.WARNING, "Could not read the shipped log of " + base, x);
+                        }
+                    }
+                    log.write((reason + "\nFinished: " + result + "\n").getBytes(StandardCharsets.UTF_8));
+                }
                 try (OutputStream out = new GZIPOutputStream(Files.newOutputStream(snapshot))) {
                     new FilePath(dir.toFile()).tar(out, new DirScanner.Glob("**", null, false));
                 } catch (InterruptedException e) {
@@ -487,8 +678,13 @@ public final class BuildRecords {
         }
         try {
             seen(base + "/" + RECORD, store.write(base + "/" + RECORD, record.getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT));
-            LOGGER.info(() -> "Closed " + job.getFullName() + " #" + number + " as aborted: " + reason);
+            LOGGER.info(() -> "Closed " + job.getFullName() + " #" + number + " (" + result + "): " + reason);
             writtenElsewhere(job, number); // this controller's own write raises no event here
+            // published here for the controller which ran it: update the shared permalinks, as it would have
+            Run<?, ?> run = job.getBuildByNumber(number);
+            if (run != null) {
+                PeepholePermalink.completed(run);
+            }
         } catch (ConflictException e) {
             LOGGER.fine(() -> job.getFullName() + " #" + number + " was published meanwhile");
             if (blobs != null && hasBlob(blobs, base + "/" + SNAPSHOT)) {
@@ -501,6 +697,22 @@ public final class BuildRecords {
         try (InputStream in = blobs.get(key)) {
             return in != null;
         }
+    }
+
+    /**
+     * The log a build printed while it ran, kept outside its controller (Target 15): when that controller dies and the
+     * build cannot be resumed, the build is closed as aborted with this output in its console, not just the reason.
+     *
+     * @since TODO
+     */
+    @Restricted(Beta.class)
+    public interface LostLog extends hudson.ExtensionPoint {
+        /**
+         * @param base the build's key, such as {@code jobs/p/builds/5}
+         * @return the shipped log, or null if this extension kept none
+         */
+        @CheckForNull
+        InputStream shippedLog(@NonNull String base) throws IOException;
     }
 
     @CheckForNull
@@ -638,10 +850,8 @@ public final class BuildRecords {
             return;
         }
         PersistenceStore store = PersistenceStores.get();
-        Set<String> numbers = store.children(builds);
-        for (String number : numbers) {
-            store.delete(builds + "/" + number + "/" + RECORD, PersistenceStore.ANY);
-        }
+        Set<String> numbers = store.children(builds); // whose snapshots go, should the job be made again meanwhile
+        store.deleteAll(builds); // at once (Target 15): a job with 20,000 builds was 20,000 transactions
         String running = builds.substring(0, builds.length() - "builds".length()) + RunningBuilds.PREFIX;
         for (String name : store.children(running)) {
             store.delete(running + "/" + name, PersistenceStore.ANY);
@@ -792,11 +1002,62 @@ public final class BuildRecords {
                 throw (IOException) new InterruptedIOException().initCause(e);
             }
         }
+        Manifest.write(dir, signature(dir)); // what it holds as published: files added later are told apart
         // last, as on the publishing side: a local build.xml means the directory is complete
         writeRecord(dir, record.content());
         seen(base + "/" + RECORD, record.version());
         LOGGER.fine(() -> "Materialized " + job.getFullName() + " #" + dir.getName());
         return true;
+    }
+
+    /**
+     * Adds to a build's directory the files of its shared snapshot that it lacks, and did not remove since it was last in
+     * sync (its {@link Manifest}): files added to the build on another controller, which publishing this directory with
+     * the files added here would otherwise drop. A file in both is kept as it is here.
+     *
+     * <p>Two controllers publishing files of one build at the same moment may still each put a snapshot without the
+     * other's file over the other's: accepted (eventual consistency, as for the last writer of a record), being rare (files
+     * added to one completed build on two controllers within one publication).
+     */
+    private static void addFilesAddedElsewhere(String base, File dir) throws IOException {
+        BlobStore blobs = PersistenceStores.getBlobStore();
+        if (blobs == null) {
+            return;
+        }
+        Set<String> before = Manifest.paths(dir);
+        Path root = dir.toPath().toRealPath();
+        Path shared = Files.createTempDirectory("build-snapshot");
+        try {
+            try (InputStream in = blobs.get(base + "/" + SNAPSHOT)) {
+                if (in == null) {
+                    return;
+                }
+                new FilePath(shared.toFile()).untarFrom(in, FilePath.TarCompression.GZIP);
+            } catch (InterruptedException e) {
+                throw (IOException) new InterruptedIOException().initCause(e);
+            }
+            removeLinks(shared);
+            List<Path> files;
+            try (Stream<Path> walk = Files.walk(shared)) {
+                files = walk.filter(f -> Files.isRegularFile(f, LinkOption.NOFOLLOW_LINKS)).toList();
+            }
+            for (Path f : files) {
+                String rel = shared.relativize(f).toString().replace(File.separatorChar, '/');
+                Path target = root.resolve(rel).normalize();
+                if (rel.equals(RECORD) || rel.equals(Manifest.NAME) || before.contains(rel) || !target.startsWith(root)
+                        || Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
+                    continue; // the record, removed here since, or here too (kept as it is here)
+                }
+                Files.createDirectories(target.getParent());
+                if (!target.getParent().toRealPath().startsWith(root)) {
+                    continue; // never through a link
+                }
+                Files.copy(f, target);
+                LOGGER.fine(() -> "Keeping " + rel + " of " + base + ", added elsewhere");
+            }
+        } finally {
+            Util.deleteRecursive(shared.toFile());
+        }
     }
 
     private static void writeRecord(File dir, byte[] content) throws IOException {
@@ -846,18 +1107,31 @@ public final class BuildRecords {
         File dir = new File(job.getBuildDir(), String.valueOf(number));
         // under the lock materialization holds (RunMap.retrieve): one in progress is waited for and then refreshed,
         // rather than taken for not there yet and left with the record it read before this change
+        Run<?, ?> toPublish = null;
         synchronized (runs) {
             if (new File(dir, RECORD).isFile()) {
                 PersistenceStore.Entry record = PersistenceStores.get().read(builds + "/" + number + "/" + RECORD);
                 if (record == null) {
                     return; // deleted since; the deletion event follows
                 }
-                LOGGER.fine(() -> "Refreshing " + job.getFullName() + " #" + number + " changed elsewhere");
-                // its files may have changed too (a later snapshot): drop the local copy, materialised again when next needed
-                runs.unload(number);
-                Util.deleteRecursive(dir);
-                Files.createDirectories(dir.toPath());
-                runs.recognizeNumber(number);
+                if (Manifest.filesAdded(dir)) {
+                    // files were added here since this copy was published or fetched: publish them (with the record as
+                    // written elsewhere) rather than dropping them with the local copy (Target 15)
+                    Run<?, ?> loaded = runs.getLoadedBuilds().get(number);
+                    if (loaded != null) {
+                        LOGGER.info(() -> job.getFullName() + " #" + number + " changed elsewhere while files were added to it here; publishing them");
+                        writeRecord(dir, record.content());
+                        toPublish = loaded;
+                    }
+                }
+                if (toPublish == null) {
+                    LOGGER.fine(() -> "Refreshing " + job.getFullName() + " #" + number + " changed elsewhere");
+                    // its files may have changed too (a later snapshot): drop the local copy, materialised again when next needed
+                    runs.unload(number);
+                    Util.deleteRecursive(dir);
+                    Files.createDirectories(dir.toPath());
+                    runs.recognizeNumber(number);
+                }
             } else {
                 LOGGER.fine(() -> "Recognizing " + job.getFullName() + " #" + number + " completed elsewhere");
                 Files.createDirectories(dir.toPath());
@@ -865,6 +1139,11 @@ public final class BuildRecords {
                 runs.unload(number);
                 runs.recognizeNumber(number);
             }
+        }
+        if (toPublish != null) {
+            // not under the lock: it downloads and uploads (keeping the files of the snapshot made elsewhere)
+            publish(toPublish, true);
+            runs.unload(number); // loaded again with the record as written elsewhere
         }
         PeepholePermalink.changedElsewhere(job, number, false);
     }
@@ -1252,7 +1531,11 @@ public final class BuildRecords {
                 return;
             }
             try {
-                republish(run);
+                if (Manifest.filesAdded(run.getRootDir()) && PersistenceStores.get().read(recordKeyOf(run)) != null) {
+                    publish(run, true, true); // files were added too (Target 15): the record alone would leave them out
+                } else {
+                    republish(run);
+                }
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.WARNING, "Failed to republish " + run, e);
             }

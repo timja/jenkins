@@ -224,6 +224,16 @@ public abstract class PeepholePermalink extends Permalink implements Predicate<R
          * @param target {@link Some} or {@link #NONE}
          */
         void put(@NonNull Job<?, ?> job, @NonNull String id, @NonNull Known target);
+
+        /**
+         * Whether this cache is shared with other controllers keeping the job's builds (cloud-native Jenkins): its
+         * entries are then kept up to date by the controller completing or deleting builds, so that
+         * {@link #changedElsewhere} need not hint.
+         */
+        @Restricted(Beta.class)
+        default boolean isShared(@NonNull Job<?, ?> job) {
+            return false;
+        }
     }
 
     /**
@@ -329,6 +339,9 @@ public abstract class PeepholePermalink extends Permalink implements Predicate<R
     @Restricted(NoExternalUse.class)
     public static void changedElsewhere(@NonNull Job<?, ?> job, int number, boolean deleted) {
         Cache cache = ExtensionList.lookupFirst(Cache.class);
+        if (cache.isShared(job)) {
+            return; // the controller which completed or deleted the build updated the shared cache
+        }
         for (PeepholePermalink pp : Util.filter(job.getPermalinks(), PeepholePermalink.class)) {
             Cache.PermalinkTarget target = cache.get(job, pp.getId());
             if (target instanceof Cache.Some(int n) && (n > number || deleted && n < number)) {
@@ -339,6 +352,23 @@ public abstract class PeepholePermalink extends Permalink implements Predicate<R
             }
             LOGGER.fine(() -> "Hinting " + pp.getId() + " of " + job + " at #" + number + " changed elsewhere");
             cache.put(job, pp.getId(), new Cache.Some(number));
+        }
+    }
+
+    /**
+     * Updates the permalinks a completed build matches, as when it completes here; also for a build whose record this
+     * controller published for another one, gone before publishing it (Target 15).
+     */
+    @Restricted(NoExternalUse.class)
+    public static void completed(@NonNull Run<?, ?> run) {
+        Job<?, ?> j = run.getParent();
+        for (PeepholePermalink pp : Util.filter(j.getPermalinks(), PeepholePermalink.class)) {
+            if (pp.apply(run)) {
+                if (pp.resolveNumber(j) < run.getNumber()) {
+                    LOGGER.fine(() -> "Updating " + pp.getId() + " permalink to completed " + run);
+                    pp.updateCache(j, run);
+                }
+            }
         }
     }
 
@@ -364,15 +394,7 @@ public abstract class PeepholePermalink extends Permalink implements Predicate<R
          */
         @Override
         public void onCompleted(Run<?, ?> run, @NonNull TaskListener listener) {
-            Job<?, ?> j = run.getParent();
-            for (PeepholePermalink pp : Util.filter(j.getPermalinks(), PeepholePermalink.class)) {
-                if (pp.apply(run)) {
-                    if (pp.resolveNumber(j) < run.getNumber()) {
-                        LOGGER.fine(() -> "Updating " + pp.getId() + " permalink to completed " + run);
-                        pp.updateCache(j, run);
-                    }
-                }
-            }
+            completed(run);
         }
     }
 

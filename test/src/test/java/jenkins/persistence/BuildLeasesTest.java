@@ -297,6 +297,22 @@ class BuildLeasesTest {
     }
 
     @Test
+    void aControllerNeverTakesItselfForGone() throws Exception {
+        // e.g. its own heartbeat late under load: the store's live set lacks it for a moment; its builds stay its own
+        // (fencing handles a membership that really lapsed), or it would adopt and resume a build it is still running
+        r.createFreeStyleProject("mine");
+        String key = "jobs/mine/running/1.xml";
+        long epoch = STORE.leases().acquire(key);
+        STORE.write(key, placeholder(STORE.getOrigin(), 1, epoch, "x.savePoint=3\n"), PersistenceStore.ABSENT);
+        live = Set.of("another-controller");
+
+        assertEquals(0, RunningBuilds.removeStale());
+
+        assertTrue(Adopter.prepared.isEmpty(), Adopter.prepared::toString);
+        assertNotNull(text(key), "its placeholder is left alone");
+    }
+
+    @Test
     void buildOfDeadControllerIsAdopted() throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("orphan");
         String key = "jobs/orphan/running/1.xml";
@@ -350,6 +366,78 @@ class BuildLeasesTest {
         assertEquals(1, RunningBuilds.removeStale());
         assertNull(text(key));
         assertTrue(Adopter.resumed.isEmpty());
+    }
+
+    @Test
+    void completedBuildOfDeadControllerIsClosedWithItsResultNotResumed() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("finished");
+        String key = "jobs/finished/running/1.xml";
+        // its owner recorded the result on completion, then died before publishing the record (ET17)
+        dead.write(key, placeholder("dead-controller", 1, dead.leases().acquire(key), "x.savePoint=3\nx.result=SUCCESS\n"), PersistenceStore.ABSENT);
+        live = Set.of(STORE.getOrigin());
+
+        assertEquals(1, RunningBuilds.removeStale());
+
+        assertTrue(Adopter.prepared.isEmpty(), "not offered for adoption");
+        assertTrue(Adopter.resumed.isEmpty());
+        assertNull(text(key));
+        assertThat(text("jobs/finished/builds/1/build.xml"), containsString("<result>SUCCESS</result>"));
+        assertEquals(1, p.getLastSuccessfulBuild().getNumber(), "the permalinks are updated as its owner would have");
+        assertThat(text("jobs/finished/builds/permalinks"), containsString("lastSuccessfulBuild 1"));
+    }
+
+    @Test
+    void placeholderUpdatesKeepEarlierProperties() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        FreeStyleProject p = blocking(r, "merged", started, release);
+        QueueTaskFuture<FreeStyleBuild> f = p.scheduleBuild2(0);
+        assertTrue(started.await(60, TimeUnit.SECONDS));
+        String key = "jobs/merged/running/1.xml";
+
+        RunningBuilds.update(p.getBuildByNumber(1), Map.of("savePoint", "7"));
+        RunningBuilds.update(p.getBuildByNumber(1), Map.of("other", "x"));
+        assertThat(text(key), containsString("x.savePoint=7"));
+        assertThat(text(key), containsString("x.other=x"));
+
+        release.countDown();
+        r.assertBuildStatusSuccess(f);
+    }
+
+    @Test
+    void concurrentPlaceholderUpdatesAllApply() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        FreeStyleProject p = blocking(r, "concurrent", started, release);
+        QueueTaskFuture<FreeStyleBuild> f = p.scheduleBuild2(0);
+        assertTrue(started.await(60, TimeUnit.SECONDS));
+        FreeStyleBuild b = p.getBuildByNumber(1);
+        String key = "jobs/concurrent/running/1.xml";
+
+        // e.g. a Pipeline's last save point, shipped while it completes and its result is recorded
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(8);
+        try {
+            List<java.util.concurrent.Future<?>> updates = new java.util.ArrayList<>();
+            for (int i = 0; i < 40; i++) {
+                String name = "p" + i;
+                updates.add(pool.submit(() -> {
+                    RunningBuilds.update(b, Map.of(name, "v"));
+                    return null;
+                }));
+            }
+            for (java.util.concurrent.Future<?> u : updates) {
+                u.get(60, TimeUnit.SECONDS); // none conflicts with another update from here
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+        assertTrue(RunningBuilds.owns(b));
+        for (int i = 0; i < 40; i++) {
+            assertThat(text(key), containsString("x.p" + i + "=v"));
+        }
+
+        release.countDown();
+        r.assertBuildStatusSuccess(f);
     }
 
     @Test
@@ -949,6 +1037,77 @@ class BuildLeasesTest {
                 }
             }
             return List.of();
+        }
+    }
+
+    private static void awaitApplied() throws InterruptedException {
+        for (int i = 0; i < 300 && !ItemChangeApplier.isIdle(); i++) {
+            Thread.sleep(100);
+        }
+        assertTrue(ItemChangeApplier.isIdle(), "changes applied");
+    }
+
+    @Test
+    void aBuildWhoseResultWasRecordedJustBeforeItsOwnerDiedIsClosedWithIt() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("completed-orphan");
+        String key = "jobs/completed-orphan/running/1.xml";
+        long deadEpoch = dead.leases().acquire(key);
+        dead.write(key, placeholder("dead-controller", 1, deadEpoch, "x.savePoint=3\n"), PersistenceStore.ABSENT);
+        live = Set.of(STORE.getOrigin());
+        awaitApplied();
+        assertEquals(List.of(1), RunningBuilds.elsewhere(p).stream().map(RunningBuilds.Placeholder::getNumber).toList()); // as listed
+        // its owner recorded its result, then died, before this controller applied that change
+        onReadKey = key;
+        onReadThread = Thread.currentThread();
+        onRead = () -> {
+            try {
+                dead.write(key, placeholder("dead-controller", 1, deadEpoch, "x.savePoint=3\nx.result=SUCCESS\n"), PersistenceStore.ANY);
+            } catch (java.io.IOException e) {
+                throw new AssertionError(e);
+            }
+        };
+
+        assertEquals(1, RunningBuilds.removeStale());
+
+        assertNull(onRead, "looked at as stored now");
+        assertThat(text("jobs/completed-orphan/builds/1/build.xml"), containsString("<result>SUCCESS</result>"));
+        assertNull(text(key));
+    }
+
+    @Test
+    void aDeliveryStoredBeforeItsBuildIsRegisteredReachesIt() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        FreeStyleProject p = blocking(r, "registered-late", started, release);
+        String key = "jobs/registered-late/running/1.xml";
+        failWrites = k -> k.equals(key); // not registered as it starts
+        QueueTaskFuture<FreeStyleBuild> f = p.scheduleBuild2(0);
+        assertTrue(started.await(60, TimeUnit.SECONDS));
+        failWrites = null;
+        // e.g. a downstream build completed on another controller meanwhile: not for this one, which does not own it yet
+        STORE.as("other-controller").write("jobs/registered-late/running/1.deliver-x", "done".getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+        awaitApplied();
+        Thread.sleep(1000);
+        assertEquals(List.of(), Deliveries.got);
+
+        RunningBuilds.registerPending();
+
+        for (int i = 0; i < 100 && Deliveries.got.isEmpty(); i++) {
+            Thread.sleep(100);
+        }
+        assertEquals(List.of("registered-late #1 x=done"), Deliveries.got);
+        release.countDown();
+        r.assertBuildStatusSuccess(f);
+    }
+
+    @TestExtension("aDeliveryStoredBeforeItsBuildIsRegisteredReachesIt")
+    public static class Deliveries implements RunningBuilds.Delivery {
+        static final List<String> got = new CopyOnWriteArrayList<>();
+
+        @Override
+        public boolean deliver(Run<?, ?> run, String id, String payload) {
+            got.add(run.getParent().getName() + " #" + run.getNumber() + " " + id + "=" + payload);
+            return true;
         }
     }
 

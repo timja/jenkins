@@ -211,6 +211,20 @@ public final class ItemChangeApplier {
 
     /** The origin of {@link #reload} events (never a controller's). */
     private static final String MERGED = "(merged here)";
+    /** The origin of reloads after a save the strict-ui policy refused: applied at once, over the refused values. */
+    private static final String REFUSED = "(refused here)";
+
+    /**
+     * Reloads the object stored at a key at once, even though it has unsaved changes: they are a save that was
+     * refused, which must not reach the store later through another save of the same object.
+     */
+    static void reloadRefused(String key) {
+        ItemChangeApplier a = instance;
+        if (a != null) {
+            a.pending.incrementAndGet();
+            a.queue.add(new ChangeEvent(ChangeEvent.Kind.WRITTEN, key, null, Long.MAX_VALUE, REFUSED));
+        }
+    }
 
     // before global configuration is loaded, which item loading (requiring SYSTEM_CONFIG_ADAPTED) follows: an item read
     // before subscribing could miss a change made in between, never delivered and newer than what was read
@@ -298,7 +312,7 @@ public final class ItemChangeApplier {
                 // nor a move: a later write of its destination does not move the item from its old name (or a second
                 // one would be loaded at the new name, the moved one left where it was)
                 boolean move = e.kind() == ChangeEvent.Kind.MOVED;
-                if (!MERGED.equals(e.origin()) && latest != null && latest > e.version() && !itemDeleted && !move) {
+                if (!MERGED.equals(e.origin()) && !REFUSED.equals(e.origin()) && latest != null && latest > e.version() && !itemDeleted && !move) {
                     failures.remove(e.key()); // overtaken by a newer change of its key, which applies the latest state
                     continue;
                 }
@@ -392,7 +406,7 @@ public final class ItemChangeApplier {
                 if (e.key().equals("config.xml")) {
                     // check and reload under one lock (Jenkins.save and reloadGlobalConfig take it), as for items below
                     synchronized (jenkins) {
-                        if (jenkins.hasUnsavedGlobalChanges() && retryLater(e)) {
+                        if (!REFUSED.equals(e.origin()) && jenkins.hasUnsavedGlobalChanges() && retryLater(e)) {
                             return;
                         }
                         if (StaticStateApplier.apply(e.key(), false)) {
@@ -406,12 +420,19 @@ public final class ItemChangeApplier {
             }
             return;
         }
+        String owner = SubItems.ownerKey(e.key());
+        if (owner != null) {
+            // a promotion process or matrix configuration (Target 15): its job loads it, from its directory
+            Util.createDirectories(SubItems.dirOf(e.key()).toPath());
+            reload(owner);
+            return;
+        }
         List<String> names = itemPath(e.key());
         if (names == null || e.version() <= PersistenceStores.lastSeen(e.key())) {
             return; // not an item, or already have this version (e.g. loaded it at startup)
         }
         ChangeEvent failedDeletion = failedDeletions.get(e.key());
-        if (failedDeletion != null && failedDeletion.version() < e.version() && !MERGED.equals(e.origin())) {
+        if (failedDeletion != null && failedDeletion.version() < e.version() && !MERGED.equals(e.origin()) && !REFUSED.equals(e.origin())) {
             // made again elsewhere after a deletion that failed to apply here: that deletion first, or the deleted item
             // would be reloaded as the new one, keeping its builds and history (and its retry then skipped as older
             // than what was loaded); if it fails again, so does this write, retried after it
@@ -428,12 +449,21 @@ public final class ItemChangeApplier {
             LOGGER.fine(() -> "Reloading " + fullName + " changed elsewhere");
             // under the item's lock, as AbstractItem.save is: a save while the object is half reloaded would write a mix
             // of the two versions, as of the version just read, so nobody would notice (lost trigger, ET11 scenario 3)
+            // the new version is read outside the lock; only what changed is copied in under it (Target 15)
+            ItemReload.Prepared prepared = ItemReload.prepare(existing);
             synchronized (existing) {
-                if (PersistenceStores.hasUnsavedChanges(existing.getConfigFile(), existing) && retryLater(e)) {
+                if (!REFUSED.equals(e.origin()) && PersistenceStores.hasUnsavedChanges(existing.getConfigFile(), existing) && retryLater(e)) {
                     return; // its save is pending: it will conflict and be merged, and reloaded with both changes
                 }
-                PersistenceStores.reload(existing.getConfigFile(), existing, existing::load); // a display name cleared, say
-                PersistenceStores.synced(existing.getConfigFile(), existing);
+                // after a refused save, all of it: field by field only copies what changed in the store, which would
+                // leave the refused values (changed in memory only) where they are
+                ItemReload.Outcome reloaded = REFUSED.equals(e.origin()) || prepared == null ? ItemReload.Outcome.RELOAD : ItemReload.apply(existing, prepared);
+                if (reloaded == ItemReload.Outcome.RELOAD) {
+                    PersistenceStores.reload(existing.getConfigFile(), existing, existing::load); // a display name cleared, say
+                }
+                if (reloaded != ItemReload.Outcome.PARTLY) {
+                    PersistenceStores.synced(existing.getConfigFile(), existing);
+                }
             }
             applied(e.key());
             ItemListener.fireOnUpdated(existing);
@@ -465,6 +495,13 @@ public final class ItemChangeApplier {
             if (created instanceof AbstractItem ai) {
                 PersistenceStores.synced(ai.getConfigFile(), ai);
             }
+        } else if (parent instanceof RemoteItemGroup group && Items.load(parent, dir) instanceof TopLevelItem created) {
+            // just the new child (Target 15): reloading the folder would reload every child already in it
+            if (created instanceof AbstractItem ai) {
+                PersistenceStores.synced(ai.getConfigFile(), ai);
+            }
+            group.addRemotelyCreated(created);
+            ItemListener.fireOnCreated(created);
         } else if (parent instanceof AbstractItem folder) {
             // reloading the folder loads children which so far exist only in the store; under its lock, as items are
             // reloaded above, so that a save of the folder meanwhile does not store a mix of the two versions
@@ -512,6 +549,12 @@ public final class ItemChangeApplier {
             }
             return;
         }
+        String owner = SubItems.ownerKey(e.key());
+        if (owner != null) {
+            Util.deleteRecursive(SubItems.dirOf(e.key())); // its job reloads without it
+            reload(owner);
+            return;
+        }
         List<String> names = itemPath(e.key());
         if (names == null || e.version() <= PersistenceStores.lastSeen(e.key())) {
             return; // not an item, or deleted before what this controller has: an item it made again since, say
@@ -531,6 +574,20 @@ public final class ItemChangeApplier {
      * @return false if the key is not a build record
      */
     private boolean build(ChangeEvent e) throws Exception {
+        String permalinks = StoredPermalinks.buildsKeyOf(e.key());
+        if (permalinks != null) {
+            StoredPermalinks.changedElsewhere(permalinks, e.version());
+            applied.incrementAndGet();
+            return true;
+        }
+        RunningBuilds.DeliveryKey delivery = RunningBuilds.DeliveryKey.parse(e.key());
+        if (delivery != null) {
+            if (e.kind() == ChangeEvent.Kind.WRITTEN) {
+                Timer.get().submit(() -> RunningBuilds.delivered(delivery.jobKey(), delivery.number(), delivery.id(), 0));
+            }
+            applied.incrementAndGet();
+            return true;
+        }
         RunningBuilds.StopKey stop = RunningBuilds.StopKey.parse(e.key());
         if (stop != null) {
             if (e.kind() == ChangeEvent.Kind.WRITTEN) {
@@ -691,6 +748,9 @@ public final class ItemChangeApplier {
         }
         List<String> names = new ArrayList<>();
         for (int i = 1; i < segments.length - 1; i += 2) {
+            if (i > 1 && !segments[i - 1].equals("jobs") && !segments[i - 1].equals("branches")) {
+                return null; // e.g. jobs/x/promotions/p/config.xml: a sub-item of x (SubItems), not an item
+            }
             names.add(segments[i]);
         }
         return names;

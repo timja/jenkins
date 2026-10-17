@@ -66,7 +66,10 @@ import org.kohsuke.accmod.restrictions.NoExternalUse;
  * <p>Also remembers, per key, the version this JVM last read or wrote, so that writes can detect
  * modifications made by other controllers in the meantime.
  * What happens on such a conflict depends on {@code -Djenkins.persistence.PersistenceStores.conflicts}:
- * {@code warn} (the default) logs and overwrites, {@code fail} throws {@link ConflictException}.
+ * {@code warn} (the default) merges what can be merged, else logs and overwrites; {@code fail} throws {@link ConflictException};
+ * {@code strict-ui} (Target 15) is {@code warn}, except that a save made by a web request (a form, {@code config.xml})
+ * which changed the same part as the change made meanwhile, or cannot be merged, is refused, so that the user reloads
+ * instead of silently overwriting someone else's change.
  *
  * @since TODO
  */
@@ -76,7 +79,7 @@ public final class PersistenceStores {
     private static final Logger LOGGER = Logger.getLogger(PersistenceStores.class.getName());
 
     /**
-     * Conflict policy: {@code warn} or {@code fail}.
+     * Conflict policy: {@code warn}, {@code strict-ui} or {@code fail}.
      */
     @Restricted(NoExternalUse.class)
     public static /* non-final for script console */ String CONFLICTS = SystemProperties.getString(PersistenceStores.class.getName() + ".conflicts", "warn");
@@ -224,10 +227,89 @@ public final class PersistenceStores {
             return null;
         }
         String key = keyFor(file);
-        if (key == null || !store.owns(key) || localOnly.contains(key)) {
+        if (key == null || !store.owns(key) || localOnly.contains(key) || declaredLocal(key)) {
             return null;
         }
         return new Route(store, key);
+    }
+
+    /** Patterns of {@link LocalFiles}, once extensions are loaded; until then core's own. */
+    private static volatile List<java.nio.file.PathMatcher> localPatterns = matchers(new LocalFiles.Core().patterns());
+    /** Root {@code <class name>.xml} files by whether their class is {@link PerController}. */
+    private static final Map<String, Boolean> perControllerRoots = new ConcurrentHashMap<>();
+
+    private static List<java.nio.file.PathMatcher> matchers(java.util.Collection<String> patterns) {
+        List<java.nio.file.PathMatcher> result = new java.util.ArrayList<>();
+        for (String p : patterns) {
+            result.add(java.nio.file.FileSystems.getDefault().getPathMatcher("glob:" + p));
+        }
+        return result;
+    }
+
+    /** Loads the declared {@link LocalFiles} (Target 15), and again whenever plugins add some. */
+    @hudson.init.Initializer(after = hudson.init.InitMilestone.EXTENSIONS_AUGMENTED)
+    public static void loadLocalFiles() {
+        hudson.ExtensionList<LocalFiles> list = hudson.ExtensionList.lookup(LocalFiles.class);
+        Runnable refresh = () -> {
+            List<String> patterns = new java.util.ArrayList<>();
+            for (LocalFiles l : list) {
+                patterns.addAll(l.patterns());
+            }
+            localPatterns = matchers(patterns);
+            perControllerRoots.clear();
+        };
+        refresh.run();
+        list.addListener(new hudson.ExtensionListListener() {
+            @Override
+            public void onChange() {
+                refresh.run();
+            }
+        });
+    }
+
+    /**
+     * Whether a key is declared per controller (Target 15): by a {@link LocalFiles} pattern, or as the root file of a
+     * {@link PerController} class.
+     */
+    @Restricted(Beta.class)
+    public static boolean declaredLocal(@NonNull String key) {
+        java.nio.file.Path path = java.nio.file.Path.of(key);
+        for (java.nio.file.PathMatcher m : localPatterns) {
+            if (m.matches(path)) {
+                return true;
+            }
+        }
+        if (key.indexOf('/') < 0 && key.endsWith(".xml")) {
+            Boolean known = perControllerRoots.get(key);
+            if (known != null) {
+                return known;
+            }
+            Jenkins j = Jenkins.getInstanceOrNull();
+            if (j == null || j.getInitLevel().compareTo(hudson.init.InitMilestone.EXTENSIONS_AUGMENTED) < 0) {
+                return false; // plugin classes are not all loadable yet; decided (and cached) later
+            }
+            boolean local;
+            try {
+                local = Class.forName(key.substring(0, key.length() - 4), false, j.getPluginManager().uberClassLoader)
+                        .isAnnotationPresent(PerController.class);
+            } catch (ClassNotFoundException | LinkageError e) {
+                local = false;
+            }
+            perControllerRoots.put(key, local);
+            return local;
+        }
+        return false;
+    }
+
+    /** Keeps the file of an object of a {@link PerController} class local (Target 15); called before it is read or written. */
+    @Restricted(NoExternalUse.class)
+    public static void declare(@NonNull File file, @CheckForNull Object o) {
+        if (o != null && o.getClass().isAnnotationPresent(PerController.class)) {
+            String key = keyFor(file);
+            if (key != null && !localOnly.contains(key)) {
+                localOnly.add(key);
+            }
+        }
     }
 
     /** Keys the store owns which this controller nevertheless keeps to itself, such as its own cloud agents. */
@@ -721,6 +803,14 @@ public final class PersistenceStores {
     private static final int MERGE_ATTEMPTS = 5;
     private static final int MAX_BASE_SIZE = 1024 * 1024;
     private static final AtomicLong merges = new AtomicLong();
+    /** Saves refused by the {@code strict-ui} policy (Target 15). */
+    private static final AtomicLong unresolved = new AtomicLong();
+
+    /** How many saves the {@code strict-ui} policy refused, since this controller started. */
+    @Restricted(Beta.class)
+    public static long getRefusedCount() {
+        return unresolved.get();
+    }
 
     private static void remember(String key, long version, byte[] content) {
         if (key.endsWith(".xml") && content.length <= MAX_BASE_SIZE) {
@@ -753,6 +843,13 @@ public final class PersistenceStores {
                 snapshots.remove(key);
             }
         }
+    }
+
+    /** The object's serialisation as last saved here or reloaded (see {@link #synced}), or null if unknown. */
+    @CheckForNull
+    static byte[] snapshotOf(@NonNull XmlFile file) {
+        String key = keyFor(file.getPath());
+        return key == null ? null : snapshots.get(key);
     }
 
     /**
@@ -1111,12 +1208,23 @@ public final class PersistenceStores {
             long version;
             try {
                 version = store.write(key, content, expected);
+                LOGGER.fine(() -> "Wrote " + key + " over version " + expected);
             } catch (ConflictException e) {
+                Base b0 = bases.get(key);
+                LOGGER.fine(() -> "Conflict writing " + key + " over version " + expected + " (base " + (b0 == null ? "none" : b0.version()) + ")");
                 conflicts.incrementAndGet();
                 if (createOnly || "fail".equals(CONFLICTS)) {
                     throw e;
                 }
-                Long merged = mergeAndWrite(content, expected);
+                boolean strict = "strict-ui".equals(CONFLICTS) && org.kohsuke.stapler.Stapler.getCurrentRequest2() != null;
+                Long merged = mergeAndWrite(content, expected, strict);
+                if (merged == null && strict) {
+                    unresolved.incrementAndGet();
+                    // the object in memory holds the refused values: reload it now, or a later save of it (a background
+                    // one, not refused) would store them after all
+                    ItemChangeApplier.reloadRefused(key);
+                    throw new ConflictException(key, expected, -1); // shown to the user: reload, then save again
+                }
                 if (merged != null) {
                     return merged; // seen and remembered as the object in memory has it, until it is reloaded
                 } else {
@@ -1140,7 +1248,7 @@ public final class PersistenceStores {
          * @return the new version, or null if the contents cannot be merged
          */
         @CheckForNull
-        private Long mergeAndWrite(byte[] mine, long expected) throws IOException {
+        private Long mergeAndWrite(byte[] mine, long expected, boolean refuseConflicts) throws IOException {
             Base base = bases.get(key);
             if (base == null || base.version() != expected || !key.endsWith(".xml")) {
                 return null;
@@ -1151,7 +1259,7 @@ public final class PersistenceStores {
                     return null; // deleted meanwhile
                 }
                 XmlMerge.Result result = XmlMerge.merge(base.content(), mine, theirs.content());
-                if (result == null) {
+                if (result == null || refuseConflicts && result.conflicts() > 0) {
                     return null;
                 }
                 try {
@@ -1159,8 +1267,14 @@ public final class PersistenceStores {
                     // the object in memory still has only this JVM's side until it is reloaded (queued below): a save of
                     // it meanwhile must conflict and merge again, against what it holds, rather than overwrite the
                     // merged content with its stale part (a setter saving twice, ET11 scenario 3)
-                    seen(key, theirs.version());
-                    remember(key, theirs.version(), mine);
+                    if (version != theirs.version()) {
+                        seen(key, theirs.version());
+                        remember(key, theirs.version(), mine);
+                    }
+                    // else the merge is what was stored already, and the write was a no-op keeping theirs' version
+                    // (Target 15): taking that version as seen would let the next save from this stale object pass
+                    // without a conflict, overwriting their change; keeping the version and base read before makes it
+                    // merge again
                     if (result.conflicts() > 0) {
                         LOGGER.warning(() -> key + " was changed meanwhile; merged, but " + result.conflicts()
                                 + " part(s) changed on both sides keep this controller's version");

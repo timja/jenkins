@@ -28,6 +28,7 @@ import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import hudson.Extension;
+import hudson.ExtensionList;
 import hudson.init.InitMilestone;
 import hudson.init.Initializer;
 import hudson.init.Terminator;
@@ -200,17 +201,35 @@ public final class SharedQueue {
         return bytes.toByteArray();
     }
 
+    /** pipeline-build-step's handler of downstream outcomes delivered across controllers ({@link RunningBuilds.Delivery}). */
+    private static final String BUILD_STEP_DELIVERY = "org.jenkinsci.plugins.workflow.support.steps.build.BuildTriggerDelivery";
+
+    /**
+     * The controller a downstream build must run on, or null if any may run it. A {@code build} step waiting for its
+     * downstream build to complete gets the outcome delivered wherever the downstream build runs (Target 15), when
+     * pipeline-build-step can take deliveries; one waiting only for the start ({@code waitForStart}) needs the started
+     * build itself, so it stays pinned to the controller that scheduled it.
+     */
     @CheckForNull
     private static String pinnedTo(@NonNull List<Action> actions) {
         for (Action a : actions) {
             if (a.getClass().getName().equals(BUILD_TRIGGER_ACTION)) {
-                return origin();
+                boolean delivered = ExtensionList.lookup(RunningBuilds.Delivery.class).stream()
+                        .anyMatch(d -> d.getClass().getName().equals(BUILD_STEP_DELIVERY));
+                if (!delivered || Queue.XSTREAM.toXML(a).contains("<waitForStart>true</waitForStart>")) {
+                    return origin();
+                }
             }
             if (a instanceof ParametersAction pa && pa.getParameters().stream().anyMatch(FileParameterValue.class::isInstance)) {
                 return origin(); // the uploaded file is only here
             }
         }
         return null;
+    }
+
+    /** Whether a pin still holds: its controller is alive (a pin to one that died must not keep the item forever). */
+    private static boolean pinHolds(@NonNull String pinnedTo) {
+        return seemsAlive(pinnedTo); // as last read, off the queue lock
     }
 
     static String toXml(@NonNull List<? extends Action> actions) {
@@ -379,8 +398,14 @@ public final class SharedQueue {
         }
     }
 
-    /** Removes an item from this controller's queue because it was claimed, started or cancelled elsewhere. */
-    private static void dropLocal(long id) {
+    /**
+     * Removes an item from this controller's queue because it was claimed or started elsewhere ({@code taken}), or
+     * cancelled.
+     */
+    private static void dropLocal(long id, boolean taken) {
+        if (taken) {
+            takenHere.add(id); // before it leaves: its listeners ask (takenElsewhere)
+        }
         if (PersistenceStores.applyingRemoteChange(() -> Queue.getInstance().cancelLocal(id))) {
             LOGGER.fine(() -> "Dropped queue item " + id + ", taken or cancelled elsewhere");
             droppedHere.add(id);
@@ -392,6 +417,14 @@ public final class SharedQueue {
      * before starting it, the store puts it back, under the same id, and it is mirrored again (Mirror.create).
      */
     private static final Set<Long> droppedHere = java.util.Collections.newSetFromMap(java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>() {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<Long, Boolean> eldest) {
+            return size() > 10_000;
+        }
+    }));
+
+    /** Of those, the items dropped because another controller claimed or started them (for {@link #takenElsewhere}). */
+    private static final Set<Long> takenHere = java.util.Collections.newSetFromMap(java.util.Collections.synchronizedMap(new java.util.LinkedHashMap<>() {
         @Override
         protected boolean removeEldestEntry(Map.Entry<Long, Boolean> eldest) {
             return size() > 10_000;
@@ -878,7 +911,7 @@ public final class SharedQueue {
         if (r.claimedBy() != null) {
             return me.equals(r.claimedBy());
         }
-        if (r.pinnedTo() != null) {
+        if (r.pinnedTo() != null && pinHolds(r.pinnedTo())) {
             return me.equals(r.pinnedTo());
         }
         if (me.equals(r.origin())) {
@@ -991,10 +1024,11 @@ public final class SharedQueue {
             if (r.state() != ClusterQueue.State.WAITING) {
                 // taken elsewhere, or started here already: an item started here has left the queue, so a copy still in
                 // it is stale (e.g. restored by a reload from a queue saved before it started)
-                Timer.get().submit(() -> dropLocal(id));
+                boolean taken = r.state() != ClusterQueue.State.CANCELLED && !me.equals(r.claimedBy());
+                Timer.get().submit(() -> dropLocal(id, taken));
                 return new Blocked(r.state() == ClusterQueue.State.STARTED && me.equals(r.claimedBy()) ? "Started already" : "Starting on another controller");
             }
-            if (r.pinnedTo() != null && !me.equals(r.pinnedTo())) {
+            if (r.pinnedTo() != null && !me.equals(r.pinnedTo()) && pinHolds(r.pinnedTo())) {
                 return new Blocked("Waiting for the controller that scheduled it (it waits for the result)");
             }
             if (!me.equals(r.origin()) && System.currentTimeMillis() < r.dueAt() + ORIGIN_GRACE_MILLIS && seemsAlive(r.origin())) {
@@ -1020,8 +1054,10 @@ public final class SharedQueue {
             try {
                 String me = origin();
                 ClusterQueue.Record r = cq.get(id);
-                // not if a request folded into it since the gate looked pinned it elsewhere (the claim checks it did not since)
-                if (r != null && r.state() == ClusterQueue.State.WAITING && (r.pinnedTo() == null || me.equals(r.pinnedTo()))) {
+                // not if a request folded into it since the gate looked pinned it to a live controller elsewhere (the claim
+                // checks it did not since)
+                if (r != null && r.state() == ClusterQueue.State.WAITING
+                        && (r.pinnedTo() == null || me.equals(r.pinnedTo()) || !pinHolds(r.pinnedTo()))) {
                     String reservedBy = Reservations.holder(id);
                     if (reservedBy != null && !origin().equals(reservedBy)) {
                         if (!gone(reservedBy)) {
@@ -1363,10 +1399,10 @@ public final class SharedQueue {
                 }
                 case CLAIMED, STARTED -> {
                     if (!me.equals(r.claimedBy())) {
-                        dropLocal(r.id());
+                        dropLocal(r.id(), true);
                     }
                 }
-                case CANCELLED -> dropLocal(r.id());
+                case CANCELLED -> dropLocal(r.id(), false);
                 default -> throw new IllegalStateException(r.toString());
             }
         }
@@ -1422,6 +1458,7 @@ public final class SharedQueue {
                 Ids.MIRRORED.remove();
             }
             droppedHere.remove(r.id());
+            takenHere.remove(r.id()); // put back: it may yet be cancelled
         }
 
         /** Waiting items whose job was not here when they were mirrored, by job: they are once it comes. */
@@ -1454,6 +1491,60 @@ public final class SharedQueue {
     }
 
     // ------------------------------------------------------------------ queue items not (or no longer) here
+
+    /**
+     * Whether a queue item left this controller's queue because another controller claimed or started it, rather
+     * than because it was cancelled (Target 15). Its local copy leaves as cancelled either way, so a
+     * {@link hudson.model.queue.QueueListener#onLeft} that fails on cancellation should not when this is true.
+     *
+     * <p>Answered from what this controller knows: an item dropped here because it was taken elsewhere is known to be
+     * (without asking the store, under the queue lock that {@code onLeft} holds, nor failing if it cannot be asked). Of
+     * another item the store is asked; if it cannot be, the answer is false.
+     */
+    @Restricted(Beta.class)
+    public static boolean takenElsewhere(long id) {
+        ClusterQueue cq = queue();
+        if (cq == null) {
+            return false;
+        }
+        if (takenHere.contains(id)) {
+            return true;
+        }
+        try {
+            ClusterQueue.Record r = cq.get(id);
+            return r != null && (r.state() == ClusterQueue.State.CLAIMED || r.state() == ClusterQueue.State.STARTED)
+                    && !origin().equals(r.claimedBy());
+        } catch (IOException e) {
+            LOGGER.log(Level.FINE, "Cannot look up queue item " + id, e);
+            return false;
+        }
+    }
+
+    /**
+     * The number of the build a queue item became on another controller (Target 15: for the CLI's {@code build -s},
+     * whose local item is cancelled when another controller starts it), waiting up to {@code seconds}; -1 if it did not
+     * (it was cancelled).
+     */
+    @Restricted(Beta.class)
+    public static int startedElsewhere(long id, int seconds) throws InterruptedException {
+        ClusterQueue cq = queue();
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(seconds);
+        while (cq != null && System.nanoTime() < deadline) {
+            try {
+                ClusterQueue.Record r = cq.get(id);
+                if (r == null || r.state() == ClusterQueue.State.CANCELLED) {
+                    return -1;
+                }
+                if (r.state() == ClusterQueue.State.STARTED && r.buildNumber() > 0) {
+                    return r.buildNumber();
+                }
+            } catch (IOException e) {
+                LOGGER.log(Level.FINE, "Cannot look up queue item " + id, e);
+            }
+            Thread.sleep(500);
+        }
+        return -1;
+    }
 
     /**
      * An item of the shared queue which is not in this controller's queue, for {@code queue/item/<id>}.
