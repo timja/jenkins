@@ -226,6 +226,29 @@ class BuildLeasesTest {
     }
 
     @Test
+    void adoptionWaitsWhileAnotherBuildOfTheJobRunsElsewhere() throws Exception {
+        r.createFreeStyleProject("serial"); // one build at a time
+        String key = "jobs/serial/running/1.xml";
+        long deadEpoch = dead.leases().acquire(key);
+        dead.write(key, placeholder("dead-controller", 1, deadEpoch, "x.savePoint=3\n"), PersistenceStore.ABSENT);
+        // a third controller started a newer build of it meanwhile
+        PersistenceStore third = STORE.as("third");
+        long exclusive = third.leases().acquire("jobs/serial/running/exclusive");
+        assertThat(exclusive, greaterThan(0L));
+        live = Set.of(STORE.getOrigin(), "third");
+
+        RunningBuilds.removeStale();
+
+        assertTrue(Adopter.resumed.isEmpty(), "not resumed while the other build runs");
+        assertNotNull(text(key), "left for a later sweep");
+        assertThat(Adopter.abandoned.get(), greaterThan(0));
+        // the store outlives this test
+        third.leases().release("jobs/serial/running/exclusive", exclusive);
+        STORE.delete(key, PersistenceStore.ANY);
+        STORE.delete("jobs/serial/config.xml", PersistenceStore.ANY);
+    }
+
+    @Test
     void buildOfDeadControllerIsAdopted() throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("orphan");
         String key = "jobs/orphan/running/1.xml";
@@ -368,6 +391,8 @@ class BuildLeasesTest {
         assertEquals(0, RunningBuilds.removeStale());
         assertThat("it names its gone owner again, not this live controller", text(key), containsString("origin=dead-controller"));
         assertTrue(Adopter.resumed.isEmpty());
+        assertThat("nor does this controller keep the job's exclusive lease", STORE.as("third-controller").leases().acquire("jobs/unresumable/running/exclusive"),
+                greaterThan(0L));
 
         assertEquals(1, RunningBuilds.removeStale());
         assertEquals(1, Adopter.resumed.size());
@@ -546,6 +571,72 @@ class BuildLeasesTest {
         assertEquals(1, Adopter.resumed.size());
         assertEquals(1, Adopter.abandoned.get());
         forget("unwritten");
+    }
+
+    @Test
+    void adoptionFailingOnARetryKeepsNoExclusiveLease() throws Exception {
+        String key = orphan("retried-adoption");
+        // the first attempt conflicts with a newer save point (with the job's exclusive lease taken); the second fails
+        Adopter.interfere = () -> {
+            Adopter.interfere = null;
+            Adopter.failPrepare = 1;
+            dead.write(key, placeholder("dead-controller", 1, 1, "x.savePoint=4\n"), PersistenceStore.ANY);
+        };
+
+        RunningBuilds.removeStale();
+
+        assertThat(text(key), containsString("origin=dead-controller"));
+        PersistenceStore third = STORE.as("third-controller");
+        long epoch = third.leases().acquire("jobs/retried-adoption/running/exclusive");
+        assertThat("this controller, which runs none of its builds, does not keep the job's exclusive lease", epoch, greaterThan(0L));
+        third.leases().release("jobs/retried-adoption/running/exclusive", epoch);
+        forget("retried-adoption");
+    }
+
+    @Test
+    void adoptedBuildReleasesTheExclusiveLeaseWithoutASharedQueue() throws Exception {
+        String key = orphan("adopted-alone"); // this store has leases, but no queue
+        RunningBuilds.removeStale();
+        assertThat(text(key), containsString("origin=" + STORE.getOrigin()));
+        String exclusive = "jobs/adopted-alone/running/exclusive";
+        PersistenceStore third = STORE.as("third-controller");
+        assertEquals(0, third.leases().acquire(exclusive), "held for the adopted build");
+
+        // the test adopter loads no build: one of that number, run here, stands for the adopted build completing
+        FreeStyleProject p = r.jenkins.getItemByFullName("adopted-alone", FreeStyleProject.class);
+        r.buildAndAssertSuccess(p);
+
+        long epoch = third.leases().acquire(exclusive);
+        assertThat("released once the adopted build was finalized", epoch, greaterThan(0L));
+        third.leases().release(exclusive, epoch);
+        assertNull(text(key));
+        forget("adopted-alone");
+    }
+
+    @Test
+    void stopRequestedWhileTheOwnerWasGoneStopsTheAdoptedBuild() throws Exception {
+        String key = orphan("stopped-adopted");
+        String stop = "jobs/stopped-adopted/running/1.stop";
+        dead.write(stop, "controller=jenkins-b\nby=alice\n".getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+
+        RunningBuilds.removeStale();
+        assertThat(text(key), containsString("origin=" + STORE.getOrigin()));
+        assertNotNull(text(stop), "kept until the adopted build can be stopped (the test adopter loads none)");
+
+        // a build of that number, run here, stands for the adopted build getting its executor
+        FreeStyleProject p = r.jenkins.getItemByFullName("stopped-adopted", FreeStyleProject.class);
+        p.getBuildersList().add(new TestBuilder() {
+            @Override
+            public boolean perform(AbstractBuild<?, ?> build, Launcher launcher, BuildListener listener) throws InterruptedException {
+                Thread.sleep(30_000);
+                return true;
+            }
+        });
+        FreeStyleBuild b = p.scheduleBuild2(0).get(60, TimeUnit.SECONDS);
+        assertEquals(Result.ABORTED, b.getResult());
+        assertThat(b.getLog(), containsString("Stopped from jenkins-b by alice"));
+        assertNull(text(stop));
+        forget("stopped-adopted");
     }
 
     @TestExtension

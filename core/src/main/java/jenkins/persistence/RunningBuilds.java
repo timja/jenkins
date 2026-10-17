@@ -31,7 +31,9 @@ import hudson.ExtensionList;
 import hudson.model.Action;
 import hudson.model.AsyncPeriodicWork;
 import hudson.model.Executor;
+import hudson.model.Item;
 import hudson.model.Job;
+import hudson.model.Queue;
 import hudson.model.Result;
 import hudson.model.Run;
 import hudson.model.TaskListener;
@@ -67,8 +69,12 @@ import jenkins.util.Timer;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
+import org.kohsuke.stapler.HttpResponse;
+import org.kohsuke.stapler.HttpResponses;
+import org.kohsuke.stapler.QueryParameter;
 import org.kohsuke.stapler.export.Exported;
 import org.kohsuke.stapler.export.ExportedBean;
+import org.kohsuke.stapler.interceptor.RequirePOST;
 
 /**
  * Makes builds running on one controller visible on the others, as placeholders, until their record is {@linkplain BuildRecords published}.
@@ -88,6 +94,7 @@ public final class RunningBuilds {
 
     static final String PREFIX = "running";
     private static final String SUFFIX = ".xml";
+    private static final String STOP_SUFFIX = ".stop";
 
     /**
      * How this controller is named in placeholders; defaults to the host name.
@@ -312,9 +319,47 @@ public final class RunningBuilds {
      */
     @NonNull
     public static List<Placeholder> elsewhere(@NonNull Job<?, ?> job) {
+        return elsewhere(job, all(job));
+    }
+
+    /** Jobs whose placeholders are being loaded for {@link #elsewhereCached}, by job key. */
+    private static final Set<String> loading = ConcurrentHashMap.newKeySet();
+
+    /**
+     * {@link #elsewhere}, without asking the store, for callers under the queue lock: from what is cached, or null if
+     * nothing is. The job's placeholders are then loaded off the lock, and the queue looked at again.
+     */
+    @CheckForNull
+    static List<Placeholder> elsewhereCached(@NonNull Job<?, ?> job) {
+        String runningKey = runningKey(job);
+        if (PersistenceStores.get() == null || runningKey == null) {
+            return List.of();
+        }
+        String jobKey = jobKeyOfRunning(runningKey);
+        List<Placeholder> cached = cache.get(jobKey);
+        if (cached != null) {
+            return elsewhere(job, cached);
+        }
+        if (loading.add(jobKey)) {
+            Timer.get().submit(() -> {
+                try {
+                    all(job);
+                } finally {
+                    loading.remove(jobKey);
+                }
+                if (cache.containsKey(jobKey)) { // else not loaded (the store is unreachable): asked again at the next maintenance
+                    Queue.getInstance().scheduleMaintenance();
+                }
+            });
+        }
+        return null;
+    }
+
+    @NonNull
+    private static List<Placeholder> elsewhere(@NonNull Job<?, ?> job, @NonNull List<Placeholder> all) {
         PersistenceStore store = PersistenceStores.get();
         List<Placeholder> result = new ArrayList<>();
-        for (Placeholder p : all(job)) {
+        for (Placeholder p : all) {
             if (store != null && p.origin.equals(store.getOrigin())) {
                 continue; // running here, so a real build
             }
@@ -367,7 +412,12 @@ public final class RunningBuilds {
                 epoch, Map.of(), PersistenceStore.ABSENT);
         long version = store.write(key, p.toBytes(), PersistenceStore.ANY);
         owned.put(key, new Placeholder(key, p.number, p.origin, p.controller, p.displayName, p.startTime, epoch, Map.of(), version));
-        invalidate(jobKeyOfRunning(runningKey(run.getParent())));
+        String jobKey = jobKeyOfRunning(runningKey(run.getParent()));
+        invalidate(jobKey);
+        // a stop requested between the placeholder's write and its registration above was not taken as ours
+        if (store.read(jobKey + "/" + PREFIX + "/" + run.getNumber() + STOP_SUFFIX) != null) {
+            stopRequested(jobKey, run.getNumber());
+        }
     }
 
     /**
@@ -462,6 +512,7 @@ public final class RunningBuilds {
         Placeholder p = owned.remove(key);
         PersistenceStore store = PersistenceStores.get();
         store.delete(key, p == null ? PersistenceStore.ANY : p.version);
+        store.delete(key.substring(0, key.length() - SUFFIX.length()) + STOP_SUFFIX, PersistenceStore.ANY);
         BuildLeases leases = store.leases();
         if (leases != null && p != null) {
             leases.release(key, p.epoch);
@@ -641,6 +692,139 @@ public final class RunningBuilds {
         return true;
     }
 
+    /**
+     * Parsed key of a stop request: {@code jobs/f/jobs/j/running/5.stop} → job key {@code jobs/f/jobs/j}, number 5.
+     */
+    record StopKey(String jobKey, int number) {
+        @CheckForNull
+        static StopKey parse(String key) {
+            String[] segments = key.split("/");
+            int n = segments.length;
+            if (n < 4 || !segments[n - 2].equals(PREFIX) || !segments[n - 1].matches("[0-9]+\\Q" + STOP_SUFFIX + "\\E")) {
+                return null;
+            }
+            String file = segments[n - 1];
+            return new StopKey(String.join("/", Arrays.copyOf(segments, n - 2)), Integer.parseInt(file.substring(0, file.length() - STOP_SUFFIX.length())));
+        }
+    }
+
+    /**
+     * Asks whichever controller runs a build to stop it.
+     * If it runs here, it is stopped right away; otherwise its owner (the holder of its lease, including one that adopts it later)
+     * stops it when it sees the request.
+     *
+     * @param by who asked, for the build log
+     */
+    public static void requestStop(@NonNull Job<?, ?> job, int number, @NonNull String by) throws IOException {
+        String runningKey = runningKey(job);
+        if (runningKey == null) {
+            return;
+        }
+        String key = runningKey + "/" + number + SUFFIX;
+        if (owned.containsKey(key)) {
+            Run<?, ?> run = job.getBuildByNumber(number);
+            if (run != null && run.isLogUpdated() && interrupt(run, new StoppedElsewhere(CONTROLLER_NAME, by))) {
+                return;
+            }
+        }
+        PersistenceStore store = PersistenceStores.get();
+        if (store.read(key) == null) {
+            return; // no such build runs: a request left behind would stop a later build given that number
+        }
+        Properties request = new Properties();
+        request.setProperty("controller", CONTROLLER_NAME);
+        request.setProperty("by", by);
+        StringWriter w = new StringWriter();
+        request.store(w, null); // escaped, as it is read (a user name may hold a backslash)
+        store.write(runningKey + "/" + number + STOP_SUFFIX, w.toString().getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        if (owned.containsKey(key)) {
+            // owned here, but not loaded or given an executor yet (being resumed): stopped once it has one (the event of
+            // this controller's own write is not applied here)
+            stopRequested(jobKeyOfRunning(runningKey), number);
+        }
+    }
+
+    /** How many times a stop request is retried while the build it is for has no executor yet (being resumed). */
+    private static final int STOP_ATTEMPTS = 8;
+
+    /**
+     * Stops a build owned here for which another controller requested a stop.
+     */
+    static void stopRequested(@NonNull String jobKey, int number) throws IOException {
+        stopRequested(jobKey, number, 0);
+    }
+
+    private static void stopRequested(String jobKey, int number, int attempt) throws IOException {
+        String placeholder = jobKey + "/" + PREFIX + "/" + number + SUFFIX;
+        if (!owned.containsKey(placeholder)) {
+            return; // not ours: its owner handles it
+        }
+        String stopKey = jobKey + "/" + PREFIX + "/" + number + STOP_SUFFIX;
+        PersistenceStore store = PersistenceStores.get();
+        PersistenceStore.Entry request = store.read(stopKey);
+        if (request == null) {
+            return;
+        }
+        Properties p = new Properties();
+        p.load(new StringReader(new String(request.content(), StandardCharsets.UTF_8)));
+        List<String> names = ItemChangeApplier.itemPath(jobKey + "/config.xml");
+        Job<?, ?> job = names == null ? null : Jenkins.get().getItemByFullName(String.join("/", names), Job.class);
+        Run<?, ?> run = job == null ? null : job.getBuildByNumber(number);
+        if (run == null || run.isLogUpdated() && !interrupt(run, new StoppedElsewhere(p.getProperty("controller", "?"), p.getProperty("by", "?")))) {
+            // adopted, but not loaded or given an executor yet: the request is kept (its build's completion removes it)
+            if (attempt < STOP_ATTEMPTS) {
+                stopLater(jobKey, number, attempt);
+            } else {
+                LOGGER.warning(() -> "Could not stop " + jobKey + " #" + number + " as requested: it has no executor");
+            }
+            return;
+        }
+        store.delete(stopKey, PersistenceStore.ANY);
+    }
+
+    /** Tries {@link #stopRequested} again later; again after that if the store fails then (nothing else would). */
+    private static void stopLater(String jobKey, int number, int attempt) {
+        Timer.get().schedule(() -> {
+            try {
+                stopRequested(jobKey, number, attempt + 1);
+            } catch (IOException | RuntimeException e) {
+                if (attempt + 1 < STOP_ATTEMPTS) {
+                    LOGGER.log(Level.INFO, "Failed to stop " + jobKey + " #" + number + " as requested; retrying", e);
+                    stopLater(jobKey, number, attempt + 1);
+                } else {
+                    LOGGER.log(Level.WARNING, "Failed to stop " + jobKey + " #" + number + " as requested", e);
+                }
+            }
+        }, Math.min(30, 1L << attempt), TimeUnit.SECONDS);
+    }
+
+    /** @return false if the build has no executor (yet) to interrupt */
+    private static boolean interrupt(Run<?, ?> run, CauseOfInterruption cause) {
+        Executor executor = run.getExecutor();
+        if (executor == null) {
+            return false;
+        }
+        LOGGER.info(() -> "Stopping " + run + ": " + cause.getShortDescription());
+        executor.interrupt(Result.ABORTED, cause);
+        return true;
+    }
+
+    /** Cause of interruption of a build stopped from another controller. */
+    public static final class StoppedElsewhere extends CauseOfInterruption {
+        private final String controller;
+        private final String by;
+
+        StoppedElsewhere(String controller, String by) {
+            this.controller = controller;
+            this.by = by;
+        }
+
+        @Override
+        public String getShortDescription() {
+            return "Stopped from " + controller + " by " + by;
+        }
+    }
+
     /** How many times adoption is retried when the placeholder changes under it. */
     private static final int ADOPTION_ATTEMPTS = 5;
 
@@ -650,6 +834,18 @@ public final class RunningBuilds {
      * @return true if it was adopted
      */
     private static boolean adopt(PersistenceStore store, Job<?, ?> job, String key, long epoch) throws IOException {
+        try {
+            return offer(store, job, key, epoch);
+        } finally {
+            if (!owned.containsKey(key)) {
+                // not resumed here (gone, left for later, nobody could, or failing): the job's exclusive lease is not
+                // kept for it, if it was taken
+                SharedQueue.abandonExclusive(job, Integer.parseInt(key.substring(key.lastIndexOf('/') + 1, key.length() - SUFFIX.length())));
+            }
+        }
+    }
+
+    private static boolean offer(PersistenceStore store, Job<?, ?> job, String key, long epoch) throws IOException {
         int number = Integer.parseInt(key.substring(key.lastIndexOf('/') + 1, key.length() - SUFFIX.length()));
         for (int attempt = 0; attempt < ADOPTION_ATTEMPTS; attempt++) {
             PersistenceStore.Entry entry = store.read(key);
@@ -669,6 +865,23 @@ public final class RunningBuilds {
             BuildAdopter.Adoption adoption = p == null ? null : prepare(job, p);
             if (adoption == null) {
                 return false; // nobody can adopt it
+            }
+            boolean exclusive;
+            try {
+                exclusive = SharedQueue.adoptExclusive(job, number);
+            } catch (IOException | RuntimeException e) {
+                adoption.abandon(); // retried by the next sweep, which prepares it again
+                throw e;
+            }
+            if (!exclusive) {
+                // a newer build of this job (which allows one at a time) runs elsewhere, or here: resume this one later
+                adoption.abandon();
+                BuildLeases leases = store.leases();
+                if (leases != null) {
+                    leases.release(key, epoch);
+                }
+                LOGGER.info(() -> "Not adopting " + job.getFullName() + " #" + number + " yet: another build of it runs");
+                return true; // nothing to remove: a later sweep adopts it
             }
             Placeholder mine = p.withOwner(store.getOrigin(), CONTROLLER_NAME, epoch, p.properties);
             long version;
@@ -695,6 +908,11 @@ public final class RunningBuilds {
                 adoption.resume(epoch);
             } catch (IOException | RuntimeException e) {
                 resumeFailed(store, job, p, version, e);
+            }
+            SharedQueue.resumedExclusive(job, number); // loaded now (or not resumed, and let go of): the queue sees it
+            String jobKey = jobKeyOfRunning(runningKey(job));
+            if (store.read(jobKey + "/" + PREFIX + "/" + number + STOP_SUFFIX) != null) {
+                stopRequested(jobKey, number); // asked to stop while its owner was gone
             }
             return true;
         }
@@ -835,7 +1053,17 @@ public final class RunningBuilds {
 
         @Override
         public String getUrlName() {
-            return null;
+            return "running-elsewhere";
+        }
+
+        /**
+         * Stops a build running on another controller.
+         */
+        @RequirePOST
+        public HttpResponse doStop(@QueryParameter int number) throws IOException {
+            job.checkPermission(Item.CANCEL);
+            requestStop(job, number, Jenkins.getAuthentication2().getName());
+            return HttpResponses.redirectTo("..");
         }
     }
 

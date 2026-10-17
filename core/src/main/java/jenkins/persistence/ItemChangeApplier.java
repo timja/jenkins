@@ -191,6 +191,10 @@ public final class ItemChangeApplier {
                 return null;
             });
         }
+        if (itemPath(e.key()) != null) {
+            // an item was created, changed, moved or deleted: its triggers may link it to other jobs
+            jenkins.rebuildDependencyGraphAsync();
+        }
     }
 
     private void written(ChangeEvent e) throws Exception {
@@ -286,6 +290,14 @@ public final class ItemChangeApplier {
      * @return false if the key is not a build record
      */
     private boolean build(ChangeEvent e) throws Exception {
+        RunningBuilds.StopKey stop = RunningBuilds.StopKey.parse(e.key());
+        if (stop != null) {
+            if (e.kind() == ChangeEvent.Kind.WRITTEN) {
+                RunningBuilds.stopRequested(stop.jobKey(), stop.number());
+            }
+            applied.incrementAndGet();
+            return true;
+        }
         String runningJob = RunningBuilds.jobKeyOf(e.key());
         if (runningJob != null) {
             RunningBuilds.invalidate(runningJob);
