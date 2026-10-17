@@ -470,6 +470,21 @@ class StaticStateApplierTest {
     }
 
     @Test
+    void aNodeOrUserNamedByNoFileNameIsNotApplied() throws Exception {
+        File home = r.jenkins.getRootDir();
+        File marker = new File(home, "marker");
+        Files.writeString(marker.toPath(), "here", StandardCharsets.UTF_8);
+        // keys no controller writes: ".." is JENKINS_HOME itself, whose deletion would take everything
+        other.write("nodes/../config.xml", "<slave/>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        other.delete("nodes/../config.xml", PersistenceStore.ANY);
+        awaitApplied();
+        r.jenkins.getNodesObject().changedElsewhere("..", true);
+        r.jenkins.getNodesObject().changedElsewhere(".", true);
+        User.changedElsewhere("..", true);
+        assertTrue(marker.isFile(), "JENKINS_HOME is left alone");
+    }
+
+    @Test
     void pluginStateGoesToItsHandler() throws Exception {
         writeElsewhere("custom.plugin.xml", "<x/>");
         assertEquals(List.of("custom.plugin.xml false"), Handler.seen);

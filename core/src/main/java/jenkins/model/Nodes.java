@@ -349,6 +349,11 @@ public class Nodes implements PersistenceRoot {
      */
     @Restricted(NoExternalUse.class)
     public void changedElsewhere(@NonNull String name, boolean deleted) {
+        if (!PersistenceStores.isSafeName(name)) {
+            // from a key no controller writes: ".." would be JENKINS_HOME itself, deleted below
+            LOGGER.warning(() -> "Ignoring a node named " + name + ", changed elsewhere: not a node's name");
+            return;
+        }
         Node old = getNode(name);
         if (deleted) {
             if (old != null) {

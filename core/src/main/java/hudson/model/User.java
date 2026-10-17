@@ -1258,6 +1258,10 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
     }
 
     private static void applyChangedElsewhere(String dirName, boolean deleted) {
+        if (!PersistenceStores.isSafeName(dirName)) {
+            LOGGER.warning(() -> "Ignoring a user folder named " + dirName + ", changed elsewhere: not a folder's name");
+            return;
+        }
         User known = null;
         for (User u : AllUsers.values()) {
             if (dirName.equals(getUserFolderNameFor(u.id))) {
