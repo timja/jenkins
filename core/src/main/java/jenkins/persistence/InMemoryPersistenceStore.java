@@ -31,6 +31,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Queue;
 import java.util.Set;
 import java.util.TreeMap;
@@ -69,6 +70,14 @@ public class InMemoryPersistenceStore implements PersistenceStore {
     private Thread draining;
     private final Map<String, long[]> leaseEpochs;
     private final Map<String, String> leaseOwners;
+    private final Map<Long, ClusterQueue.Record> queueRecords;
+    private final List<Consumer<ClusterQueue.Record>> queueListeners;
+    /** Queue changes made but not yet delivered, in the order they were made: added to under the data lock. */
+    private final Queue<ClusterQueue.Record> queueOutbox;
+    /** Held while delivering queue changes, as {@link #delivering} is for the others. */
+    private final Object deliveringQueue;
+    /** The thread delivering queue changes, guarded by {@link #deliveringQueue}. */
+    private Thread drainingQueue;
     /** Versions come from one counter, so a key that is deleted and recreated never repeats a version. */
     private long clock;
 
@@ -85,6 +94,10 @@ public class InMemoryPersistenceStore implements PersistenceStore {
         this.delivering = new Object();
         this.leaseEpochs = new TreeMap<>();
         this.leaseOwners = new TreeMap<>();
+        this.queueRecords = new TreeMap<>();
+        this.queueListeners = new CopyOnWriteArrayList<>();
+        this.queueOutbox = new ArrayDeque<>();
+        this.deliveringQueue = new Object();
     }
 
     private InMemoryPersistenceStore(InMemoryPersistenceStore root, String origin) {
@@ -97,6 +110,10 @@ public class InMemoryPersistenceStore implements PersistenceStore {
         this.delivering = root.delivering;
         this.leaseEpochs = root.leaseEpochs;
         this.leaseOwners = root.leaseOwners;
+        this.queueRecords = root.queueRecords;
+        this.queueListeners = root.queueListeners;
+        this.queueOutbox = root.queueOutbox;
+        this.deliveringQueue = root.deliveringQueue;
     }
 
     /**
@@ -151,6 +168,204 @@ public class InMemoryPersistenceStore implements PersistenceStore {
                 root.draining = null;
             }
         }
+    }
+
+    /** Delivers the queue changes made so far in the order they were made, as {@link ClusterQueue#subscribe} promises. */
+    private void deliverQueue() {
+        synchronized (deliveringQueue) {
+            if (root.drainingQueue == Thread.currentThread()) {
+                return; // a listener made a change: the loop below delivers it once every listener had the current one
+            }
+            root.drainingQueue = Thread.currentThread();
+            try {
+                while (true) {
+                    ClusterQueue.Record r;
+                    synchronized (root) {
+                        r = queueOutbox.poll();
+                    }
+                    if (r == null) {
+                        return;
+                    }
+                    for (Consumer<ClusterQueue.Record> l : queueListeners) {
+                        try {
+                            l.accept(r);
+                        } catch (RuntimeException | LinkageError x) {
+                            // as for changes to keys: the others still get it, and the change does not fail
+                            LOGGER.log(Level.WARNING, "A listener failed to handle " + r, x);
+                        }
+                    }
+                }
+            } finally {
+                root.drainingQueue = null;
+            }
+        }
+    }
+
+    /**
+     * A shared queue held in memory, for tests. Not returned by {@link #queue} unless a subclass does so.
+     */
+    @NonNull
+    public ClusterQueue clusterQueue() {
+        return new ClusterQueue() {
+            /** Under the data lock: queues a change for delivery, in commit order, once the lock is released. */
+            private void fire(Record r) {
+                queueOutbox.add(r);
+            }
+
+            private Record with(Record r, State state, String claimedBy, int buildNumber, String actions, long dueAt) {
+                return new Record(r.id(), r.task(), r.dedupKey(), actions, dueAt, state, r.origin(), r.pinnedTo(), claimedBy, buildNumber);
+            }
+
+            @Override
+            public long nextId() {
+                synchronized (root) {
+                    return ++root.clock;
+                }
+            }
+
+            @Override
+            @NonNull
+            public long[] nextIds(int n) {
+                long[] ids = new long[n];
+                synchronized (root) {
+                    for (int i = 0; i < n; i++) {
+                        ids[i] = ++root.clock;
+                    }
+                }
+                return ids;
+            }
+
+            @Override
+            @NonNull
+            public Record publish(@NonNull Record item) {
+                Record stored;
+                synchronized (root) {
+                    Record same = queueRecords.get(item.id());
+                    if (same != null) {
+                        return same;
+                    }
+                    for (Record r : queueRecords.values()) {
+                        if (r.state() == State.WAITING && r.dedupKey().equals(item.dedupKey())) {
+                            return r;
+                        }
+                    }
+                    stored = item;
+                    queueRecords.put(item.id(), item);
+                    fire(stored);
+                }
+                deliverQueue();
+                return stored;
+            }
+
+            @Override
+            public boolean update(long id, @NonNull String expectedActions, @NonNull String actions, long dueAt, @CheckForNull String pinTo) {
+                synchronized (root) {
+                    Record r = queueRecords.get(id);
+                    if (r == null || r.state() != State.WAITING || !r.actions().equals(expectedActions)) {
+                        return false;
+                    }
+                    Record next = new Record(r.id(), r.task(), r.dedupKey(), actions, Math.min(r.dueAt(), dueAt), r.state(), r.origin(),
+                            r.pinnedTo() != null ? r.pinnedTo() : pinTo, r.claimedBy(), r.buildNumber());
+                    if (next.equals(r)) {
+                        return true;
+                    }
+                    queueRecords.put(id, next);
+                    fire(next);
+                }
+                deliverQueue();
+                return true;
+            }
+
+            @Override
+            public boolean claim(long id, @CheckForNull String expectedPin) {
+                Record next;
+                synchronized (root) {
+                    Record r = queueRecords.get(id);
+                    if (r == null || r.state() != State.WAITING) {
+                        return r != null && origin.equals(r.claimedBy());
+                    }
+                    if (!Objects.equals(r.pinnedTo(), expectedPin)) {
+                        return false;
+                    }
+                    next = with(r, State.CLAIMED, origin, 0, r.actions(), r.dueAt());
+                    queueRecords.put(id, next);
+                    fire(next);
+                }
+                deliverQueue();
+                return true;
+            }
+
+            @Override
+            public void started(long id, int buildNumber) {
+                Record next;
+                synchronized (root) {
+                    Record r = queueRecords.get(id);
+                    if (r == null || !origin.equals(r.claimedBy())) {
+                        return;
+                    }
+                    next = with(r, State.STARTED, origin, buildNumber, r.actions(), r.dueAt());
+                    queueRecords.put(id, next);
+                    fire(next);
+                }
+                deliverQueue();
+            }
+
+            @Override
+            public boolean cancel(long id) {
+                Record next;
+                synchronized (root) {
+                    Record r = queueRecords.get(id);
+                    if (r == null || r.state() != State.WAITING && !(r.state() == State.CLAIMED && origin.equals(r.claimedBy()))) {
+                        return false;
+                    }
+                    next = with(r, State.CANCELLED, null, 0, r.actions(), r.dueAt());
+                    queueRecords.put(id, next);
+                    fire(next);
+                }
+                deliverQueue();
+                return true;
+            }
+
+            @Override
+            public Record get(long id) {
+                synchronized (root) {
+                    return queueRecords.get(id);
+                }
+            }
+
+            @Override
+            @NonNull
+            public List<Record> pending() {
+                synchronized (root) {
+                    return queueRecords.values().stream().filter(r -> r.state() == State.WAITING || r.state() == State.CLAIMED).toList();
+                }
+            }
+
+            @Override
+            @NonNull
+            public AutoCloseable subscribe(@NonNull Consumer<Record> listener) {
+                queueListeners.add(listener);
+                return () -> queueListeners.remove(listener);
+            }
+        };
+    }
+
+    /**
+     * Puts an item claimed by a controller which went away back into the queue, under the same id, as a store does once
+     * it finds that controller gone; for tests.
+     */
+    public void requeue(long id) {
+        synchronized (root) {
+            ClusterQueue.Record r = queueRecords.get(id);
+            if (r == null || r.state() != ClusterQueue.State.CLAIMED) {
+                return;
+            }
+            ClusterQueue.Record next = new ClusterQueue.Record(r.id(), r.task(), r.dedupKey(), r.actions(), r.dueAt(), ClusterQueue.State.WAITING,
+                    r.origin(), r.pinnedTo(), null, 0);
+            queueRecords.put(id, next);
+            queueOutbox.add(next);
+        }
+        deliverQueue();
     }
 
     /**

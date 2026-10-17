@@ -117,6 +117,8 @@ import jenkins.model.queue.AsynchronousExecution;
 import jenkins.model.queue.CompositeCauseOfBlockage;
 import jenkins.model.queue.QueueIdStrategy;
 import jenkins.model.queue.QueueItem;
+import jenkins.model.queue.QueueStartGate;
+import jenkins.persistence.SharedQueue;
 import jenkins.security.QueueItemAuthenticator;
 import jenkins.security.QueueItemAuthenticatorProvider;
 import jenkins.security.stapler.StaplerAccessibleType;
@@ -670,6 +672,10 @@ public class Queue extends ResourceController implements Saveable {
 
             if (queueUpdated) scheduleMaintenance();
 
+            for (Item item : duplicatesInQueue) {
+                Listeners.notify(QueueListener.class, true, l -> l.onFolded(item, actions));
+            }
+
             // REVISIT: when there are multiple existing items in the queue that matches the incoming one,
             // whether the new one should affect all existing ones or not is debatable. I for myself
             // thought this would only affect one, so the code was bit of surprise, but I'm keeping the current
@@ -764,7 +770,13 @@ public class Queue extends ResourceController implements Saveable {
     public HttpResponse doCancelItem(@QueryParameter long id) throws IOException, ServletException {
         Item item = getItem(id);
         if (item != null && !hasReadPermission(item, true)) {
-            item = null;
+            item = null; // as for a local item: whoever may not see it learns nothing of it
+        }
+        if (item instanceof RemoteItem) {
+            // in the queue shared with other controllers, not in this one's
+            return SharedQueue.cancelRemote(id)
+                    ? HttpResponses.status(HttpServletResponse.SC_NO_CONTENT)
+                    : HttpResponses.error(422, "Item for id (" + id + ") is not cancellable");
         }
         if (item != null) {
             if (item.hasCancelPermission()) {
@@ -775,7 +787,75 @@ public class Queue extends ResourceController implements Saveable {
             }
             return HttpResponses.error(422, "Item for id (" + id + ") is not cancellable");
         } // else too late, ignore (JENKINS-14813)
+        if (SharedQueue.cancelRemote(id)) {
+            return HttpResponses.status(HttpServletResponse.SC_NO_CONTENT);
+        }
         return HttpResponses.error(HttpServletResponse.SC_NOT_FOUND, "Provided id (" + id + ") not found");
+    }
+
+    /**
+     * Updates an item to match a change made to it by another controller sharing the queue:
+     * its actions are replaced by these, and a waiting item's quiet period ends at {@code due} if that is earlier.
+     *
+     * @return false if there is no such item here
+     */
+    @Restricted(NoExternalUse.class)
+    public boolean updateShared(long id, @NonNull Calendar due, @NonNull List<Action> actions) {
+        return callWithLock(() -> {
+            Item item = getLocalItem(id);
+            if (item == null || item instanceof LeftItem) {
+                return false;
+            }
+            // exactly the shared record's actions: by class, replaceAction would keep actions dropped there and
+            // collapse several of one class (e.g. ParametersActions) into one
+            item.removeActions(Action.class);
+            for (Action a : actions) {
+                item.addAction(a);
+            }
+            if (item instanceof WaitingItem wi && due.before(wi.timestamp)) {
+                wi.leave(this);
+                wi.timestamp = due;
+                wi.enter(this);
+                scheduleMaintenance();
+            }
+            updateSnapshot();
+            return true;
+        });
+    }
+
+    /**
+     * Adds an item of a queue shared with other controllers, as mirrored from another controller: as a new item, never
+     * folded into one here (the shared queue decided which requests fold; the local queue's folding cannot see
+     * everything that decided it), and with no {@link QueueDecisionHandler} asked (the controller it was scheduled on did).
+     * Its id is whichever the {@link QueueIdStrategy} gives it.
+     */
+    @Restricted(NoExternalUse.class)
+    public @NonNull WaitingItem scheduleShared(@NonNull Task p, int quietPeriod, @NonNull List<Action> actions) {
+        lock.lock();
+        try { try {
+            Calendar due = new GregorianCalendar();
+            due.add(Calendar.SECOND, quietPeriod);
+            WaitingItem added = new WaitingItem(due, p, actions);
+            added.enter(this);
+            scheduleMaintenance();
+            return added;
+        } finally { updateSnapshot(); } } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Cancels the item with this id wherever it is in this controller's queue now: an {@link Item} captured earlier is
+     * stale once the item moved on (from waiting to blocked or buildable), and cancelling it would miss.
+     *
+     * @return false if there is no such item here (it started, or left)
+     */
+    @Restricted(NoExternalUse.class)
+    public boolean cancelLocal(long id) {
+        return callWithLock(() -> {
+            Item item = getLocalItem(id);
+            return item != null && !(item instanceof LeftItem) && cancel(item);
+        });
     }
 
     public boolean isEmpty() {
@@ -902,6 +982,22 @@ public class Queue extends ResourceController implements Saveable {
     }
 
     public Item getItem(long id) {
+        Item local = getLocalItem(id);
+        if (local == null || local instanceof LeftItem left && left.isCancelled()) {
+            // e.g. started or cancelled by another controller sharing the queue (our mirror of it was dropped)
+            Item remote = SharedQueue.remoteItem(id);
+            if (remote != null) {
+                return remote;
+            }
+        }
+        return local;
+    }
+
+    /**
+     * Like {@link #getItem(long)}, but only items in this controller's queue (including those which left it recently).
+     */
+    @Restricted(NoExternalUse.class)
+    public @CheckForNull Item getLocalItem(long id) {
         Snapshot snapshot = this.snapshot;
         for (Item item : snapshot.blockedProjects) {
             if (item.id == id)
@@ -1761,6 +1857,13 @@ public class Queue extends ResourceController implements Saveable {
                 if (p.task instanceof FlyweightTask) {
                     Runnable r = makeFlyWeightTaskBuildable(new BuildableItem(p));
                     if (r != null) {
+                        // e.g. it entered the buildables to have a node provisioned, so the gate has not seen it yet
+                        CauseOfBlockage gated = QueueStartGate.check(p);
+                        if (gated != null) {
+                            LOGGER.log(Level.FINER, "{0} may not start here: {1}", new Object[] {p, gated});
+                            p.transientCausesOfBlockage = List.of(gated);
+                            continue;
+                        }
                         p.leave(this);
                         LOGGER.log(Level.FINEST, "Executing flyweight task {0}", taskDisplayName);
                         r.run();
@@ -1799,6 +1902,13 @@ public class Queue extends ResourceController implements Saveable {
                                 new Object[]{p, candidates, parked.values()});
                         List<CauseOfBlockage> reasons = reasonMap.values().stream().filter(Objects::nonNull).collect(Collectors.toList());
                         p.transientCausesOfBlockage = reasons.isEmpty() ? null : reasons;
+                        continue;
+                    }
+
+                    CauseOfBlockage gated = QueueStartGate.check(p);
+                    if (gated != null) {
+                        LOGGER.log(Level.FINER, "{0} may not start here: {1}", new Object[] {p, gated});
+                        p.transientCausesOfBlockage = List.of(gated);
                         continue;
                     }
 
@@ -1846,6 +1956,11 @@ public class Queue extends ResourceController implements Saveable {
                 Runnable runnable = makeFlyWeightTaskBuildable(p);
                 LOGGER.log(Level.FINEST, "Converting flyweight task: {0} into a BuildableRunnable", taskDisplayName);
                 if (runnable != null) {
+                    CauseOfBlockage gated = QueueStartGate.check(p);
+                    if (gated != null) {
+                        LOGGER.log(Level.FINER, "{0} may not start here: {1}", new Object[] {p, gated});
+                        return null;
+                    }
                     return runnable;
                 }
 
@@ -2970,6 +3085,78 @@ public class Queue extends ResourceController implements Saveable {
         }
     }
 
+    /**
+     * An item of a queue shared with other controllers which is not (or no longer) in this controller's queue,
+     * for example because it was started by another controller.
+     * Lets {@code queue/item/<id>} answer on every controller.
+     */
+    @Restricted(Beta.class)
+    public static final class RemoteItem extends Item {
+        private final transient CauseOfBlockage why;
+        private final boolean cancelled;
+        private final transient RemoteExecutable executable;
+
+        public RemoteItem(@NonNull Task task, long id, @NonNull List<Action> actions, @CheckForNull CauseOfBlockage why, boolean cancelled,
+                @CheckForNull RemoteExecutable executable) {
+            super(task, actions, id, new FutureImpl(task));
+            this.why = why;
+            this.cancelled = cancelled;
+            this.executable = executable;
+        }
+
+        @Override
+        public CauseOfBlockage getCauseOfBlockage() {
+            return why;
+        }
+
+        /** Whether the item was cancelled. */
+        @Exported
+        public boolean isCancelled() {
+            return cancelled;
+        }
+
+        /** The build the item started as, possibly on another controller. */
+        @Exported
+        public @CheckForNull RemoteExecutable getExecutable() {
+            return executable;
+        }
+
+        @Override
+        void enter(Queue q) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        boolean leave(Queue q) {
+            return false;
+        }
+    }
+
+    /**
+     * A build started from a {@link RemoteItem}, which may be running on another controller.
+     */
+    @Restricted(Beta.class)
+    @ExportedBean(defaultVisibility = 2)
+    public static final class RemoteExecutable {
+        private final int number;
+        private final String url;
+
+        public RemoteExecutable(int number, @NonNull String url) {
+            this.number = number;
+            this.url = url;
+        }
+
+        @Exported
+        public int getNumber() {
+            return number;
+        }
+
+        @Exported
+        public String getUrl() {
+            return url;
+        }
+    }
+
     private static final Logger LOGGER = Logger.getLogger(Queue.class.getName());
 
     /**
@@ -3201,9 +3388,16 @@ public class Queue extends ResourceController implements Saveable {
     }
 
     /**
+     * The milestone attained once {@link #init} restored the queue: whatever adds items at startup should require it,
+     * as loading clears the queue first.
+     */
+    @Restricted(NoExternalUse.class)
+    public static final String LOADED = "hudson.model.Queue.loaded";
+
+    /**
      * Restores the queue content during the start up.
      */
-    @Initializer(after = JOB_CONFIG_ADAPTED)
+    @Initializer(after = JOB_CONFIG_ADAPTED, attains = LOADED)
     public static void init(Jenkins h) {
         Queue queue = h.getQueue();
         Item[] items = queue.getItems();

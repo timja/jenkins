@@ -25,6 +25,7 @@
 package jenkins.persistence;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.charset.StandardCharsets;
@@ -66,6 +67,75 @@ class InMemoryPersistenceStoreTest {
         assertEquals(1000, delivered.size());
         for (int i = 1; i < delivered.size(); i++) {
             assertTrue(delivered.get(i) > delivered.get(i - 1), "delivered out of order at " + i + ": " + delivered);
+        }
+    }
+
+    @Test
+    void aQueueListenerFailingDoesNotStopTheOthersNorTheChange() throws Exception {
+        InMemoryPersistenceStore store = new InMemoryPersistenceStore(key -> true);
+        ClusterQueue cq = store.clusterQueue();
+        cq.subscribe(r -> {
+            throw new IllegalStateException("broken listener");
+        });
+        List<Long> delivered = new ArrayList<>();
+        cq.subscribe(r -> delivered.add(r.id()));
+        long id = cq.nextId();
+        cq.publish(new ClusterQueue.Record(id, "j", "j", "", 0, ClusterQueue.State.WAITING, store.getOrigin(), null, null, 0));
+        assertEquals(List.of(id), delivered);
+        assertEquals(id, cq.get(id).id());
+    }
+
+    @Test
+    void aClaimIsRefusedOnceTheItemIsPinnedOtherwise() throws Exception {
+        InMemoryPersistenceStore store = new InMemoryPersistenceStore(key -> true);
+        ClusterQueue cq = store.clusterQueue();
+        long id = cq.nextId();
+        cq.publish(new ClusterQueue.Record(id, "j", "j", "", 0, ClusterQueue.State.WAITING, store.getOrigin(), null, null, 0));
+        // a request folded in elsewhere since the claimer read it pinned it to that controller
+        assertTrue(store.as("other").clusterQueue().update(id, "", "x", 0, "other"));
+        assertFalse(cq.claim(id, null));
+        assertEquals(ClusterQueue.State.WAITING, cq.get(id).state());
+        assertTrue(store.as("other").clusterQueue().claim(id, "other"));
+    }
+
+    @Test
+    void queueChangesAreDeliveredInTheOrderMade() throws Exception {
+        InMemoryPersistenceStore store = new InMemoryPersistenceStore(key -> true);
+        ClusterQueue cq = store.clusterQueue();
+        long id = cq.nextId();
+        cq.publish(new ClusterQueue.Record(id, "j", "j", "", 0, ClusterQueue.State.WAITING, store.getOrigin(), null, null, 0));
+        List<Integer> delivered = new ArrayList<>();
+        cq.subscribe(r -> {
+            synchronized (delivered) {
+                delivered.add(r.actions().length());
+            }
+        });
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Runnable folder = () -> {
+            try {
+                for (int i = 0; i < 500; ) {
+                    String read = cq.get(id).actions();
+                    if (cq.update(id, read, read + "x", 0)) {
+                        i++;
+                    }
+                }
+            } catch (Throwable t) {
+                failure.set(t);
+            }
+        };
+        Thread a = new Thread(folder, "a");
+        Thread b = new Thread(folder, "b");
+        a.start();
+        b.start();
+        a.join();
+        b.join();
+        if (failure.get() != null) {
+            throw new AssertionError(failure.get());
+        }
+        // each update made the actions one longer than the one before it
+        assertEquals(1000, delivered.size());
+        for (int i = 0; i < delivered.size(); i++) {
+            assertEquals(i + 1, delivered.get(i), "delivered out of order at " + i);
         }
     }
 
