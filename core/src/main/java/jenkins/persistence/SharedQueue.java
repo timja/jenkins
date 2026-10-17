@@ -593,6 +593,11 @@ public final class SharedQueue {
     /** Exclusive leases held here on jobs which do not allow concurrent builds: lease key → its hold; changed under {@link #lockOf}. */
     private static final Map<String, Hold> exclusive = new ConcurrentHashMap<>();
     private static final Map<String, Object> exclusiveLocks = new ConcurrentHashMap<>();
+    /**
+     * Build holders of exclusive leases whose build is being adopted here and not resumed yet, by lease key; changed
+     * under {@link #lockOf}. Until it is resumed nothing here shows the build running, so a claim must not join its hold.
+     */
+    private static final Map<String, Set<String>> adopting = new ConcurrentHashMap<>();
 
     /** One lock per lease key: taking and releasing the lease (in the store) is done under it, never under the queue lock. */
     private static Object lockOf(String key) {
@@ -627,6 +632,9 @@ public final class SharedQueue {
         }
         synchronized (lockOf(key)) {
             Hold hold = exclusive.get(key);
+            if (hold != null && holder.startsWith("q:") && adopting.containsKey(key)) {
+                return false; // a build of the job is being adopted here: the queue here would not see it running yet
+            }
             if (hold == null) {
                 long epoch = leases.acquire(key);
                 if (epoch == 0) {
@@ -647,20 +655,44 @@ public final class SharedQueue {
             return;
         }
         synchronized (lockOf(key)) {
+            notAdopting(key, holder);
             Hold hold = exclusive.get(key);
             if (hold == null || !hold.holders().remove(holder) || !hold.holders().isEmpty()) {
                 return;
             }
             exclusive.remove(key);
-            BuildLeases leases = PersistenceStores.get().leases();
-            if (leases != null) {
-                try {
-                    leases.release(key, hold.epoch());
-                } catch (IOException e) {
-                    LOGGER.log(Level.WARNING, "Failed to release " + key, e);
-                }
+            release(key, hold.epoch(), 0);
+        }
+    }
+
+    /**
+     * Releases an exclusive lease nothing here holds any more, under {@link #lockOf}; retried if the store fails, as the
+     * lease of a live controller never lapses and would block the job everywhere. A retry releases nothing if the job is
+     * held here again meanwhile (by the same lease, released with that hold).
+     */
+    private static void release(String key, long epoch, int attempt) {
+        BuildLeases leases = PersistenceStores.get().leases();
+        if (leases == null || exclusive.containsKey(key)) {
+            return;
+        }
+        try {
+            leases.release(key, epoch);
+        } catch (IOException | RuntimeException e) {
+            if (attempt < 10) {
+                LOGGER.log(Level.INFO, "Failed to release " + key + "; retrying", e);
+                Timer.get().schedule(() -> {
+                    synchronized (lockOf(key)) {
+                        release(key, epoch, attempt + 1);
+                    }
+                }, Math.min(60, 1L << attempt), TimeUnit.SECONDS);
+            } else {
+                LOGGER.log(Level.WARNING, "Failed to release " + key, e);
             }
         }
+    }
+
+    private static void notAdopting(String key, String holder) {
+        adopting.computeIfPresent(key, (k, holders) -> holders.remove(holder) && holders.isEmpty() ? null : holders);
     }
 
     /**
@@ -680,7 +712,27 @@ public final class SharedQueue {
             if (hold != null && hold.holders().stream().anyMatch(h -> !h.equals(buildHolder(number)))) {
                 return false; // the lease is this controller's, but for another build of the job
             }
-            return acquireExclusive(job, buildHolder(number));
+            if (!acquireExclusive(job, buildHolder(number))) {
+                return false;
+            }
+            if (exclusive.containsKey(key)) {
+                adopting.computeIfAbsent(key, k -> new HashSet<>()).add(buildHolder(number)); // until resumedExclusive
+            }
+            return true;
+        }
+    }
+
+    /**
+     * Tells that a build adopted with {@link #adoptExclusive} was resumed (it is loaded, so the queue here sees it
+     * running): items of its job claimed here may share its hold from now on (to be blocked by it locally).
+     */
+    @Restricted(NoExternalUse.class)
+    public static void resumedExclusive(@NonNull Job<?, ?> job, int number) {
+        String key = exclusiveKey(job);
+        if (key != null && adopting.containsKey(key)) {
+            synchronized (lockOf(key)) {
+                notAdopting(key, buildHolder(number));
+            }
         }
     }
 

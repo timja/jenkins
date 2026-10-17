@@ -118,6 +118,9 @@ class ClusterCoordinationTest {
                 if (m.getName().equals("acquire") && ((String) args[0]).endsWith("/exclusive") && failingExclusive.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
                     throw new IOException("the store is unreachable, this time");
                 }
+                if (m.getName().equals("release") && ((String) args[0]).endsWith("/exclusive") && failingRelease.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+                    throw new IOException("the store is unreachable, this time");
+                }
                 try {
                     return m.invoke(leases, args);
                 } catch (InvocationTargetException e) {
@@ -148,6 +151,8 @@ class ClusterCoordinationTest {
     static final AtomicInteger failingReads = new AtomicInteger();
     /** How many of the next acquisitions of a job's exclusive lease here fail. */
     static final AtomicInteger failingExclusive = new AtomicInteger();
+    /** How many of the next releases of a job's exclusive lease here fail. */
+    static final AtomicInteger failingRelease = new AtomicInteger();
     /** Origins the store reports as alive; null means everyone. */
     static volatile Set<String> live;
 
@@ -162,6 +167,9 @@ class ClusterCoordinationTest {
         lostClaimAnswers.set(0);
         failingReads.set(0);
         failingExclusive.set(0);
+        failingRelease.set(0);
+        Adopter.resuming = null;
+        Adopter.resume = null;
         Adopter.abandoned.set(0);
         HoldClaimed.job = null;
         Adopter.job = null;
@@ -518,6 +526,58 @@ class ClusterCoordinationTest {
         STORE.delete(key, PersistenceStore.ANY);
     }
 
+    @Test
+    void itemIsNotClaimedWhileABuildOfItsJobIsBeingAdoptedHere() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("adopting");
+        PersistenceStore dead = STORE.as("dead-controller");
+        String key = "jobs/adopting/running/5.xml";
+        long deadEpoch = dead.leases().acquire(key);
+        dead.write(key, bytes("origin=dead-controller\ncontroller=jenkins-x\ndisplayName=#5\nstartTime=1\nepoch=" + deadEpoch + "\n"), PersistenceStore.ABSENT);
+        Adopter.job = p.getFullName();
+        Adopter.resuming = new CountDownLatch(1);
+        Adopter.resume = new CountDownLatch(1);
+        live = Set.of(STORE.getOrigin());
+        Future<Integer> sweep = Executors.newSingleThreadExecutor().submit(RunningBuilds::removeStale);
+        try {
+            assertTrue(Adopter.resuming.await(60, TimeUnit.SECONDS), "being resumed: nothing shows it running here yet");
+            QueueTaskFuture<FreeStyleBuild> f = p.scheduleBuild2(0);
+            Thread.sleep(4_000); // several maintenance cycles
+            assertTrue(p.getBuilds().isEmpty(), "not started beside the build being adopted");
+            Queue.Item item = Queue.getInstance().getItem(p);
+            assertNotNull(item);
+            assertNull(STORE.clusterQueue().get(item.getId()).claimedBy(), "not claimed meanwhile");
+
+            Adopter.resume.countDown();
+            sweep.get(60, TimeUnit.SECONDS);
+            assertEquals(List.of(5), Adopter.resumed);
+            // the test adopter loads nothing, so once it is resumed nothing here holds the item back
+            r.assertBuildStatusSuccess(f);
+        } finally {
+            Adopter.resume.countDown();
+            live = null;
+            SharedQueue.abandonExclusive(p, 5);
+            STORE.delete(key, PersistenceStore.ANY);
+        }
+    }
+
+        // as here, where its own builds do not block it either
+        FreeStyleBuild b = p.scheduleBuild2(0).get(60, TimeUnit.SECONDS);
+        assertEquals(Result.FAILURE, b.getResult());
+        other.delete("jobs/cycle/running/5.xml", PersistenceStore.ANY);
+    }
+
+    @Test
+    void exclusiveLeaseWhoseReleaseFailedIsReleasedLater() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("release-retried");
+        String lease = "jobs/release-retried/running/exclusive";
+        failingRelease.set(1);
+        r.buildAndAssertSuccess(p);
+        assertEquals(0, failingRelease.get(), "the release failed");
+        long epoch = awaitFree(lease);
+        assertThat("released when retried: else it would block the job everywhere", epoch, greaterThan(0L));
+        other.leases().release(lease, epoch);
+    }
+
     /**
      * Holds the items of a job from starting once they are claimed here: at the start gate, where the claim is made,
      * as the claim may land between a dispatcher's look at an item and its start.
@@ -543,6 +603,9 @@ class ClusterCoordinationTest {
         static volatile String job;
         static final List<Integer> resumed = new CopyOnWriteArrayList<>();
         static final AtomicInteger abandoned = new AtomicInteger();
+        /** If set, resuming counts {@link #resuming} down, then waits for {@link #resume}. */
+        static volatile CountDownLatch resuming;
+        static volatile CountDownLatch resume;
 
         @Override
         public Adoption prepare(Job<?, ?> j, RunningBuilds.Placeholder placeholder) {
@@ -552,6 +615,15 @@ class ClusterCoordinationTest {
             return new Adoption() {
                 @Override
                 public void resume(long epoch) {
+                    CountDownLatch l = resume;
+                    if (l != null) {
+                        resuming.countDown();
+                        try {
+                            l.await(60, TimeUnit.SECONDS);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
                     resumed.add(placeholder.getNumber());
                 }
 
