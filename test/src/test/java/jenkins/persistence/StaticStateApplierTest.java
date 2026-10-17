@@ -133,6 +133,47 @@ class StaticStateApplierTest {
     }
 
     @Test
+    void readingTheRawFileDoesNotHideAChangeMadeElsewhere() throws Exception {
+        r.jenkins.save();
+        String base = text("config.xml");
+        long merges = PersistenceStores.getMergeCount();
+        synchronized (r.jenkins) {
+            other.write("config.xml", base.replaceFirst("<scmCheckoutRetryCount>[0-9]+</scmCheckoutRetryCount>",
+                    "<scmCheckoutRetryCount>5</scmCheckoutRetryCount>").getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+            // e.g. GET config.xml over REST: the object in memory does not have that version
+            new hudson.XmlFile(jenkins.model.Jenkins.XSTREAM, new java.io.File(r.jenkins.getRootDir(), "config.xml")).asString();
+            r.jenkins.setQuietPeriod(8);
+        }
+        awaitApplied();
+        assertEquals(merges + 1, PersistenceStores.getMergeCount(), "the save still conflicted, and was merged");
+        String stored = text("config.xml");
+        assertTrue(stored.contains("<quietPeriod>8</quietPeriod>"), stored);
+        assertTrue(stored.contains("<scmCheckoutRetryCount>5</scmCheckoutRetryCount>"), stored);
+    }
+
+    @Test
+    void concurrentSavesOfDifferentSettingsAreMerged() throws Exception {
+        r.jenkins.save(); // what this controller last wrote: the base
+        String base = text("config.xml");
+        long merges = PersistenceStores.getMergeCount();
+        synchronized (r.jenkins) { // the change from elsewhere cannot be applied here meanwhile (reloadGlobalConfig)
+            other.write("config.xml", base.replaceFirst("<scmCheckoutRetryCount>[0-9]+</scmCheckoutRetryCount>",
+                    "<scmCheckoutRetryCount>4</scmCheckoutRetryCount>").getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+            r.jenkins.setQuietPeriod(9); // saves: conflicts, merges
+        }
+        awaitApplied();
+        assertEquals(merges + 1, PersistenceStores.getMergeCount());
+        String stored = text("config.xml");
+        assertTrue(stored.contains("<quietPeriod>9</quietPeriod>"), stored);
+        assertTrue(stored.contains("<scmCheckoutRetryCount>4</scmCheckoutRetryCount>"), stored);
+        for (int i = 0; i < 100 && r.jenkins.getScmCheckoutRetryCount() != 4; i++) {
+            Thread.sleep(50);
+        }
+        assertEquals(4, r.jenkins.getScmCheckoutRetryCount(), "reloaded with the other change");
+        assertEquals(9, r.jenkins.getQuietPeriod());
+    }
+
+    @Test
     void globalConfigurationChangedElsewhere() throws Exception {
         r.jenkins.setSystemMessage("set here");
         r.jenkins.setNumExecutors(2);

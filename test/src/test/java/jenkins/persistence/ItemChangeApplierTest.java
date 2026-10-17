@@ -129,6 +129,83 @@ class ItemChangeApplierTest {
         assertEquals(conflicts, PersistenceStores.getConflictCount());
     }
 
+    private static String text(String key) {
+        return new String(STORE.read(key).content(), StandardCharsets.UTF_8);
+    }
+
+    private static byte[] withQuietPeriod(String xml, int seconds) {
+        return xml.replace("</project>", "  <quietPeriod>" + seconds + "</quietPeriod>\n</project>").getBytes(StandardCharsets.UTF_8);
+    }
+
+    @Test
+    void changesMadeElsewhereToAnItemWithASavePendingWaitForItTogether() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("pending");
+        String key = "jobs/pending/config.xml";
+        String base = text(key);
+        long merges = PersistenceStores.getMergeCount();
+        try (hudson.BulkChange bc = new hudson.BulkChange(p)) {
+            p.setDescription("here"); // saved below
+            for (int i = 1; i <= 4; i++) { // a burst of changes elsewhere: they do not use up the retries at once
+                other.write(key, withQuietPeriod(base, i), PersistenceStore.ANY);
+            }
+            Thread.sleep(1_500);
+            assertEquals("here", p.getDescription(), "not reloaded over the change about to be saved");
+            bc.commit();
+        }
+        awaitApplied();
+        assertEquals(merges + 1, PersistenceStores.getMergeCount());
+        assertThat(text(key), org.hamcrest.Matchers.containsString("<description>here</description>"));
+        assertEquals(4, p.getQuietPeriod(), "reloaded with the changes made elsewhere");
+    }
+
+    @Test
+    void aChangePutOffWhoseRetryFindsItSeenAlreadyDoesNotHoldUpLaterOnes() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("seen-meanwhile");
+        String key = "jobs/seen-meanwhile/config.xml";
+        String base = text(key);
+        try (hudson.BulkChange bc = new hudson.BulkChange(p)) {
+            p.setDescription("here"); // never saved
+            other.write(key, withQuietPeriod(base, 1), PersistenceStore.ANY);
+            Thread.sleep(200); // put off
+            PersistenceStores.seen(key, STORE.read(key).version()); // read here before its retry, as a reload here would
+            Thread.sleep(1_500); // its retry finds it seen already
+            other.write(key, withQuietPeriod(base, 2), PersistenceStore.ANY);
+            for (int i = 0; i < 100 && p.getQuietPeriod() != 2; i++) {
+                Thread.sleep(100);
+            }
+            assertEquals(2, p.getQuietPeriod(), "applied once put off enough, as any change");
+        }
+    }
+
+    @Test
+    void anItemLoadedAtStartupIsNotReloadedOverAChangeNotSavedYet() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("loaded");
+        String key = "jobs/loaded/config.xml";
+        PersistenceStores.setForTesting(null, null); // what a restart forgets
+        p.getConfigFile().unmarshal(p); // loaded at startup
+        assertFalse(PersistenceStores.hasSnapshot(key));
+        ItemChangeApplier.subscribe();
+        ItemChangeApplier.start();
+        awaitApplied();
+        assertTrue(PersistenceStores.hasSnapshot(key), "taken once loading is done");
+
+        String base = text(key);
+        try (hudson.BulkChange bc = new hudson.BulkChange(p)) {
+            p.setDescription("here");
+            other.write(key, withQuietPeriod(base, 7), PersistenceStore.ANY);
+            Thread.sleep(500);
+            assertEquals("here", p.getDescription(), "not reloaded over the change about to be saved");
+            bc.commit();
+        }
+        awaitApplied();
+        assertThat(text(key), org.hamcrest.Matchers.containsString("<description>here</description>"));
+        assertEquals(7, p.getQuietPeriod());
+
+        other.write("jobs/made-elsewhere/config.xml", project("x"), PersistenceStore.ABSENT);
+        awaitApplied();
+        assertTrue(PersistenceStores.hasSnapshot("jobs/made-elsewhere/config.xml"), "and one created elsewhere once loaded");
+    }
+
     @Test
     void ownChangesAreNotReapplied() throws Exception {
         long before = ItemChangeApplier.getAppliedCount();

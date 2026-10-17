@@ -125,6 +125,7 @@ class PersistenceStoreItemConfigTest {
         assertThat(STORE.versions(), hasKey("jobs/d/config.xml"));
         p.delete();
         assertThat(STORE.versions(), not(hasKey("jobs/d/config.xml")));
+        assertFalse(PersistenceStores.hasSnapshot("jobs/d/config.xml"), "nothing kept of it in memory either");
         assertNotNull(r.jenkins);
     }
 
@@ -146,6 +147,11 @@ class PersistenceStoreItemConfigTest {
         p.setDescription("here");
         assertEquals(before + 1, PersistenceStores.getConflictCount());
         assertThat(new String(STORE.read(key).content(), StandardCharsets.UTF_8), containsString("here"));
+        // the merge reloads the job from the store: done before the next change, which it would otherwise take for seen
+        for (int i = 0; i < 500 && !ItemChangeApplier.isIdle(); i++) {
+            Thread.sleep(10);
+        }
+        assertTrue(ItemChangeApplier.isIdle());
 
         PersistenceStores.CONFLICTS = "fail";
         STORE.write(key, "<project><description>elsewhere again</description></project>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
@@ -206,6 +212,24 @@ class PersistenceStoreItemConfigTest {
         STORE.write(key, "<project><description>elsewhere</description></project>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
         PersistenceStores.CONFLICTS = "fail";
         assertThrows(ConflictException.class, () -> route.write("<project><description>late</description></project>".getBytes(StandardCharsets.UTF_8)));
+    }
+
+    @Test
+    void aSaveAfterARenameMergesAChangeMadeElsewhereBeforeIt() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("before-rename");
+        p.setDescription("base");
+        String key = "jobs/before-rename/config.xml";
+        String base = new String(STORE.read(key).content(), StandardCharsets.UTF_8);
+        assertThat(base, containsString("<concurrentBuild>false</concurrentBuild>"));
+        // changed by another controller, which this one has not applied yet
+        STORE.write(key, base.replace("<concurrentBuild>false<", "<concurrentBuild>true<").getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        long merges = PersistenceStores.getMergeCount();
+        p.renameTo("after-rename");
+        p.setDescription("here");
+        assertEquals(merges + 1, PersistenceStores.getMergeCount(), "merged, not overwritten");
+        String stored = new String(STORE.read("jobs/after-rename/config.xml").content(), StandardCharsets.UTF_8);
+        assertThat(stored, containsString("<description>here</description>"));
+        assertThat(stored, containsString("<concurrentBuild>true</concurrentBuild>"));
     }
 
     @Test
