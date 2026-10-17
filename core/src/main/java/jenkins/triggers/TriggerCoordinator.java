@@ -66,8 +66,9 @@ public interface TriggerCoordinator extends ExtensionPoint {
                 if (!c.shouldRun(item, trigger, (Calendar) tick.clone())) {
                     return false;
                 }
-            } catch (RuntimeException | LinkageError e) {
-                // LinkageError too (a plugin built against something missing): it would end the whole round of triggers
+            } catch (Throwable e) {
+                // any Error too (a plugin built against something missing, an assertion): it would end the whole round of
+                // triggers, or the rest of a synchronous polling batch
                 Logger.getLogger(TriggerCoordinator.class.getName()).log(Level.WARNING, c + " failed; skipping " + trigger + " of " + item, e);
                 return false;
             }
