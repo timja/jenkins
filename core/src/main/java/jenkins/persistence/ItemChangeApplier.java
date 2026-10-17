@@ -211,7 +211,7 @@ public final class ItemChangeApplier {
 
     /** The origin of {@link #reload} events (never a controller's). */
     private static final String MERGED = "(merged here)";
-    /** The origin of reloads after a save the strict-ui policy refused: applied at once, over the refused values. */
+    /** The origin of reloads after a save refused for a conflict: applied at once, over the refused values. */
     private static final String REFUSED = "(refused here)";
 
     /**
