@@ -501,6 +501,12 @@ public final class BuildRecords {
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.WARNING, "Failed to publish " + run, e);
             }
+            // after the record exists, so other controllers always see one or the other
+            try {
+                RunningBuilds.finished(run);
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.WARNING, "Failed to remove running placeholder of " + run, e);
+            }
         }
 
         @Override

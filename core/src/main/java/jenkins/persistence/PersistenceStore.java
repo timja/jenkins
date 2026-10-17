@@ -138,6 +138,17 @@ public interface PersistenceStore {
     }
 
     /**
+     * The {@linkplain #getOrigin origins} of the store instances (controllers) currently alive, including this one.
+     * Used to clean up state left behind by a controller which died, such as {@linkplain RunningBuilds running build placeholders}.
+     *
+     * @return the live origins, or null if this store does not track membership
+     */
+    @CheckForNull
+    default Set<String> liveOrigins() throws IOException {
+        return null;
+    }
+
+    /**
      * Identifies this store instance (and so this controller) as the origin of the changes it makes.
      */
     @NonNull
