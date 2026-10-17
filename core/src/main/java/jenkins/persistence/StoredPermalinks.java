@@ -28,7 +28,10 @@ import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Extension;
 import hudson.ExtensionList;
+import hudson.model.Item;
 import hudson.model.Job;
+import hudson.model.Run;
+import hudson.model.listeners.ItemListener;
 import hudson.security.ACL;
 import hudson.security.ACLContext;
 import java.io.IOException;
@@ -39,6 +42,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.PeepholePermalink;
+import jenkins.model.lazy.LazyBuildMixIn;
 import jenkins.util.Timer;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
@@ -119,7 +123,7 @@ public final class StoredPermalinks implements PeepholePermalink.Cache {
                     return;
                 }
                 if (current instanceof Some(int n) && (target instanceof None || target instanceof Some(int m) && m < n)
-                        && exists(store, builds, n)) {
+                        && exists(store, builds, n) && !beingDeleted(job, n)) {
                     // this controller has not seen #n yet (or a deletion moved the target back without us): keep it
                     LOGGER.fine(() -> "Keeping " + id + " of " + job + " at #" + n + " (not " + target + ")");
                     install(builds, e, stored);
@@ -172,6 +176,17 @@ public final class StoredPermalinks implements PeepholePermalink.Cache {
         }
         String job = builds.substring(0, builds.length() - "builds".length());
         return store.read(job + RunningBuilds.PREFIX + "/" + n + ".xml") != null;
+    }
+
+    /**
+     * Whether a build is being deleted here: its record is still stored while the deletion's listeners run, of which this
+     * one (moving permalinks back) may run before the one removing the record.
+     */
+    private static boolean beingDeleted(@NonNull Job<?, ?> job, int n) {
+        Run<?, ?> run = job instanceof LazyBuildMixIn.LazyLoadingJob<?, ?> lazy
+                ? lazy.getLazyBuildMixIn()._getRuns().getLoadedBuilds().get(n) // not loading it to ask
+                : job.getBuildByNumber(n);
+        return run != null && run.isPendingDelete();
     }
 
     /**
@@ -240,6 +255,35 @@ public final class StoredPermalinks implements PeepholePermalink.Cache {
         StringBuilder sb = new StringBuilder();
         new java.util.TreeMap<>(cache).forEach((id, k) -> sb.append(id).append(' ').append(k instanceof Some(int n) ? n : -1).append('\n'));
         return sb.toString().getBytes(StandardCharsets.UTF_8);
+    }
+
+    /**
+     * The cache of a job deleted, renamed or moved (here or elsewhere) goes with it: a job renamed or moved to its name
+     * later would otherwise get its permalinks.
+     */
+    @Extension
+    public static final class Moves extends ItemListener {
+        @Override
+        public void onDeleted(Item item) {
+            String key = PersistenceStores.keyFor(item.getRootDir());
+            if (key != null) {
+                forget(key);
+            }
+        }
+
+        @Override
+        public void onLocationChanged(Item item, String oldFullName, String newFullName) {
+            forget("jobs/" + oldFullName.replace("/", "/jobs/"));
+            forget("jobs/" + newFullName.replace("/", "/jobs/"));
+            String key = PersistenceStores.keyFor(item.getRootDir());
+            if (key != null) {
+                forget(key);
+            }
+        }
+
+        private static void forget(String itemKey) {
+            caches.keySet().removeIf(k -> k.startsWith(itemKey + "/"));
+        }
     }
 
     private PeepholePermalink.Cache next() {
