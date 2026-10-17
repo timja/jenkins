@@ -32,20 +32,26 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 
+import hudson.XmlFile;
 import hudson.model.AbstractItem;
 import hudson.model.FreeStyleProject;
 import hudson.model.Item;
+import hudson.model.Saveable;
 import hudson.model.User;
+import hudson.model.listeners.SaveableListener;
 import hudson.security.ACL;
 import hudson.security.ACLContext;
 import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
 import javax.xml.transform.stream.StreamSource;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.MockAuthorizationStrategy;
 import org.jvnet.hudson.test.MockFolder;
+import org.jvnet.hudson.test.TestExtension;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 
 /** An item's identity survives renames and configuration updates, and copies get their own (Target 15). */
@@ -88,6 +94,39 @@ class ItemUuidTest {
         assertNotEquals(unknown, posted.getItemUuid());
         assertThat(posted.getConfigFile().asString(), not(containsString(unknown)));
         assertSame(posted, ItemUuids.get(posted.getItemUuid()));
+    }
+
+    @Test
+    void anItemCreatedFromXmlOrCopiedIsNotSavedAgainForItsIdentity(JenkinsRule r) throws Exception {
+        FreeStyleProject src = r.createFreeStyleProject("saved-src");
+        String posted = "<?xml version='1.1' encoding='UTF-8'?>\n<project>\n  <itemUuid>" + src.getItemUuid() + "</itemUuid>\n  <description/>\n</project>";
+        Saves.items.clear();
+        FreeStyleProject created = (FreeStyleProject) r.jenkins.createProjectFromXML("saved-posted", new ByteArrayInputStream(posted.getBytes(StandardCharsets.UTF_8)));
+        FreeStyleProject copy = (FreeStyleProject) r.jenkins.copy((hudson.model.TopLevelItem) src, "saved-copy");
+        // as without identities: none for the posted one; a copy is saved when made (before its configuration is copied),
+        // then by DisplayNameListener
+        assertEquals(List.of("saved-copy", "saved-copy"), Saves.items);
+        String stored = created.getConfigFile().asString();
+        assertThat(stored, containsString("<itemUuid>" + created.getItemUuid() + "</itemUuid>"));
+        assertThat(stored, containsString("<description/>")); // as posted, not as saved again
+        assertThat(stored, not(containsString(src.getItemUuid())));
+        assertThat(copy.getConfigFile().asString(), containsString("<itemUuid>" + copy.getItemUuid() + "</itemUuid>"));
+        assertNotEquals(src.getItemUuid(), copy.getItemUuid());
+        r.jenkins.reload();
+        assertEquals(created.getItemUuid(), r.jenkins.getItemByFullName("saved-posted").getItemUuid());
+        assertEquals(copy.getItemUuid(), r.jenkins.getItemByFullName("saved-copy").getItemUuid());
+    }
+
+    @TestExtension("anItemCreatedFromXmlOrCopiedIsNotSavedAgainForItsIdentity")
+    public static final class Saves extends SaveableListener {
+        static final List<String> items = new CopyOnWriteArrayList<>();
+
+        @Override
+        public void onChange(Saveable o, XmlFile file) {
+            if (o instanceof Item i && i.getName().startsWith("saved-") && !i.getName().equals("saved-src")) {
+                items.add(i.getName());
+            }
+        }
     }
 
     @Test

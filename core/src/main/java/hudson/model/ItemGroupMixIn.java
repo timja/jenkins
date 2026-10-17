@@ -24,6 +24,7 @@
 
 package hudson.model;
 
+import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Util;
 import hudson.XmlFile;
@@ -39,14 +40,19 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import javax.xml.transform.TransformerException;
 import javax.xml.transform.stream.StreamResult;
 import javax.xml.transform.stream.StreamSource;
@@ -176,6 +182,146 @@ public abstract class ItemGroupMixIn {
         return configurations;
     }
 
+    private static final Pattern ENCODING = Pattern.compile("^\\s*<\\?xml[^>]*?encoding\\s*=\\s*['\"]([^'\"]+)['\"]");
+
+    /**
+     * An item's configuration with its {@code itemUuid} set: put in after its root's start tag, any there before taken
+     * out, and the rest left as it is, so that it is written once, as given (not saved again with the identity).
+     *
+     * @return null if that cannot be done to it (not configuration as Jenkins writes it); then it is saved again
+     */
+    @CheckForNull
+    static byte[] withItemUuid(@NonNull byte[] xml, @NonNull String uuid) {
+        try {
+            Matcher m = ENCODING.matcher(new String(xml, 0, Math.min(xml.length, 200), StandardCharsets.ISO_8859_1));
+            Charset cs = m.find() ? Charset.forName(m.group(1)) : StandardCharsets.UTF_8;
+            String s = new String(xml, cs);
+            int i = 0;
+            while (true) { // the prolog
+                while (i < s.length() && (Character.isWhitespace(s.charAt(i)) || s.charAt(i) == '\uFEFF')) {
+                    i++;
+                }
+                int next;
+                if (s.startsWith("<?", i)) {
+                    next = after(s, "?>", i);
+                } else if (s.startsWith("<!--", i)) {
+                    next = after(s, "-->", i);
+                } else if (s.startsWith("<!DOCTYPE", i)) {
+                    int subset = s.indexOf('[', i);
+                    int end = s.indexOf('>', i);
+                    next = subset >= 0 && subset < end ? after(s, ">", after(s, "]", subset)) : after(s, ">", i);
+                } else {
+                    break;
+                }
+                if (next <= i) {
+                    return null;
+                }
+                i = next;
+            }
+            if (!s.startsWith("<", i)) {
+                return null;
+            }
+            int rootEnd = tagEnd(s, i);
+            if (rootEnd < 0) {
+                return null;
+            }
+            String element = "<itemUuid>" + uuid + "</itemUuid>";
+            if (s.charAt(rootEnd - 1) == '/') { // <project/>
+                int name = i + 1;
+                while (name < rootEnd - 1 && !Character.isWhitespace(s.charAt(name))) {
+                    name++;
+                }
+                String root = s.substring(i + 1, name);
+                return (s.substring(0, rootEnd - 1) + ">" + element + "</" + root + ">" + s.substring(rootEnd + 1)).getBytes(cs);
+            }
+            // the root's own itemUuid elements: children at depth 1, not elements of that name further down
+            List<int[]> old = new ArrayList<>();
+            int depth = 1;
+            int start = -1;
+            int j = rootEnd + 1;
+            while (depth > 0) {
+                int lt = s.indexOf('<', j);
+                if (lt < 0) {
+                    return null;
+                }
+                if (s.startsWith("<!--", lt)) {
+                    j = after(s, "-->", lt);
+                } else if (s.startsWith("<![CDATA[", lt)) {
+                    j = after(s, "]]>", lt);
+                } else if (s.startsWith("<?", lt)) {
+                    j = after(s, "?>", lt);
+                } else if (s.startsWith("</", lt)) {
+                    j = after(s, ">", lt);
+                    depth--;
+                    if (depth == 1 && start >= 0) {
+                        old.add(new int[] {start, j});
+                        start = -1;
+                    }
+                } else {
+                    int end = tagEnd(s, lt);
+                    if (end < 0) {
+                        return null;
+                    }
+                    boolean empty = s.charAt(end - 1) == '/';
+                    if (depth == 1 && (s.startsWith("<itemUuid>", lt) || s.startsWith("<itemUuid/>", lt) || s.startsWith("<itemUuid ", lt))) {
+                        if (empty) {
+                            old.add(new int[] {lt, end + 1});
+                        } else {
+                            start = lt;
+                        }
+                    }
+                    if (!empty) {
+                        depth++;
+                    }
+                    j = end + 1;
+                }
+                if (j <= lt) {
+                    return null; // not well-formed
+                }
+            }
+            StringBuilder b = new StringBuilder(s);
+            for (int k = old.size() - 1; k >= 0; k--) {
+                int from = old.get(k)[0];
+                int line = from;
+                while (line > 0 && (s.charAt(line - 1) == ' ' || s.charAt(line - 1) == '\t')) {
+                    line--;
+                }
+                if (line > 0 && s.charAt(line - 1) == '\n') {
+                    from = line - 1; // its line, with it
+                }
+                b.delete(from, old.get(k)[1]);
+            }
+            b.insert(rootEnd + 1, "\n  " + element);
+            return b.toString().getBytes(cs);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** Just after the first {@code end} from {@code from}, or -1 if there is none. */
+    private static int after(String s, String end, int from) {
+        int at = from < 0 ? -1 : s.indexOf(end, from);
+        return at < 0 ? -1 : at + end.length();
+    }
+
+    /** Where a start tag beginning at {@code lt} ends (its {@code >}), quoted attribute values skipped; -1 if it does not. */
+    private static int tagEnd(String s, int lt) {
+        char quote = 0;
+        for (int k = lt + 1; k < s.length(); k++) {
+            char c = s.charAt(k);
+            if (quote != 0) {
+                if (c == quote) {
+                    quote = 0;
+                }
+            } else if (c == '"' || c == '\'') {
+                quote = c;
+            } else if (c == '>') {
+                return k;
+            }
+        }
+        return -1;
+    }
+
     /**
      * {@link Item} → name function.
      */
@@ -300,15 +446,17 @@ public abstract class ItemGroupMixIn {
 
         T result = (T) createProject(src.getDescriptor(), name, false);
 
-        // copy config
-        Items.getConfigFile(result).writeRaw(srcConfigFile.readRawBytes());
+        // copy config; a copy is another item: an identity of its own, not the source's from the copied configuration
+        byte[] copied = srcConfigFile.readRawBytes();
+        byte[] withUuid = result instanceof AbstractItem ? withItemUuid(copied, UUID.randomUUID().toString()) : copied;
+        Items.getConfigFile(result).writeRaw(withUuid != null ? withUuid : copied);
 
         // reload from the new config
         final File rootDir = result.getRootDir();
         result = Items.callWhileUpdatingByXml(() -> (T) Items.load(parent, rootDir));
         result.onCopiedFrom(src);
-        if (result instanceof AbstractItem copy) {
-            copy.newItemUuid(); // a copy is another item (it had the source's from the copied configuration)
+        if (result instanceof AbstractItem copy && withUuid == null) {
+            copy.newItemUuid(); // configuration this cannot put one into: saved again with it
             copy.save();
         }
 
@@ -338,8 +486,11 @@ public abstract class ItemGroupMixIn {
             Util.createDirectories(dir.toPath());
             ByteArrayOutputStream buf = new ByteArrayOutputStream();
             XMLUtils.safeTransform(new StreamSource(xml), new StreamResult(buf));
+            // a new item, whatever identity the posted configuration had: as for a copy (another controller of a cluster
+            // may have been given the same configuration, and the item it made the same identity)
+            byte[] withUuid = withItemUuid(buf.toByteArray(), UUID.randomUUID().toString());
             try {
-                configXml.writeRaw(buf.toByteArray());
+                configXml.writeRaw(withUuid != null ? withUuid : buf.toByteArray());
             } catch (ConflictException e) {
                 throw alreadyExists(name);
             }
@@ -358,10 +509,8 @@ public abstract class ItemGroupMixIn {
             if (!applicableIn) {
                 throw new AccessDeniedException(result.getDescriptor().clazz.getName() + " is not applicable in " + parent.getFullName());
             }
-            if (result instanceof AbstractItem created) {
-                // a new item, whatever identity the posted configuration had: as for a copy (another controller of a
-                // cluster may have been given the same configuration, and the item it made the same identity)
-                created.newItemUuid();
+            if (result instanceof AbstractItem created && withUuid == null) {
+                created.newItemUuid(); // configuration this cannot put one into: saved again with it
                 created.save();
             }
 
