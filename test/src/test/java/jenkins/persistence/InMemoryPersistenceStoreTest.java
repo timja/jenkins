@@ -25,6 +25,7 @@
 package jenkins.persistence;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.charset.StandardCharsets;
@@ -82,6 +83,19 @@ class InMemoryPersistenceStoreTest {
         cq.publish(new ClusterQueue.Record(id, "j", "j", "", 0, ClusterQueue.State.WAITING, store.getOrigin(), null, null, 0));
         assertEquals(List.of(id), delivered);
         assertEquals(id, cq.get(id).id());
+    }
+
+    @Test
+    void aClaimIsRefusedOnceTheItemIsPinnedOtherwise() throws Exception {
+        InMemoryPersistenceStore store = new InMemoryPersistenceStore(key -> true);
+        ClusterQueue cq = store.clusterQueue();
+        long id = cq.nextId();
+        cq.publish(new ClusterQueue.Record(id, "j", "j", "", 0, ClusterQueue.State.WAITING, store.getOrigin(), null, null, 0));
+        // a request folded in elsewhere since the claimer read it pinned it to that controller
+        assertTrue(store.as("other").clusterQueue().update(id, "", "x", 0, "other"));
+        assertFalse(cq.claim(id, null));
+        assertEquals(ClusterQueue.State.WAITING, cq.get(id).state());
+        assertTrue(store.as("other").clusterQueue().claim(id, "other"));
     }
 
     @Test

@@ -107,11 +107,21 @@ public interface ClusterQueue {
     }
 
     /**
-     * Claims a waiting item for this controller.
+     * Claims a waiting item for this controller, if it is still pinned as the claimer saw it: a request folded into it
+     * meanwhile may have pinned it to another controller (see {@link #update(long, String, String, long, String)}).
+     * Stores must compare and claim atomically.
      *
-     * @return true if this controller now has it, false if it was claimed, started or cancelled elsewhere
+     * @param expectedPin the {@link Record#pinnedTo} the claimer read, null if it was not pinned
+     * @return true if this controller now has it, false if it was claimed, started or cancelled elsewhere, or is now
+     *     pinned otherwise
      */
-    boolean claim(long id) throws IOException;
+    boolean claim(long id, @CheckForNull String expectedPin) throws IOException;
+
+    /** {@link #claim(long, String)}, expecting the pin the item has when read now; for callers which checked nothing. */
+    default boolean claim(long id) throws IOException {
+        Record r = get(id);
+        return r != null && claim(id, r.pinnedTo());
+    }
 
     /** Records that an item claimed here started as the given build. */
     void started(long id, int buildNumber) throws IOException;

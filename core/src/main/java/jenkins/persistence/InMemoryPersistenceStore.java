@@ -31,6 +31,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Queue;
 import java.util.Set;
 import java.util.TreeMap;
@@ -276,12 +277,15 @@ public class InMemoryPersistenceStore implements PersistenceStore {
             }
 
             @Override
-            public boolean claim(long id) {
+            public boolean claim(long id, @CheckForNull String expectedPin) {
                 Record next;
                 synchronized (root) {
                     Record r = queueRecords.get(id);
                     if (r == null || r.state() != State.WAITING) {
                         return r != null && origin.equals(r.claimedBy());
+                    }
+                    if (!Objects.equals(r.pinnedTo(), expectedPin)) {
+                        return false;
                     }
                     next = with(r, State.CLAIMED, origin, 0, r.actions(), r.dueAt());
                     queueRecords.put(id, next);
