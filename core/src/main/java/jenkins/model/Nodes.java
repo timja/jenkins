@@ -42,6 +42,7 @@ import hudson.slaves.EphemeralNode;
 import hudson.slaves.OfflineCause;
 import java.io.File;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -493,7 +494,7 @@ public class Nodes implements PersistenceRoot {
     private Node load(String name, boolean vetoable) {
         try {
             XmlFile xmlFile = getConfigFile(name);
-            if (xmlFile.exists()) {
+            if (xmlFile.checkExists()) {
                 Node n = (Node) xmlFile.read();
                 if (vetoable && !allowLoad(n)) {
                     Node old = nodes.get(n.getNodeName());
@@ -515,6 +516,9 @@ public class Nodes implements PersistenceRoot {
                 LOGGER.fine(() -> "no such file " + xmlFile);
             }
         } catch (IOException e) {
+            if (vetoable) { // a change made elsewhere: applied again later, not taken for the node being gone
+                throw new UncheckedIOException("could not load " + name + ", changed elsewhere", e);
+            }
             LOGGER.log(Level.WARNING, "could not load " + name, e);
         }
         return null;

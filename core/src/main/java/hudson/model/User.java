@@ -1292,7 +1292,7 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
         } else {
             XmlFile xml = new XmlFile(XSTREAM, new File(new File(getUsersDirectory(), dirName), CONFIG_XML));
             try {
-                if (xml.exists()) {
+                if (xml.checkExists()) {
                     User user = new User();
                     xml.unmarshal(user);
                     if (user.id != null && dirName.equals(getUserFolderNameFor(user.id))) {
