@@ -876,11 +876,12 @@ public final class SharedQueue {
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.WARNING, "Failed to cancel queue item " + id + ", which started here without a build", e);
             }
+            if (item.task instanceof Job<?, ?> job) {
+                releaseExclusive(job, claimHolder(id)); // what its claim held of the job's exclusive lease: no build holds it
+            }
         });
     }
 
-    @Restricted(NoExternalUse.class)
-    @Extension
     /** Items cancelled here while being claimed, by id: the claim lets go of what it holds once it ends. */
     private static final Set<Long> leftWhileClaiming = ConcurrentHashMap.newKeySet();
 
