@@ -26,6 +26,7 @@ package jenkins.persistence;
 
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import hudson.Extension;
 import hudson.init.InitMilestone;
 import hudson.init.Initializer;
@@ -44,6 +45,7 @@ import hudson.model.listeners.RunListener;
 import hudson.model.queue.CauseOfBlockage;
 import hudson.model.queue.FoldableAction;
 import hudson.model.queue.QueueListener;
+import hudson.model.queue.SubTask;
 import hudson.security.ACL;
 import hudson.security.ACLContext;
 import hudson.util.DaemonThreadFactory;
@@ -58,12 +60,15 @@ import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Calendar;
+import java.util.Collection;
 import java.util.GregorianCalendar;
 import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -76,6 +81,7 @@ import jenkins.model.Jenkins;
 import jenkins.model.queue.QueueIdStrategy;
 import jenkins.model.queue.QueueStartGate;
 import jenkins.security.HMACConfidentialKey;
+import jenkins.util.SystemProperties;
 import jenkins.util.Timer;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
@@ -551,6 +557,10 @@ public final class SharedQueue {
                 }
                 Timer.get().submit(() -> releaseExclusive(job, claimHolder(id)));
             }
+            if (li.isCancelled() && shared(li.task)) {
+                long id = li.getId();
+                Timer.get().submit(() -> Reservations.release(id)); // a store call: not under the queue lock
+            }
             if (!li.isCancelled() || PersistenceStores.isApplyingRemoteChange() || !shared(li.task)) {
                 return;
             }
@@ -760,9 +770,180 @@ public final class SharedQueue {
         }
     }
 
+    /**
+     * Items whose controller is starting cloud agents for them (Target 9). With the shared queue, the controller an item
+     * was scheduled on provisions for it (it alone counts it as demand), but starting an agent can take longer than the
+     * origin's head start; without a reservation, another controller with a free executor would take the item, and the
+     * agent started for it would have nothing to do. A reservation is a store entry, {@code queue/reserved/<id>}, holding
+     * the controller's origin; others wait for it while that controller is alive, for at most {@link #RESERVATION_MILLIS}.
+     * It is a hint, not a fence: a controller claiming the item at the moment it is reserved may still take it, and the
+     * agent started for it then idles until its cloud's retention removes it.
+     */
+    @Restricted(NoExternalUse.class)
+    @Extension
+    public static final class Reservations extends hudson.slaves.CloudProvisioningListener {
+
+        static String key(long id) {
+            return "queue/reserved/" + id;
+        }
+
+        /** The origin of the controller holding a current reservation of an item, or null. */
+        @CheckForNull
+        static String holder(long id) throws IOException {
+            PersistenceStore store = PersistenceStores.get();
+            PersistenceStore.Entry e = store == null ? null : store.read(key(id));
+            if (e == null) {
+                return null;
+            }
+            String[] parts = new String(e.content(), StandardCharsets.UTF_8).split(" ", 2);
+            if (parts.length < 2 || System.currentTimeMillis() - Long.parseLong(parts[1].trim()) > RESERVATION_MILLIS) {
+                return null;
+            }
+            return parts[0];
+        }
+
+        static void release(long id) {
+            PersistenceStore store = PersistenceStores.get();
+            if (store != null) {
+                try {
+                    store.delete(key(id), PersistenceStore.ANY);
+                } catch (IOException | RuntimeException e) {
+                    LOGGER.log(Level.FINE, e, () -> "Could not release the reservation of queue item " + id);
+                }
+            }
+        }
+
+        @Override
+        public void onStarted(hudson.slaves.Cloud cloud, hudson.model.Label label, Collection<hudson.slaves.NodeProvisioner.PlannedNode> plannedNodes) {
+            ClusterQueue cq = queue();
+            PersistenceStore store = PersistenceStores.get();
+            if (cq == null || store == null) {
+                return;
+            }
+            int executors = plannedNodes.stream().mapToInt(p -> p.numExecutors).sum();
+            String me = origin();
+            for (Queue.BuildableItem bi : Queue.getInstance().getBuildableItems()) {
+                if (executors <= 0) {
+                    break;
+                }
+                // demand is counted per part of the task (as LoadStatistics does): any part needing this label
+                int needing = 0;
+                for (SubTask st : bi.task.getSubTasks()) {
+                    if (Objects.equals(label, bi.getAssignedLabelFor(st))) {
+                        needing++;
+                    }
+                }
+                if (!shared(bi.task) || needing == 0) {
+                    continue;
+                }
+                try {
+                    ClusterQueue.Record r = cq.get(bi.getId());
+                    if (r == null || r.claimedBy() != null || !provisionsHere(r, System.currentTimeMillis())) {
+                        continue;
+                    }
+                    String reservedBy = holder(bi.getId());
+                    if (reservedBy != null && (me.equals(reservedBy) || !gone(reservedBy))) {
+                        continue;
+                    }
+                    store.write(key(bi.getId()), (me + " " + System.currentTimeMillis()).getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+                    executors -= needing;
+                    LOGGER.fine(() -> "Reserved " + bi + " while starting an agent for it on " + cloud.name);
+                } catch (IOException | RuntimeException e) {
+                    LOGGER.log(Level.FINE, e, () -> "Could not reserve " + bi);
+                }
+            }
+        }
+    }
+
+    /** Whether a controller which reserved an item is known to be gone (its reservation then holds nothing up). */
+    private static boolean gone(String origin) throws IOException {
+        Set<String> live = PersistenceStores.get().liveOrigins();
+        return live != null && !live.contains(origin);
+    }
+
+    /**
+     * Whether this controller provisions for an item: the one that claimed it, or it is pinned to; otherwise its origin
+     * while alive (it goes first, and may hold the agents the build needs); otherwise, any.
+     */
+    static boolean provisionsHere(@NonNull ClusterQueue.Record r, long now) throws IOException {
+        String me = origin();
+        if (r.claimedBy() != null) {
+            return me.equals(r.claimedBy());
+        }
+        if (r.pinnedTo() != null) {
+            return me.equals(r.pinnedTo());
+        }
+        if (me.equals(r.origin())) {
+            return true;
+        }
+        Set<String> live = PersistenceStores.get().liveOrigins();
+        if (live == null) {
+            // membership unknown: as the gate decides, its controller goes first, any other after a while
+            return now > r.dueAt() + ORIGIN_GRACE_MILLIS && !reservedElsewhere(r.id(), me, live);
+        }
+        // its controller is gone: one of the others provisions, the same one whichever of them asks (unless another
+        // reserved it first, before a controller joining changed which one that is)
+        return !live.contains(r.origin()) && me.equals(provisioner(r.id(), live)) && !reservedElsewhere(r.id(), me, live);
+    }
+
+    /** Whether another controller, not known to be gone, holds a reservation of an item: it is starting an agent for it. */
+    private static boolean reservedElsewhere(long id, String me, @CheckForNull Set<String> live) throws IOException {
+        String holder = Reservations.holder(id);
+        return holder != null && !holder.equals(me) && (live == null || live.contains(holder));
+    }
+
+    /** How long a reservation holds at most (the agent may never come up). */
+    @SuppressFBWarnings(value = "MS_SHOULD_BE_FINAL", justification = "for the script console")
+    public static /* non-final for tests and the script console */ long RESERVATION_MILLIS =
+            SystemProperties.getLong(SharedQueue.class.getName() + ".reservationMillis", 5 * 60_000L);
+
+    /** The live controller which provisions for an item whose controller is gone: highest hash of item and controller. */
+    @CheckForNull
+    static String provisioner(long id, @NonNull Set<String> live) {
+        String chosen = null;
+        int best = 0;
+        for (String o : new TreeSet<>(live)) {
+            int h = (o + "#" + id).hashCode();
+            if (chosen == null || h > best) {
+                chosen = o;
+                best = h;
+            }
+        }
+        return chosen;
+    }
+
     @Restricted(NoExternalUse.class)
     @Extension
     public static final class Gate implements QueueStartGate {
+        /** Recent provisioning answers per item id: load statistics ask for every label, every few seconds. */
+        private final Map<Long, Map.Entry<Long, Boolean>> provisioning = new ConcurrentHashMap<>();
+
+        /** Only one controller provisions for an item: see {@link #provisionsHere}. */
+        @Override
+        public boolean countsForProvisioning(@NonNull Queue.BuildableItem item) {
+            if (!shared(item.task)) {
+                return true;
+            }
+            long now = System.currentTimeMillis();
+            Map.Entry<Long, Boolean> cached = provisioning.get(item.getId());
+            if (cached != null && now - cached.getKey() < 2_000) {
+                return cached.getValue();
+            }
+            boolean answer;
+            try {
+                ClusterQueue.Record r = queue().get(item.getId());
+                answer = r == null || provisionsHere(r, now);
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.FINE, e, () -> "Cannot tell who provisions for " + item);
+                answer = true;
+            }
+            if (provisioning.size() > 10_000) {
+                provisioning.clear();
+            }
+            provisioning.put(item.getId(), Map.entry(now, answer));
+            return answer;
+        }
+
         @Override
         public CauseOfBlockage mayStart(@NonNull Queue.BuildableItem item) {
             if (!shared(item.task)) {
@@ -820,6 +1001,14 @@ public final class SharedQueue {
                 ClusterQueue.Record r = cq.get(id);
                 // not if a request folded into it since the gate looked pinned it elsewhere (the claim checks it did not since)
                 if (r != null && r.state() == ClusterQueue.State.WAITING && (r.pinnedTo() == null || me.equals(r.pinnedTo()))) {
+                    String reservedBy = Reservations.holder(id);
+                    if (reservedBy != null && !origin().equals(reservedBy)) {
+                        if (!gone(reservedBy)) {
+                            notClaimed.put(id, "Waiting for the agent the controller it was scheduled on is starting for it");
+                            changed = false; // looked at again at the next maintenance, not at once
+                            return;
+                        }
+                    }
                     if (!acquireExclusive(job, holder)) {
                         notClaimed.put(id, "A build is already in progress on another controller");
                         changed = false; // looked at again at the next maintenance, not at once
@@ -892,6 +1081,7 @@ public final class SharedQueue {
                 if (r != null && origin().equals(r.claimedBy())) {
                     cq.started(id, run.getNumber());
                 }
+                Reservations.release(id);
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.WARNING, "Failed to record that " + run + " started", e);
             }

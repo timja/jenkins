@@ -27,6 +27,7 @@ package jenkins.persistence;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.instanceOf;
+import static org.hamcrest.Matchers.startsWith;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -53,10 +54,13 @@ import hudson.model.TopLevelItem;
 import hudson.model.TopLevelItemDescriptor;
 import hudson.model.queue.FoldableAction;
 import hudson.model.queue.QueueTaskFuture;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Calendar;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import jenkins.model.Jenkins;
 import org.htmlunit.HttpMethod;
@@ -81,7 +85,31 @@ class SharedQueueTest {
         public ClusterQueue queue() {
             return noQueue ? null : slowFor(clusterQueue());
         }
+
+        @Override
+        public Set<String> liveOrigins() {
+            return live;
+        }
+
+        @Override
+        public void delete(String key, long expectedVersion) throws ConflictException {
+            java.util.concurrent.CountDownLatch l = slowRelease;
+            if (l != null && key.startsWith("queue/reserved/")) {
+                try {
+                    l.await();
+                } catch (InterruptedException e) {
+                    throw new IllegalStateException(e);
+                }
+            }
+            super.delete(key, expectedVersion);
+        }
     };
+
+    /** The controllers known to be alive, or null if that is not known. */
+    static volatile Set<String> live;
+
+    /** While set, releasing a reservation waits for it: a store answering slowly. */
+    static volatile java.util.concurrent.CountDownLatch slowRelease;
 
     /** While set, the store has no queue (each controller has its own). */
     static volatile boolean noQueue;
@@ -284,6 +312,144 @@ class SharedQueueTest {
         } finally {
             SharedQueue.ORIGIN_GRACE_MILLIS = grace;
         }
+    }
+
+    @Test
+    void theControllersLeftAgreeWhichOfThemProvisions() {
+        for (long id = 1; id <= 50; id++) {
+            String one = SharedQueue.provisioner(id, Set.of("a", "b", "c"));
+            assertEquals(one, SharedQueue.provisioner(id, new LinkedHashSet<>(List.of("c", "b", "a"))), "whichever asks");
+            assertTrue(Set.of("a", "b", "c").contains(one));
+        }
+    }
+
+    @Test
+    void onlyItsOriginProvisionsForAnItem() throws Exception {
+        Label cloudy = Label.get("cloudy"); // no node has it: items stay buildable, waiting for capacity
+        FreeStyleProject elsewhere = r.createFreeStyleProject("cloudy-elsewhere");
+        elsewhere.setAssignedLabel(cloudy);
+        publishElsewhere("cloudy-elsewhere", 0, "carol");
+        for (int i = 0; i < 100 && Queue.getInstance().getBuildableItems().isEmpty(); i++) {
+            Thread.sleep(100);
+        }
+        assertEquals(1, Queue.getInstance().getBuildableItems().size());
+        assertEquals(0, cloudy.loadStatistics.computeSnapshot().getQueueLength(), "the other controller provisions for its item");
+
+        FreeStyleProject here = r.createFreeStyleProject("cloudy-here");
+        here.setAssignedLabel(cloudy);
+        here.scheduleBuild2(0);
+        for (int i = 0; i < 100 && Queue.getInstance().getBuildableItems().size() < 2; i++) {
+            Thread.sleep(100);
+        }
+        assertEquals(1, cloudy.loadStatistics.computeSnapshot().getQueueLength(), "this controller provisions for its own item");
+        Queue.getInstance().clear();
+    }
+
+    @Test
+    void itemReservedByItsControllerWaitsForTheAgentItStarts() throws Exception {
+        long grace = SharedQueue.ORIGIN_GRACE_MILLIS;
+        SharedQueue.ORIGIN_GRACE_MILLIS = 500;
+        try {
+            FreeStyleProject p = r.createFreeStyleProject("reserved");
+            ClusterQueue.Record rec = publishElsewhere("reserved", 0, "erin");
+            // the other controller is starting a cloud agent for it
+            STORE.write(SharedQueue.Reservations.key(rec.id()), ("other-controller " + System.currentTimeMillis()).getBytes(StandardCharsets.UTF_8),
+                    PersistenceStore.ANY);
+            Thread.sleep(3_000);
+            assertNull(p.getLastBuild(), "past the head start, but reserved");
+            SharedQueue.Reservations.release(rec.id()); // its agent never came, say
+            for (int i = 0; i < 100 && p.getLastBuild() == null; i++) {
+                Thread.sleep(100);
+            }
+            assertNotNull(p.getLastBuild(), "started here once no longer reserved");
+        } finally {
+            SharedQueue.ORIGIN_GRACE_MILLIS = grace;
+        }
+    }
+
+    @Test
+    void theControllerProvisioningForAnItemWhoseControllerIsGoneReservesIt() throws Exception {
+        Label cloudy = Label.get("cloudy-orphan"); // no node has it: the item stays buildable, unclaimed
+        FreeStyleProject p = r.createFreeStyleProject("cloudy-orphan");
+        p.setAssignedLabel(cloudy);
+        live = Set.of(STORE.getOrigin()); // the other controller is gone: this one provisions for its item
+        try {
+            ClusterQueue.Record rec = publishElsewhere("cloudy-orphan", 0, "gus");
+            String key = SharedQueue.Reservations.key(rec.id());
+            // which it had reserved before it went
+            STORE.write(key, ("other-controller " + System.currentTimeMillis()).getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+            for (int i = 0; i < 100 && Queue.getInstance().getBuildableItems().isEmpty(); i++) {
+                Thread.sleep(100);
+            }
+            assertEquals(1, Queue.getInstance().getBuildableItems().size());
+            new SharedQueue.Reservations().onStarted(new hudson.slaves.Cloud("test") {}, cloudy,
+                    List.of(new hudson.slaves.NodeProvisioner.PlannedNode("agent", new java.util.concurrent.CompletableFuture<>(), 1)));
+            assertThat(new String(STORE.read(key).content(), StandardCharsets.UTF_8), startsWith(STORE.getOrigin() + " "));
+        } finally {
+            live = null;
+            Queue.getInstance().clear();
+        }
+    }
+
+    @Test
+    void anItemReservedByAnotherControllerIsNotDemandHere() throws Exception {
+        long grace = SharedQueue.ORIGIN_GRACE_MILLIS;
+        SharedQueue.ORIGIN_GRACE_MILLIS = 0; // past its controller's head start at once
+        Label cloudy = Label.get("cloudy-reserved"); // no node has it: the items stay buildable, unclaimed
+        try {
+            // membership unknown: any controller would provision for it, but its controller is starting an agent for it
+            FreeStyleProject p = r.createFreeStyleProject("cloudy-reserved");
+            p.setAssignedLabel(cloudy);
+            ClusterQueue.Record rec = publishElsewhere("cloudy-reserved", 0, "hal");
+            STORE.write(SharedQueue.Reservations.key(rec.id()), ("other-controller " + System.currentTimeMillis()).getBytes(StandardCharsets.UTF_8),
+                    PersistenceStore.ANY);
+            for (int i = 0; i < 100 && Queue.getInstance().getBuildableItems().isEmpty(); i++) {
+                Thread.sleep(100);
+            }
+            assertEquals(1, Queue.getInstance().getBuildableItems().size());
+            assertEquals(0, cloudy.loadStatistics.computeSnapshot().getQueueLength(), "reserved by its controller");
+
+            // its controller is gone, and the one elected to provision reserved it before this one joined (and won)
+            Queue.getInstance().clear();
+            awaitMirrored();
+            String me = STORE.getOrigin();
+            ClusterQueue.Record orphan = publishElsewhere("cloudy-reserved", 0, "ida");
+            String survivor = java.util.stream.IntStream.range(0, 1000).mapToObj(i -> "controller-" + i)
+                    .filter(o -> me.equals(SharedQueue.provisioner(orphan.id(), Set.of(me, o)))).findFirst().orElseThrow();
+            live = Set.of(me, survivor);
+            STORE.write(SharedQueue.Reservations.key(orphan.id()), (survivor + " " + System.currentTimeMillis()).getBytes(StandardCharsets.UTF_8),
+                    PersistenceStore.ANY);
+            for (int i = 0; i < 100 && Queue.getInstance().getBuildableItems().isEmpty(); i++) {
+                Thread.sleep(100);
+            }
+            assertEquals(1, Queue.getInstance().getBuildableItems().size());
+            assertEquals(0, cloudy.loadStatistics.computeSnapshot().getQueueLength(), "reserved by a live controller");
+        } finally {
+            live = null;
+            SharedQueue.ORIGIN_GRACE_MILLIS = grace;
+            Queue.getInstance().clear();
+        }
+    }
+
+    @Test
+    void cancellingAReservedItemDoesNotWaitForTheStoreToReleaseIt() throws Exception {
+        r.createFreeStyleProject("reserved-cancelled");
+        ClusterQueue.Record rec = publishElsewhere("reserved-cancelled", 60_000, "hal");
+        String key = SharedQueue.Reservations.key(rec.id());
+        STORE.write(key, (STORE.getOrigin() + " " + System.currentTimeMillis()).getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        Queue.Item item = Queue.getInstance().getItem(rec.id());
+        slowRelease = new java.util.concurrent.CountDownLatch(1);
+        try {
+            assertTrue(java.util.concurrent.CompletableFuture.supplyAsync(() -> Queue.getInstance().cancel(item))
+                    .get(10, java.util.concurrent.TimeUnit.SECONDS), "not waiting for the store under the queue lock");
+        } finally {
+            slowRelease.countDown();
+            slowRelease = null;
+        }
+        for (int i = 0; i < 500 && STORE.read(key) != null; i++) {
+            Thread.sleep(10);
+        }
+        assertNull(STORE.read(key), "released afterwards");
     }
 
     @Test

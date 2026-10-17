@@ -38,6 +38,7 @@ import hudson.model.PersistenceRoot;
 import hudson.model.Queue;
 import hudson.model.Saveable;
 import hudson.model.listeners.SaveableListener;
+import hudson.slaves.AbstractCloudSlave;
 import hudson.slaves.EphemeralNode;
 import hudson.slaves.OfflineCause;
 import java.io.File;
@@ -221,7 +222,21 @@ public class Nodes implements PersistenceRoot {
     }
 
     public XmlFile getConfigFile(Node node) {
+        // a cloud agent, launched by this controller's cloud: other controllers sharing a persistence store must not
+        // launch it too; any other node is shared, also one that replaced a cloud agent of the same name
+        String key = PersistenceStores.keyFor(new File(node.getRootDir(), "config.xml"));
+        if (key != null) {
+            PersistenceStores.keepLocal(key, node instanceof AbstractCloudSlave);
+        }
         return getConfigFile(node.getRootDir());
+    }
+
+    /**
+     * Whether a node is a cloud agent which another controller launched (its configuration came from the store): one
+     * whose configuration a store owns and which this controller does not keep local. Without such a store, none is.
+     */
+    private static boolean launchedElsewhere(Node n, File dir) {
+        return n instanceof AbstractCloudSlave && PersistenceStores.route(new File(dir, "config.xml")) != null;
     }
 
     public XmlFile getConfigFile(File dir) {
@@ -332,6 +347,8 @@ public class Nodes implements PersistenceRoot {
             });
             // no need for a full save() so we just do the minimum
             LOGGER.fine(() -> "deleting " + new File(getRootDir(), node.getNodeName()));
+            // before deleting: getConfigFile(Node) keeps a cloud agent's key local, which the deletion then undoes
+            XmlFile config = getConfigFile(node);
             deleteNodeDir(node.getNodeName());
 
             if (match.get()) {
@@ -339,7 +356,7 @@ public class Nodes implements PersistenceRoot {
                 jenkins.trimLabels(node);
             }
             NodeListener.fireOnDeleted(node);
-            SaveableListener.fireOnDeleted(node, getConfigFile(node));
+            SaveableListener.fireOnDeleted(node, config);
         }
     }
 
@@ -351,6 +368,10 @@ public class Nodes implements PersistenceRoot {
     public void changedElsewhere(@NonNull String name, boolean deleted) {
         Node old = getNode(name);
         if (deleted) {
+            String key = PersistenceStores.keyFor(getConfigFile(name).getPath());
+            if (key != null && PersistenceStores.isKeptLocal(key)) {
+                return; // this controller's cloud agent of that name, which the store never had: not the node deleted
+            }
             if (old != null) {
                 unload(old);
                 jenkins.updateComputerList();
@@ -390,6 +411,10 @@ public class Nodes implements PersistenceRoot {
             route.delete();
         }
         Util.deleteRecursive(new File(getRootDir(), nodeName));
+        String key = PersistenceStores.keyFor(new File(getRootDir(), nodeName + File.separator + "config.xml"));
+        if (key != null) {
+            PersistenceStores.keepLocal(key, false);
+        }
     }
 
     @Override
@@ -429,14 +454,35 @@ public class Nodes implements PersistenceRoot {
         final File[] localDirs = nodesDir.listFiles(File::isDirectory);
         // nodes may also exist only in a persistence store shared with other controllers
         final Set<File> subdirs = new TreeSet<>(localDirs == null ? List.of() : Arrays.asList(localDirs));
-        for (String name : PersistenceStores.storedItemNames(nodesDir)) {
+        final Set<String> stored = PersistenceStores.storedItemNames(nodesDir);
+        for (String name : stored) {
             subdirs.add(new File(nodesDir, name));
         }
         final Map<String, Node> newNodes = new TreeMap<>();
         {
             for (File subdir : subdirs) {
                 try {
-                    load(subdir, newNodes);
+                    boolean local = localDirs != null && Arrays.asList(localDirs).contains(subdir);
+                    // only here (this controller's cloud agent, never written to the store): read it from here, which
+                    // routing to the store would not find, and keep it here if it is a cloud agent
+                    String key = PersistenceStores.keyFor(new File(subdir, "config.xml"));
+                    boolean onlyHere = local && key != null && !stored.contains(subdir.getName());
+                    if (onlyHere) {
+                        PersistenceStores.keepLocal(key, true);
+                    }
+                    Node n = null;
+                    try {
+                        n = load(subdir, newNodes);
+                    } finally {
+                        if (onlyHere && !(n instanceof AbstractCloudSlave)) {
+                            // a permanent node, or nothing loadable (e.g. an empty directory left behind): shared from its next save
+                            PersistenceStores.keepLocal(key, false);
+                        }
+                    }
+                    if (n != null && launchedElsewhere(n, subdir)) {
+                        // from the store, even with a directory here: another controller's cloud agent
+                        newNodes.remove(n.getNodeName());
+                    }
                 } catch (IOException e) {
                     LOGGER.log(Level.WARNING, "could not load " + subdir, e);
                 }
@@ -490,6 +536,10 @@ public class Nodes implements PersistenceRoot {
             XmlFile xmlFile = getConfigFile(name);
             if (xmlFile.exists()) {
                 Node n = (Node) xmlFile.read();
+                if (launchedElsewhere(n, new File(getRootDir(), name))) {
+                    LOGGER.fine(() -> "not loading " + name + ", a cloud agent of another controller");
+                    return null;
+                }
                 if (vetoable && !allowLoad(n)) {
                     Node old = nodes.get(n.getNodeName());
                     if (old != null) { // as if deleted: it would not be here after a restart either
