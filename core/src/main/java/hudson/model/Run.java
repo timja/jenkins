@@ -139,6 +139,7 @@ import net.sf.json.JSONObject;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.jelly.XMLOutput;
 import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.Beta;
 import org.kohsuke.accmod.restrictions.DoNotUse;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.kohsuke.stapler.HttpResponse;
@@ -1558,6 +1559,16 @@ public abstract class Run<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
         } catch (InterruptedException x) {
             throw new IOException(x);
         }
+    }
+
+    /**
+     * Whether this build is being deleted (or was): from when {@link #delete} starts, before its listeners run.
+     *
+     * @since TODO
+     */
+    @Restricted(Beta.class)
+    public synchronized boolean isPendingDelete() {
+        return isPendingDelete;
     }
 
     /**

@@ -195,7 +195,23 @@ public abstract class AbstractLazyLoadRunMap<R> extends AbstractMap<Integer, R> 
                 // matched BUILD_NUMBER but not an int?
             }
         }
+        for (int buildNumber : storedNumbers()) {
+            if (!newBuildRefsMap.containsKey(buildNumber) && allower.test(buildNumber)) {
+                newBuildRefsMap.put(buildNumber, new BuildReference<>(String.valueOf(buildNumber)));
+            }
+        }
         core.replaceBy(newBuildRefsMap);
+    }
+
+    /**
+     * Numbers of builds which exist elsewhere, such as in a store shared with other controllers, and may have no local
+     * directory yet; {@link #retrieve} is expected to create it. Added to the index when it is loaded.
+     *
+     * @since TODO
+     */
+    @Restricted(NoExternalUse.class)
+    protected Set<Integer> storedNumbers() {
+        return Set.of();
     }
 
     @Restricted(NoExternalUse.class)
@@ -227,6 +243,39 @@ public abstract class AbstractLazyLoadRunMap<R> extends AbstractMap<Integer, R> 
         } else {
             LOGGER.fine(() -> "no such subdirectory " + buildNumber + " in " + dir);
         }
+    }
+
+    /**
+     * Whether a build number is in the index, without loading the build.
+     *
+     * @since TODO
+     */
+    @Restricted(Beta.class)
+    public final synchronized boolean knows(int buildNumber) {
+        return core.containsKey(buildNumber);
+    }
+
+    /**
+     * Drops the loaded instance of a build, if any, so that it is read again from disk when next needed,
+     * as after another controller changed its record.
+     *
+     * @since TODO
+     */
+    @Restricted(Beta.class)
+    public final synchronized void unload(int buildNumber) {
+        if (core.containsKey(buildNumber)) {
+            core.put(buildNumber, new BuildReference<>(String.valueOf(buildNumber)));
+        }
+    }
+
+    /**
+     * Removes a build from the index without loading it or notifying anyone, as after another controller deleted it.
+     *
+     * @since TODO
+     */
+    @Restricted(Beta.class)
+    public final synchronized void forget(int buildNumber) {
+        core.remove(buildNumber);
     }
 
     @Override
@@ -411,6 +460,19 @@ public abstract class AbstractLazyLoadRunMap<R> extends AbstractMap<Integer, R> 
     protected final synchronized void proposeNewNumber(int number) throws IllegalStateException {
         if (number <= maxNumberOnDisk()) {
             throw new IllegalStateException("JENKINS-27530: cannot create a build with number " + number + " since that (or higher) is already in use among " + keySet());
+        }
+    }
+
+    /**
+     * Like {@link #proposeNewNumber} for numbers assigned from a sequence shared with other controllers:
+     * builds with higher numbers made elsewhere may already be known, so only the number itself must be unused.
+     *
+     * @since TODO
+     */
+    @Restricted(NoExternalUse.class)
+    protected final synchronized void proposeSharedNumber(int number) throws IllegalStateException {
+        if (core.containsKey(number)) {
+            throw new IllegalStateException("JENKINS-27530: cannot create a build with number " + number + " since it is already in use among " + keySet());
         }
     }
 
