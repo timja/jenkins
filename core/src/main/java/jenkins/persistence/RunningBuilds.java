@@ -38,6 +38,9 @@ import hudson.model.Result;
 import hudson.model.Run;
 import hudson.model.TaskListener;
 import hudson.model.listeners.RunListener;
+import hudson.security.ACL;
+import hudson.security.ACLContext;
+import java.io.File;
 import java.io.IOException;
 import java.io.StringReader;
 import java.io.StringWriter;
@@ -421,6 +424,92 @@ public final class RunningBuilds {
     }
 
     /**
+     * Takes over the lease of a build this controller's previous incarnation (the same name, another origin) was running,
+     * before it is loaded from this home.
+     *
+     * @return false if another controller holds it, so the local copy must not be loaded (nor resumed)
+     */
+    static boolean reclaim(@NonNull Job<?, ?> job, int number) throws IOException {
+        PersistenceStore store = PersistenceStores.get();
+        String runningKey = store == null ? null : runningKey(job);
+        if (runningKey == null) {
+            return true;
+        }
+        String key = runningKey + "/" + number + SUFFIX;
+        if (owned.containsKey(key)) {
+            return true;
+        }
+        Placeholder cached = null;
+        for (Placeholder p : all(job)) {
+            if (p.number == number) {
+                cached = p;
+            }
+        }
+        if (cached == null || !CONTROLLER_NAME.equals(cached.controller) || store.getOrigin().equals(cached.origin)
+                || !new File(new File(job.getBuildDir(), String.valueOf(number)), "build.xml").isFile()) {
+            return true; // not one this controller was running before a restart
+        }
+        PersistenceStore.Entry entry = store.read(key);
+        Placeholder p = entry == null ? null : Placeholder.fromBytes(key, number, entry.content(), entry.version());
+        if (p == null || !CONTROLLER_NAME.equals(p.controller)) {
+            if (p != null) {
+                LOGGER.info(() -> job.getFullName() + " #" + number + " was adopted by " + p.controller + " while this controller restarted; not resuming it here");
+                return false;
+            }
+            return true; // completed meanwhile
+        }
+        if (store.getOrigin().equals(p.origin)) {
+            return true;
+        }
+        // as an adoption does: while this controller restarted, its exclusive lease on the job (one build at a time)
+        // may have lapsed, and another controller started a newer build; this one then waits for it
+        if (!SharedQueue.adoptExclusive(job, number)) {
+            throw new NotYet("another build of " + job.getFullName() + " runs; #" + number + " is resumed here once it is done");
+        }
+        boolean reclaimed = false;
+        try {
+            BuildLeases leases = store.leases();
+            long epoch = leases == null ? p.epoch : leases.acquire(key);
+            if (epoch == 0) {
+                LOGGER.info(() -> "Another controller holds the lease on " + job.getFullName() + " #" + number + "; not resuming it here");
+                return false;
+            }
+            Placeholder mine = p.withOwner(store.getOrigin(), CONTROLLER_NAME, epoch, p.properties);
+            long version;
+            try {
+                version = store.writeIfHeld(key, epoch, key, mine.toBytes(), p.version); // fenced, as an adoption is
+            } catch (LeaseLostException e) {
+                LOGGER.info(() -> "Another controller took " + job.getFullName() + " #" + number + " over while it was reclaimed after a restart; not resuming it here");
+                return false;
+            } catch (ConflictException e) {
+                LOGGER.info(() -> job.getFullName() + " #" + number + " changed while being reclaimed after a restart; not resuming it here");
+                if (leases != null) {
+                    leases.release(key, epoch);
+                }
+                return false;
+            }
+            owned.put(key, new Placeholder(key, number, mine.origin, mine.controller, p.displayName, p.startTime, epoch, p.properties, version));
+            invalidate(jobKeyOfRunning(runningKey));
+            LOGGER.info(() -> "Reclaimed " + job.getFullName() + " #" + number + " from this controller's previous run (" + p.origin + ") with epoch " + epoch);
+            reclaimed = true;
+            return true;
+        } finally {
+            if (!reclaimed) {
+                SharedQueue.abandonExclusive(job, number); // not resumed here: the job is not blocked for it
+            } else {
+                SharedQueue.resumedExclusive(job, number); // loaded right after this: the queue here then sees it
+            }
+        }
+    }
+
+    /** A build that cannot be reclaimed yet (another build of its job runs), to be looked at again later. */
+    static final class NotYet extends IOException {
+        NotYet(String message) {
+            super(message);
+        }
+    }
+
+    /**
      * Whether this controller may still work on and publish a build it started or adopted.
      * False once another controller has taken it over (for example after this one was partitioned).
      */
@@ -632,7 +721,7 @@ public final class RunningBuilds {
                         if (epoch == 0) {
                             continue; // another controller is adopting it
                         }
-                        boolean adopted;
+                        Adoption adopted;
                         try {
                             adopted = adopt(store, job, p.key, epoch);
                         } catch (IOException | RuntimeException e) {
@@ -641,7 +730,7 @@ public final class RunningBuilds {
                             leases.release(p.key, epoch);
                             continue;
                         }
-                        if (adopted) {
+                        if (adopted != Adoption.NONE) {
                             removedHere++;
                             continue;
                         }
@@ -651,6 +740,13 @@ public final class RunningBuilds {
                     PersistenceStore.Entry now = store.read(p.key);
                     if (now != null && (leases == null || leases.holds(p.key, epoch))) {
                         LOGGER.info(() -> "Removing placeholder of " + job.getFullName() + " #" + p.number + " left by " + p.controller + " (" + p.origin + "), which is gone");
+                        try {
+                            // nothing can resume it: close it as aborted rather than let it vanish (Target 12)
+                            BuildRecords.publishLost(job, p.number, p.startTime,
+                                    "This build was running on " + p.controller + ", which is gone, and could not be resumed elsewhere; it is closed as aborted.");
+                        } catch (IOException | RuntimeException e) {
+                            LOGGER.log(Level.WARNING, "Could not close " + job.getFullName() + " #" + p.number + " as aborted", e);
+                        }
                         try {
                             // only as read: several controllers noticing at once is harmless, and a write since is kept
                             store.delete(p.key, now.version());
@@ -798,6 +894,20 @@ public final class RunningBuilds {
         }, Math.min(30, 1L << attempt), TimeUnit.SECONDS);
     }
 
+    /** Stops a build adopted here if that was requested, looking again later if the store cannot tell now. */
+    private static void stopIfRequested(String jobKey, int number, int attempt) {
+        try {
+            stopRequested(jobKey, number);
+        } catch (IOException | RuntimeException e) {
+            if (attempt < STOP_ATTEMPTS) {
+                LOGGER.log(Level.WARNING, "Could not tell whether " + jobKey + " #" + number + " was asked to stop; looking again later", e);
+                Timer.get().schedule(() -> stopIfRequested(jobKey, number, attempt + 1), Math.min(30, 1L << attempt), TimeUnit.SECONDS);
+            } else {
+                LOGGER.log(Level.WARNING, "Could not tell whether " + jobKey + " #" + number + " was asked to stop", e);
+            }
+        }
+    }
+
     /** @return false if the build has no executor (yet) to interrupt */
     private static boolean interrupt(Run<?, ?> run, CauseOfInterruption cause) {
         Executor executor = run.getExecutor();
@@ -828,12 +938,24 @@ public final class RunningBuilds {
     /** How many times adoption is retried when the placeholder changes under it. */
     private static final int ADOPTION_ATTEMPTS = 5;
 
+    /** What became of a build offered for adoption. */
+    enum Adoption {
+        /** Adopted: resumed here, its lease kept. */
+        ADOPTED,
+        /** Completed (or removed) meanwhile: nothing to adopt; the lease is released. */
+        GONE,
+        /** Left for a later attempt (its placeholder is kept); the lease is released. */
+        LATER,
+        /** Nothing can adopt it; the lease is still held, for the caller to close it. */
+        NONE
+    }
+
     /**
      * Offers a build whose owner is gone to the {@link BuildAdopter}s, with its lease already held.
      *
-     * @return true if it was adopted
+     * @return what became of it
      */
-    private static boolean adopt(PersistenceStore store, Job<?, ?> job, String key, long epoch) throws IOException {
+    private static Adoption adopt(PersistenceStore store, Job<?, ?> job, String key, long epoch) throws IOException {
         try {
             return offer(store, job, key, epoch);
         } finally {
@@ -845,7 +967,7 @@ public final class RunningBuilds {
         }
     }
 
-    private static boolean offer(PersistenceStore store, Job<?, ?> job, String key, long epoch) throws IOException {
+    private static Adoption offer(PersistenceStore store, Job<?, ?> job, String key, long epoch) throws IOException {
         int number = Integer.parseInt(key.substring(key.lastIndexOf('/') + 1, key.length() - SUFFIX.length()));
         for (int attempt = 0; attempt < ADOPTION_ATTEMPTS; attempt++) {
             PersistenceStore.Entry entry = store.read(key);
@@ -855,16 +977,16 @@ public final class RunningBuilds {
                 if (leases != null) {
                     leases.release(key, epoch);
                 }
-                return true;
+                return Adoption.GONE;
             }
             if (BuildRecords.isStored(job, number)) {
                 // completed: its record is published only once it has, and its owner was gone before removing this
-                return false;
+                return Adoption.NONE;
             }
             Placeholder p = Placeholder.fromBytes(key, number, entry.content(), entry.version());
             BuildAdopter.Adoption adoption = p == null ? null : prepare(job, p);
             if (adoption == null) {
-                return false; // nobody can adopt it
+                return Adoption.NONE;
             }
             boolean exclusive;
             try {
@@ -881,7 +1003,7 @@ public final class RunningBuilds {
                     leases.release(key, epoch);
                 }
                 LOGGER.info(() -> "Not adopting " + job.getFullName() + " #" + number + " yet: another build of it runs");
-                return true; // nothing to remove: a later sweep adopts it
+                return Adoption.LATER;
             }
             Placeholder mine = p.withOwner(store.getOrigin(), CONTROLLER_NAME, epoch, p.properties);
             long version;
@@ -903,20 +1025,24 @@ public final class RunningBuilds {
             }
             owned.put(key, new Placeholder(key, number, mine.origin, mine.controller, p.displayName, p.startTime, epoch, p.properties, version));
             invalidate(jobKeyOfRunning(runningKey(job)));
-            LOGGER.info(() -> "Adopting " + job.getFullName() + " #" + number + " from " + p.controller + " (" + p.origin + "), which is gone");
+            LOGGER.info(() -> "Adopting " + job.getFullName() + " #" + number + " from " + p.controller + " (" + p.origin + ")");
             try {
                 adoption.resume(epoch);
             } catch (IOException | RuntimeException e) {
                 resumeFailed(store, job, p, version, e);
             }
             SharedQueue.resumedExclusive(job, number); // loaded now (or not resumed, and let go of): the queue sees it
-            String jobKey = jobKeyOfRunning(runningKey(job));
-            if (store.read(jobKey + "/" + PREFIX + "/" + number + STOP_SUFFIX) != null) {
-                stopRequested(jobKey, number); // asked to stop while its owner was gone
-            }
-            return true;
+            // asked to stop while its owner was gone; it runs here now whatever this finds, so nothing below throws: a
+            // caller takes an exception for "not resumed", and releases the lease
+            stopIfRequested(jobKeyOfRunning(runningKey(job)), number, 0);
+            return Adoption.ADOPTED;
         }
-        return false;
+        // its owner kept changing it: not as gone as it seemed; a later sweep looks again
+        BuildLeases leases = store.leases();
+        if (leases != null) {
+            leases.release(key, epoch);
+        }
+        return Adoption.LATER;
     }
 
     /**
@@ -969,6 +1095,59 @@ public final class RunningBuilds {
     }
 
     /**
+     * Gives up a build this controller runs so that another controller can take it over ({@link #takeOver}), for example
+     * a Pipeline waiting for an agent only another controller has (Target 12). The build is then stopped here without
+     * being published, as when ownership is lost.
+     */
+    @Restricted(Beta.class)
+    public static void handOver(@NonNull Run<?, ?> run) throws IOException {
+        String key = placeholderKey(run);
+        PersistenceStore store = PersistenceStores.get();
+        Placeholder p = key == null ? null : owned.get(key);
+        if (p == null || store == null || store.leases() == null) {
+            throw new IOException(run + " is not owned here");
+        }
+        store.leases().release(key, p.epoch);
+        LOGGER.info(() -> "Handed over " + run);
+        lost(run);
+    }
+
+    /**
+     * Takes over a build another controller {@linkplain #handOver handed over}: acquires its lease and adopts it.
+     *
+     * @return whether it was adopted
+     */
+    @Restricted(Beta.class)
+    public static boolean takeOver(@NonNull Job<?, ?> job, int number) throws IOException {
+        PersistenceStore store = PersistenceStores.get();
+        String runningKey = runningKey(job);
+        if (store == null || store.leases() == null || runningKey == null) {
+            return false;
+        }
+        String key = runningKey + "/" + number + SUFFIX;
+        long epoch = store.leases().acquire(key);
+        if (epoch == 0) {
+            return false; // not released (yet), or taken by another controller
+        }
+        Adoption adopted;
+        try {
+            adopted = adopt(store, job, key, epoch);
+        } catch (IOException | RuntimeException e) {
+            store.leases().release(key, epoch); // left as it was, for another attempt
+            throw e;
+        }
+        // only an adoption is a takeover: a build that completed meanwhile was not taken over
+        return switch (adopted) {
+            case ADOPTED -> true;
+            case GONE, LATER -> false; // its lease released already
+            case NONE -> {
+                store.leases().release(key, epoch);
+                yield false;
+            }
+        };
+    }
+
+    /**
      * The placeholder of a build as this controller, its owner, last wrote it, or null if it is not owned here.
      */
     @CheckForNull
@@ -980,6 +1159,49 @@ public final class RunningBuilds {
     @Restricted(NoExternalUse.class)
     @Extension
     public static final class Listener extends RunListener<Run<?, ?>> {
+
+        /**
+         * A build this controller was running before it restarted with its home (e.g. a safe restart to apply plugin
+         * changes) is loaded, and a Pipeline then resumed, from that home: first take its lease over from the previous
+         * incarnation, as an adopter would, so that no other controller adopts it too. If another controller holds it
+         * already (it adopted the build meanwhile), the local copy is not loaded: that controller's is the build.
+         */
+        @Override
+        public boolean allowLoad(@NonNull Job<?, ?> job, int buildNumber) {
+            if (PersistenceStores.isApplyingRemoteChange()) {
+                return true;
+            }
+            try {
+                return reclaim(job, buildNumber);
+            } catch (NotYet e) {
+                LOGGER.info(() -> "Not resuming a build after a restart yet: " + e.getMessage());
+                reclaimLater(job, buildNumber);
+                return false;
+            } catch (IOException | RuntimeException e) {
+                // not loaded (nor resumed) without its lease: another controller may run it; looked at again later
+                LOGGER.log(Level.WARNING, "Could not reclaim " + job.getFullName() + " #" + buildNumber + " after a restart; trying again later", e);
+                reclaimLater(job, buildNumber);
+                return false;
+            }
+        }
+
+        /**
+         * Tries to load a build not loaded because it could not be reclaimed yet, so that a Pipeline is resumed without
+         * waiting for someone to open it. Only that build: the others of the job, perhaps running, keep their instances.
+         */
+        private static void reclaimLater(Job<?, ?> job, int number) {
+            Timer.get().schedule(() -> {
+                if (job instanceof LazyBuildMixIn.LazyLoadingJob<?, ?> lazy) {
+                    try (ACLContext ctx = ACL.as2(ACL.SYSTEM2)) {
+                        lazy.getLazyBuildMixIn()._getRuns().recognizeNumber(number); // declined when listed: not indexed
+                        job.getBuildByNumber(number); // a load failing again schedules another
+                    }
+                }
+            }, RECLAIM_RETRY_SECONDS, TimeUnit.SECONDS);
+        }
+
+        /** How long a build not reclaimed after a restart waits before it is tried again. */
+        static /* non-final for tests */ long RECLAIM_RETRY_SECONDS = 30;
 
         @Override
         public void onStarted(Run<?, ?> run, TaskListener listener) {
@@ -1064,6 +1286,60 @@ public final class RunningBuilds {
             job.checkPermission(Item.CANCEL);
             requestStop(job, number, Jenkins.getAuthentication2().getName());
             return HttpResponses.redirectTo("..");
+        }
+    }
+
+    /**
+     * The page of a build running on another controller, at the build's own URL here ({@code job/x/N/}), so that its
+     * links never find nothing. A cluster routing such requests to the controller running the build answers them first;
+     * without one, this shows the build as running there, until its record arrives and the build itself is shown.
+     *
+     * @return null if no build of this number runs elsewhere
+     */
+    @Restricted(NoExternalUse.class)
+    @CheckForNull
+    public static BuildElsewhere buildElsewhere(@NonNull Job<?, ?> job, int number) {
+        for (Placeholder p : elsewhere(job)) {
+            if (p.number == number) {
+                return new BuildElsewhere(job, p);
+            }
+        }
+        return null;
+    }
+
+    /** A build running on another controller, as a page: {@code index} and {@code console}. */
+    @Restricted(NoExternalUse.class)
+    public static final class BuildElsewhere {
+        private final Job<?, ?> job;
+        private final Placeholder placeholder;
+
+        BuildElsewhere(Job<?, ?> job, Placeholder placeholder) {
+            this.job = job;
+            this.placeholder = placeholder;
+        }
+
+        public Job<?, ?> getJob() {
+            return job;
+        }
+
+        public Placeholder getPlaceholder() {
+            return placeholder;
+        }
+
+        public String getDisplayName() {
+            return job.getFullDisplayName() + " " + placeholder.getDisplayName();
+        }
+
+        public boolean isStoppable() {
+            return job.hasPermission(Item.CANCEL);
+        }
+
+        /** Stops it: asks the controller running it to. */
+        @RequirePOST
+        public HttpResponse doStop() throws IOException {
+            job.checkPermission(Item.CANCEL);
+            requestStop(job, placeholder.number, Jenkins.getAuthentication2().getName());
+            return HttpResponses.redirectTo(".");
         }
     }
 

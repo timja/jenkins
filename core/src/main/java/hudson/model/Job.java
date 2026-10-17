@@ -906,7 +906,16 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
                              StaplerResponse2 rsp) {
         try {
             // try to interpret the token as build number
-            return getBuildByNumber(Integer.parseInt(token));
+            int number = Integer.parseInt(token);
+            RunT run = getBuildByNumber(number);
+            if (run == null) {
+                // running on another controller sharing this job's builds: a page saying so, not nothing
+                Object elsewhere = jenkins.persistence.RunningBuilds.buildElsewhere(this, number);
+                if (elsewhere != null) {
+                    return elsewhere;
+                }
+            }
+            return run;
         } catch (NumberFormatException e) {
             // try to map that to widgets
             for (Widget w : getWidgets()) {
@@ -1264,10 +1273,11 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
         while (lastBuild != null && lastBuild.hasntStartedYet())
             lastBuild = lastBuild.getPreviousBuild();
 
-        if (lastBuild != null)
-            return lastBuild.getIconColor();
-        else
-            return BallColor.NOTBUILT;
+        BallColor color = lastBuild != null ? lastBuild.getIconColor() : BallColor.NOTBUILT;
+        if (!color.isAnimated() && !jenkins.persistence.RunningBuilds.elsewhere(this).isEmpty()) {
+            return color.anime(); // a build is running on another controller of the cluster
+        }
+        return color;
     }
 
     /**

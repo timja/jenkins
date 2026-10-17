@@ -103,6 +103,8 @@ public final class BuildRecords {
 
     static final String RECORD = "build.xml";
     static final String SNAPSHOT = "files.tgz";
+    /** The stand-in snapshot of a build closed as lost: its own key, so that it never replaces a real snapshot. */
+    static final String LOST_SNAPSHOT = "lost.tgz";
 
     /**
      * Never part of a snapshot: the record itself, artifacts (use an external {@link jenkins.model.ArtifactManager}),
@@ -225,6 +227,14 @@ public final class BuildRecords {
      */
     @Restricted(Beta.class) // e.g. importing a file-based home
     public static void publish(@NonNull Run<?, ?> run) throws IOException {
+        publish(run, false);
+    }
+
+    /**
+     * @param filesChanged whether only files of the build directory changed (not its record): the record is then marked
+     *     so that it gets a new version, and other controllers fetch the new snapshot
+     */
+    private static void publish(@NonNull Run<?, ?> run, boolean filesChanged) throws IOException {
         String builds = buildsKey(run.getParent());
         if (builds == null) {
             return;
@@ -234,7 +244,7 @@ public final class BuildRecords {
             publishing.merge(base, 1, Integer::sum);
         }
         try {
-            publish(run, base);
+            publish(run, base, filesChanged);
         } finally {
             synchronized (deleted) {
                 publishing.computeIfPresent(base, (k, n) -> n == 1 ? null : n - 1);
@@ -242,7 +252,7 @@ public final class BuildRecords {
         }
     }
 
-    private static void publish(Run<?, ?> run, String base) throws IOException {
+    private static void publish(Run<?, ?> run, String base, boolean filesChanged) throws IOException {
         File dir = run.getRootDir();
         Path record = new File(dir, RECORD).toPath();
         if (!Files.isRegularFile(record)) {
@@ -254,6 +264,8 @@ public final class BuildRecords {
         RunningBuilds.Placeholder lease = PersistenceStores.get().leases() == null ? null : RunningBuilds.ownedPlaceholder(run);
         // uploaded under a name of its own first, which a controller that lost the build cannot put over the owner's
         String upload = lease == null ? SNAPSHOT : SNAPSHOT + "." + lease.getEpoch();
+        // before the snapshot: a file added while it is made and uploaded then differs from this, and is published later
+        String signature = signature(dir);
         BlobStore blobs = PersistenceStores.getBlobStore();
         if (blobs != null) {
             List<String> excludes = new ArrayList<>(DEFAULT_EXCLUDES);
@@ -287,9 +299,34 @@ public final class BuildRecords {
             LOGGER.fine(() -> "Not publishing " + run + ": deleted while being published");
             return;
         }
+        PersistenceStore store = PersistenceStores.get();
         try {
             byte[] published = Files.readAllBytes(record);
+            PersistenceStore.Entry stored = filesChanged ? store.read(base + "/" + RECORD) : null;
+            if (filesChanged && stored == null) {
+                // deleted elsewhere, which this controller has not applied yet: not brought back for files added here
+                discardSnapshot(base);
+                recentlyPublished.remove(base);
+                LOGGER.fine(() -> "Not publishing files added to " + run + ": deleted elsewhere");
+                return;
+            }
+            if (stored != null) {
+                // only the files changed: mark the stored record (telling other controllers to fetch the snapshot again),
+                // rather than writing this controller's copy over an edit made elsewhere since
+                byte[] marked = (new String(stored.content(), StandardCharsets.UTF_8).replaceAll("\n<!-- files updated \\d+ -->$", "")
+                        + "\n<!-- files updated " + System.currentTimeMillis() + " -->").getBytes(StandardCharsets.UTF_8);
+                try {
+                    seen(base + "/" + RECORD, store.write(base + "/" + RECORD, marked, stored.version()));
+                } catch (ConflictException e) {
+                    LOGGER.fine(() -> run + " changed meanwhile; its files are published with the next sweep");
+                    return;
+                }
+                recentlyPublished.put(base, new Published(new java.lang.ref.WeakReference<>(run), signature, System.currentTimeMillis()));
+                LOGGER.fine(() -> "Published files added to " + run);
+                return;
+            }
             publishRecord(lease, base + "/" + RECORD, published);
+            recentlyPublished.put(base, new Published(new java.lang.ref.WeakReference<>(run), signature, System.currentTimeMillis()));
             // a save made while publishing found no record yet, so republish left it to this: include it
             for (int i = 0; i < 10; i++) {
                 byte[] now = Files.readAllBytes(record);
@@ -308,6 +345,7 @@ public final class BuildRecords {
         // complete), its deletion removed what was written before, and this removes what was written after
         if (isDeleted(base, run)) {
             PersistenceStores.get().delete(base + "/" + RECORD, PersistenceStore.ANY);
+            seen(base + "/" + RECORD, PersistenceStore.ABSENT);
             discardSnapshot(base);
             LOGGER.fine(() -> "Unpublished " + run + ": deleted while being published");
             return;
@@ -322,6 +360,163 @@ public final class BuildRecords {
         } else {
             seen(key, PersistenceStores.get().writeIfHeld(lease.getKey(), lease.getEpoch(), key, content, PersistenceStore.ANY));
         }
+    }
+
+    /** A build published here recently, and the signature of its directory when it was. */
+    private record Published(java.lang.ref.WeakReference<Run<?, ?>> run, String signature, long at) {}
+
+    static final Map<String, Published> recentlyPublished = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** How long after publishing a build files added to its directory are still published (Target 12). */
+    static final long LATE_FILES_MILLIS = java.util.concurrent.TimeUnit.HOURS.toMillis(1);
+
+    /** Paths, sizes and modification times of what a snapshot would hold. */
+    static String signature(File dir) {
+        StringBuilder b = new StringBuilder();
+        Path root = dir.toPath();
+        try (java.util.stream.Stream<Path> files = Files.walk(root)) {
+            files.filter(Files::isRegularFile).sorted().forEach(f -> {
+                String rel = root.relativize(f).toString().replace(File.separatorChar, '/');
+                if (rel.equals(RECORD) || rel.startsWith("archive/") || rel.startsWith("workflow/") || rel.startsWith("stashes/")
+                        || rel.equals("program.dat") || rel.endsWith(".tmp")) {
+                    return;
+                }
+                b.append(rel).append(' ').append(f.toFile().length()).append(' ').append(f.toFile().lastModified()).append('\n');
+            });
+        } catch (IOException | java.io.UncheckedIOException e) {
+            return "";
+        }
+        return b.toString();
+    }
+
+    /**
+     * Republishes recently completed builds whose directories changed without their record being saved, as when a
+     * plugin adds a file to a completed build: their snapshots would otherwise miss it on other controllers.
+     */
+    @Restricted(NoExternalUse.class)
+    @Extension
+    public static final class LateFiles extends hudson.model.AsyncPeriodicWork {
+        public LateFiles() {
+            super("Files added to completed builds");
+        }
+
+        @Override
+        public long getRecurrencePeriod() {
+            return java.util.concurrent.TimeUnit.SECONDS.toMillis(Long.getLong(BuildRecords.class.getName() + ".lateFilesPeriodSeconds", 60));
+        }
+
+        @Override
+        protected void execute(hudson.model.TaskListener listener) {
+            long now = System.currentTimeMillis();
+            for (Map.Entry<String, Published> e : recentlyPublished.entrySet()) {
+                Published p = e.getValue();
+                Run<?, ?> run = p.run().get();
+                if (run == null || now - p.at() > LATE_FILES_MILLIS || isDeleted(e.getKey(), run)
+                        || !new File(run.getRootDir(), RECORD).isFile()) { // e.g. its job was deleted
+                    recentlyPublished.remove(e.getKey());
+                    continue;
+                }
+                if (!signature(run.getRootDir()).equals(p.signature())) {
+                    try {
+                        LOGGER.fine(() -> "Republishing " + run + ": files were added to it after it was published");
+                        publish(run, true);
+                    } catch (IOException | RuntimeException x) {
+                        LOGGER.log(Level.WARNING, "Could not republish " + run, x);
+                    }
+                }
+            }
+        }
+
+        @Override
+        protected Level getNormalLoggingLevel() {
+            return Level.FINE;
+        }
+    }
+
+    /**
+     * Publishes a build which can no longer run anywhere (its controller died, nothing could resume it) as aborted, so
+     * that it stays in the history with a console saying what happened, rather than vanishing (Target 12).
+     */
+    @Restricted(NoExternalUse.class)
+    public static void publishLost(@NonNull Job<?, ?> job, int number, long startTime, @NonNull String reason) throws IOException {
+        String builds = buildsKey(job);
+        if (builds == null) {
+            return;
+        }
+        String base = builds + "/" + number;
+        PersistenceStore store = PersistenceStores.get();
+        if (store.read(base + "/" + RECORD) != null) {
+            return; // published meanwhile (e.g. it completed after all)
+        }
+        Class<?> buildClass = buildClassOf(job);
+        if (buildClass == null) {
+            LOGGER.warning(() -> "Cannot tell the build class of " + job + "; not closing #" + number);
+            return;
+        }
+        String tag = Run.XSTREAM2.getMapper().serializedClass(buildClass);
+        String record = "<?xml version='1.1' encoding='UTF-8'?>\n<" + tag + ">\n  <actions/>\n  <timestamp>" + startTime + "</timestamp>\n"
+                + "  <startTime>" + startTime + "</startTime>\n  <result>ABORTED</result>\n  <duration>0</duration>\n"
+                + "  <charset>UTF-8</charset>\n  <keepLog>false</keepLog>\n  <completed>true</completed>\n</" + tag + ">";
+        BlobStore blobs = PersistenceStores.getBlobStore();
+        if (blobs != null) {
+            Path dir = Files.createTempDirectory("lost-build");
+            Path snapshot = Files.createTempFile("lost-build", ".tgz");
+            try {
+                Files.writeString(dir.resolve("log"), reason + "\nFinished: ABORTED\n", StandardCharsets.UTF_8);
+                try (OutputStream out = new GZIPOutputStream(Files.newOutputStream(snapshot))) {
+                    new FilePath(dir.toFile()).tar(out, new DirScanner.Glob("**", null, false));
+                } catch (InterruptedException e) {
+                    throw (IOException) new InterruptedIOException().initCause(e);
+                }
+                try (InputStream in = Files.newInputStream(snapshot)) {
+                    blobs.put(base + "/" + LOST_SNAPSHOT, in, Files.size(snapshot));
+                }
+            } finally {
+                Files.deleteIfExists(snapshot);
+                Util.deleteRecursive(dir.toFile());
+            }
+        }
+        try {
+            seen(base + "/" + RECORD, store.write(base + "/" + RECORD, record.getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT));
+            LOGGER.info(() -> "Closed " + job.getFullName() + " #" + number + " as aborted: " + reason);
+            writtenElsewhere(job, number); // this controller's own write raises no event here
+        } catch (ConflictException e) {
+            LOGGER.fine(() -> job.getFullName() + " #" + number + " was published meanwhile");
+            if (blobs != null && hasBlob(blobs, base + "/" + SNAPSHOT)) {
+                blobs.delete(base + "/" + LOST_SNAPSHOT); // its owner's real record and snapshot stand
+            } // else closed by another controller at the same time: its record goes with this stand-in (the same)
+        }
+    }
+
+    private static boolean hasBlob(BlobStore blobs, String key) throws IOException {
+        try (InputStream in = blobs.get(key)) {
+            return in != null;
+        }
+    }
+
+    @CheckForNull
+    private static Class<?> buildClassOf(Job<?, ?> job) {
+        for (Class<?> c = job.getClass(); c != null; c = c.getSuperclass()) {
+            try {
+                java.lang.reflect.Method m = c.getDeclaredMethod("getBuildClass");
+                m.setAccessible(true);
+                return (Class<?>) m.invoke(job);
+            } catch (NoSuchMethodException e) {
+                // look further up
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                return null;
+            }
+        }
+        if (job instanceof jenkins.model.lazy.LazyBuildMixIn.LazyLoadingJob<?, ?> lazy) {
+            try {
+                java.lang.reflect.Method m = jenkins.model.lazy.LazyBuildMixIn.class.getDeclaredMethod("getBuildClass");
+                m.setAccessible(true);
+                return (Class<?>) m.invoke(lazy.getLazyBuildMixIn());
+            } catch (ReflectiveOperationException | RuntimeException e) {
+                return null;
+            }
+        }
+        return null;
     }
 
     /**
@@ -569,6 +764,9 @@ public final class BuildRecords {
         if (blobs != null) {
             snapshot = blobs.get(base + "/" + SNAPSHOT);
             if (snapshot == null) {
+                snapshot = blobs.get(base + "/" + LOST_SNAPSHOT); // closed as lost: only the stand-in
+            }
+            if (snapshot == null) {
                 // a record is stored only once its snapshot is: the snapshot is moving (a rename in progress), so the
                 // build is left unmaterialized rather than taken as complete without its files; it is retrieved again
                 // once the move is applied. (A record stored before a blob store was configured would stay hidden.)
@@ -646,9 +844,11 @@ public final class BuildRecords {
                     return; // deleted since; the deletion event follows
                 }
                 LOGGER.fine(() -> "Refreshing " + job.getFullName() + " #" + number + " changed elsewhere");
-                writeRecord(dir, record.content());
-                seen(builds + "/" + number + "/" + RECORD, record.version());
+                // its files may have changed too (a later snapshot): drop the local copy, materialised again when next needed
                 runs.unload(number);
+                Util.deleteRecursive(dir);
+                Files.createDirectories(dir.toPath());
+                runs.recognizeNumber(number);
             } else {
                 LOGGER.fine(() -> "Recognizing " + job.getFullName() + " #" + number + " completed elsewhere");
                 Files.createDirectories(dir.toPath());

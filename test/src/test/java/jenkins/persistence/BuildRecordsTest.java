@@ -424,6 +424,101 @@ class BuildRecordsTest {
     }
 
     @Test
+    void fileAddedToACompletedBuildIsRepublished() throws Exception {
+        FreeStyleProject p = project(r, "late");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p);
+        java.nio.file.Files.writeString(new java.io.File(b.getRootDir(), "late.txt").toPath(), "added later");
+        hudson.model.AsyncPeriodicWork.all().get(BuildRecords.LateFiles.class).execute(hudson.model.TaskListener.NULL);
+        wipeAndReload(r);
+        b = r.jenkins.getItemByFullName("late", FreeStyleProject.class).getBuildByNumber(1);
+        assertEquals("added later", java.nio.file.Files.readString(new java.io.File(b.getRootDir(), "late.txt").toPath()));
+    }
+
+    @Test
+    void lateFilesKeepAnEditMadeElsewhere() throws Exception {
+        FreeStyleProject p = project(r, "edited-late");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p);
+        String key = "jobs/edited-late/builds/1/build.xml";
+        // another controller edits the completed build (its description), and this one has not applied that yet
+        // (written as this controller, so that it is never applied here)
+        STORE.write(key, record(key).replace("<keepLog>", "<description>set elsewhere</description><keepLog>")
+                .getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        Files.writeString(new File(b.getRootDir(), "late.txt").toPath(), "added later");
+        hudson.model.AsyncPeriodicWork.all().get(BuildRecords.LateFiles.class).execute(hudson.model.TaskListener.NULL);
+        assertThat(record(key), containsString("set elsewhere"));
+        assertThat(record(key), containsString("files updated"));
+    }
+
+    @Test
+    void deletedJobIsDroppedFromTheLateFilesSweep() throws Exception {
+        FreeStyleProject p = project(r, "gone");
+        r.buildAndAssertSuccess(p);
+        assertTrue(BuildRecords.recentlyPublished.keySet().stream().anyMatch(k -> k.startsWith("jobs/gone/")));
+        p.delete();
+        hudson.model.AsyncPeriodicWork.all().get(BuildRecords.LateFiles.class).execute(hudson.model.TaskListener.NULL);
+        assertTrue(BuildRecords.recentlyPublished.keySet().stream().noneMatch(k -> k.startsWith("jobs/gone/")), "not republished every minute");
+    }
+
+    @Test
+    void buildNothingCouldResumeIsClosedAsAborted() throws Exception {
+        FreeStyleProject p = project(r, "lost");
+        r.buildAndAssertSuccess(p);
+        BuildRecords.publishLost(p, 2, System.currentTimeMillis(), "It was running on a controller which is gone.");
+        assertNotNull(record("jobs/lost/builds/2/build.xml"));
+        assertNull(BLOBS.get("jobs/lost/builds/2/files.tgz"), "the stand-in has a key of its own");
+        assertEquals(hudson.model.Result.ABORTED, p.getBuildByNumber(2).getResult(), "the publishing controller lists it too");
+        wipeAndReload(r);
+        FreeStyleBuild lost = r.jenkins.getItemByFullName("lost", FreeStyleProject.class).getBuildByNumber(2);
+        assertNotNull(lost);
+        assertEquals(hudson.model.Result.ABORTED, lost.getResult());
+        assertThat(lost.getLog(), org.hamcrest.Matchers.containsString("a controller which is gone"));
+    }
+
+    @Test
+    void lateFilesDoNotBringBackABuildDeletedElsewhere() throws Exception {
+        FreeStyleProject p = project(r, "deleted-late");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p);
+        String key = "jobs/deleted-late/builds/1/build.xml";
+        // another controller deletes the build, and this one has not applied that yet (deleted as this controller, so
+        // that it is never applied here)
+        STORE.delete(key, PersistenceStore.ANY);
+        Files.writeString(new File(b.getRootDir(), "late.txt").toPath(), "added later");
+        hudson.model.AsyncPeriodicWork.all().get(BuildRecords.LateFiles.class).execute(hudson.model.TaskListener.NULL);
+        assertNull(record(key), "not brought back");
+        assertNull(BLOBS.get("jobs/deleted-late/builds/1/files.tgz"));
+    }
+
+    @Test
+    void aBuildClosedByTwoControllersAtOnceKeepsItsConsole() throws Exception {
+        FreeStyleProject p = project(r, "lost-twice");
+        r.buildAndAssertSuccess(p);
+        String key = "jobs/lost-twice/builds/2/build.xml";
+        long start = System.currentTimeMillis();
+        String reason = "It was running on a controller which is gone.";
+        // another controller closes it too, its record written once this one found none
+        afterRead = k -> {
+            if (k.equals(key)) {
+                afterRead = null;
+                try {
+                    BuildRecords.publishLost(p, 2, start, reason);
+                } catch (IOException e) {
+                    throw new AssertionError(e);
+                }
+            }
+        };
+        try {
+            BuildRecords.publishLost(p, 2, start, reason);
+        } finally {
+            afterRead = null;
+        }
+        assertNotNull(BLOBS.get("jobs/lost-twice/builds/2/lost.tgz"), "the stand-in of the record that stands is kept");
+        wipeAndReload(r);
+        FreeStyleBuild lost = r.jenkins.getItemByFullName("lost-twice", FreeStyleProject.class).getBuildByNumber(2);
+        assertEquals(hudson.model.Result.ABORTED, lost.getResult());
+        assertThat(lost.getLog(), containsString("a controller which is gone"));
+    }
+
+    @Test
     void renameMovesRecordsAndSnapshots() throws Exception {
         FreeStyleProject p = project(r, "before");
         r.buildAndAssertSuccess(p);

@@ -158,6 +158,13 @@ class RunningBuildsTest {
         assertThat(wc.goTo("job/remote/api/json?tree=actions[builds[number,controller]]", "application/json").getWebResponse().getContentAsString(),
                 containsString("{\"controller\":\"jenkins-a\",\"number\":2}"));
         assertThat(wc.goTo("job/remote/").asNormalizedText(), containsString("#2 on jenkins-a"));
+        assertEquals(hudson.model.BallColor.BLUE_ANIME, p.getIconColor(), "the job shows as building");
+        String history = wc.goTo("job/remote/buildHistory/ajax").getWebResponse().getContentAsString();
+        assertThat("the build list shows it", history, containsString("Running on jenkins-a"));
+        assertThat(history, containsString("running-elsewhere/stop?number=2"));
+        // its links answer here too (no owner routing in core): the build, running there
+        assertThat(wc.goTo("job/remote/2/").asNormalizedText(), containsString("Running on controller jenkins-a"));
+        assertThat(wc.goTo("job/remote/2/console").asNormalizedText(), containsString("This build runs on controller jenkins-a"));
 
         // the other controller completes it: record first, then the placeholder goes
         try (InputStream snapshot = BLOBS.get("jobs/remote/builds/1/files.tgz")) {
@@ -167,6 +174,7 @@ class RunningBuildsTest {
         other.write("jobs/remote/builds/2/build.xml", STORE.read("jobs/remote/builds/1/build.xml").content(), PersistenceStore.ABSENT);
         awaitApplied();
         assertEquals(List.of(), elsewhere(p), "hidden once the completed record is known");
+        assertEquals(hudson.model.BallColor.BLUE, p.getIconColor());
         assertEquals(2, p.getLastBuild().getNumber());
 
         other.delete("jobs/remote/running/2.xml", PersistenceStore.ANY);

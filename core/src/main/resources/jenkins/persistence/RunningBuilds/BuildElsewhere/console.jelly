@@ -1,0 +1,14 @@
+<?jelly escape-by-default='true'?>
+<!-- the console of a build running on another controller of a cluster (cloud-native Jenkins) -->
+<j:jelly xmlns:j="jelly:core" xmlns:st="jelly:stapler" xmlns:l="/lib/layout">
+  <l:layout title="${it.displayName}">
+    <l:header>
+      <meta http-equiv="refresh" content="5" />
+    </l:header>
+    <st:include page="sidepanel.jelly" it="${it.job}" />
+    <l:main-panel>
+      <l:app-bar title="${%Console}" />
+      <p>${%elsewhere(it.placeholder.controller)}</p>
+    </l:main-panel>
+  </l:layout>
+</j:jelly>
