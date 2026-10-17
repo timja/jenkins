@@ -178,7 +178,13 @@ public abstract class Telemetry implements ExtensionPoint {
         return components;
     }
 
-    @ClusterSingleton // acts on shared state: once per cluster of controllers sharing it
+    /**
+     * Reports once per cluster of controllers sharing state: the correlator, which the service tells instances apart
+     * by, is shared, so a report from each controller would be taken as several from one instance. A trial
+     * collecting observations made on each controller (requests served, say) reports only those of the controller that
+     * runs it that day.
+     */
+    @ClusterSingleton
     @Extension
     public static class TelemetryReporter extends AsyncPeriodicWork {
 

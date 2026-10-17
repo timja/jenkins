@@ -48,7 +48,9 @@ import org.kohsuke.accmod.restrictions.NoExternalUse;
  *
  * <p>Runs on every controller, since each keeps its own {@link FileFingerprintStorage}. When periodic work is
  * coordinated across controllers sharing state ({@link PeriodicWorkCoordinator}), a fingerprint storage other than
- * files, shared by them, is cleaned by {@link Shared} instead, once per cluster.
+ * files, shared by them, is cleaned by {@link Shared} instead, once per cluster. Such a storage is taken to be the
+ * same external service on every controller, since its configuration is shared state too; one local to each
+ * controller is not supported there, as only the controller running {@link Shared} would clean it.
  *
  * @author Kohsuke Kawaguchi
  */
@@ -107,6 +109,8 @@ public class FingerprintCleanupThread extends AsyncPeriodicWork {
 
     /**
      * Cleans a fingerprint storage shared by controllers, once per cluster, when periodic work is coordinated.
+     * Any storage other than files is taken to be shared then: the same external service, configured alike on every
+     * controller (the configuration is shared state).
      */
     @ClusterSingleton // acts on shared state: once per cluster of controllers sharing it
     @Extension
