@@ -132,6 +132,8 @@ public interface PersistenceStore {
     /**
      * Receives every change made through any instance of the store, including this one, in the order they were made.
      * Implementations deliver events at least once and must not lose them across reconnects.
+     * Listeners should not throw; one which does is logged, and neither stops the others getting the event nor makes
+     * the change that caused it fail.
      *
      * @return a handle which unsubscribes when closed
      */

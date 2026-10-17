@@ -39,6 +39,8 @@ import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
 
@@ -51,6 +53,8 @@ import org.kohsuke.accmod.restrictions.Beta;
  */
 @Restricted(Beta.class)
 public class InMemoryPersistenceStore implements PersistenceStore {
+
+    private static final Logger LOGGER = Logger.getLogger(InMemoryPersistenceStore.class.getName());
 
     private final Predicate<String> owns;
     private final InMemoryPersistenceStore root;
@@ -129,7 +133,12 @@ public class InMemoryPersistenceStore implements PersistenceStore {
                         return;
                     }
                     for (Consumer<ChangeEvent> l : listeners) {
-                        l.accept(e);
+                        try {
+                            l.accept(e);
+                        } catch (RuntimeException | LinkageError x) {
+                            // the change is made: the other listeners still get it, and the caller is not told it failed
+                            LOGGER.log(Level.WARNING, "A listener failed to handle " + e, x);
+                        }
                     }
                 }
             } finally {
