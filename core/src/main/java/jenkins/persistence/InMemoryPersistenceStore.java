@@ -186,7 +186,12 @@ public class InMemoryPersistenceStore implements PersistenceStore {
                         return;
                     }
                     for (Consumer<ClusterQueue.Record> l : queueListeners) {
-                        l.accept(r);
+                        try {
+                            l.accept(r);
+                        } catch (RuntimeException | LinkageError x) {
+                            // as for changes to keys: the others still get it, and the change does not fail
+                            LOGGER.log(Level.WARNING, "A listener failed to handle " + r, x);
+                        }
                     }
                 }
             } finally {
