@@ -428,7 +428,7 @@ class BuildLeasesTest {
         String key = "jobs/handed-here/running/1.xml";
         // another controller, alive, ran it and handed it over to this one: released, marked handed over
         long theirs = dead.leases().acquire(key);
-        dead.write(key, placeholder("dead-controller", 1, theirs, "savePoint=4\nhandedOver=" + System.currentTimeMillis() + "\n"), PersistenceStore.ABSENT);
+        dead.write(key, placeholder("dead-controller", 1, theirs, "x.savePoint=4\nx.handedOver=" + System.currentTimeMillis() + "\n"), PersistenceStore.ABSENT);
         dead.leases().release(key, theirs);
         assertTrue(RunningBuilds.takeOver(p, 1));
         assertEquals(List.of("handed-here#1@savePoint=4"), Adopter.prepared);
