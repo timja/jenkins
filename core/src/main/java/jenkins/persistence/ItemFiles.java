@@ -94,7 +94,17 @@ public final class ItemFiles {
     /** What was last shared or taken here, per item key: path → checksum. */
     private static final Map<String, Map<String, String>> known = new java.util.concurrent.ConcurrentHashMap<>();
 
+    /**
+     * One take or publication of a directory at a time, by its key: of two takes at once, the one of the older manifest
+     * could otherwise finish last, leaving its files and baseline here while the store has newer ones.
+     */
+    private static final Map<String, Object> locks = new java.util.concurrent.ConcurrentHashMap<>();
+
     private ItemFiles() {}
+
+    private static Object lock(String itemKey) {
+        return locks.computeIfAbsent(itemKey, k -> new Object());
+    }
 
     /** For tests: as a controller that never shared or took an item's files (another JVM). */
     static void forgetForTests() {
@@ -163,6 +173,12 @@ public final class ItemFiles {
         if (store == null || blobs == null || itemKey == null) {
             return;
         }
+        synchronized (lock(itemKey)) {
+            publish(dir, store, blobs, itemKey);
+        }
+    }
+
+    private static void publish(File dir, PersistenceStore store, BlobStore blobs, String itemKey) throws IOException {
         Map<String, String> local = scan(dir, itemKey, store);
         Map<String, String> last = last(dir, itemKey);
         if (local.equals(last)) {
@@ -171,9 +187,14 @@ public final class ItemFiles {
         for (Map.Entry<String, String> f : local.entrySet()) {
             if (!f.getValue().equals(last.get(f.getKey()))) {
                 Path p = dir.toPath().resolve(f.getKey());
-                try (InputStream in = Files.newInputStream(p)) {
-                    blobs.put(itemKey + "/" + BLOBS + "/" + f.getValue(), in, Files.size(p));
+                // read once and checked against what was scanned: a file rewritten since is not stored under the old
+                // checksum (it is shared with the next publication)
+                byte[] content = Files.size(p) <= MAX_SIZE ? Files.readAllBytes(p) : null;
+                if (content == null || !sha256(content).equals(f.getValue())) {
+                    LOGGER.fine(() -> f.getKey() + " of " + itemKey + " changed while it was shared; sharing it next time");
+                    return;
                 }
+                blobs.put(itemKey + "/" + BLOBS + "/" + f.getValue(), new java.io.ByteArrayInputStream(content), content.length);
             }
         }
         String config = itemKey + "/config.xml";
@@ -217,6 +238,12 @@ public final class ItemFiles {
         if (store == null || blobs == null || itemKey == null) {
             return;
         }
+        synchronized (lock(itemKey)) {
+            take(dir, store, blobs, itemKey);
+        }
+    }
+
+    private static void take(File dir, PersistenceStore store, BlobStore blobs, String itemKey) throws IOException {
         Map<String, String> shared = parse(store.read(itemKey + "/" + MANIFEST));
         Map<String, String> last = last(dir, itemKey);
         if (shared.isEmpty() && !known.containsKey(itemKey)) {
@@ -328,8 +355,12 @@ public final class ItemFiles {
     }
 
     private static String sha256(Path f) throws IOException {
+        return sha256(Files.readAllBytes(f));
+    }
+
+    private static String sha256(byte[] content) {
         try {
-            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(f)));
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(content));
         } catch (NoSuchAlgorithmException e) {
             throw new AssertionError(e);
         }
@@ -373,16 +404,21 @@ public final class ItemFiles {
             }
             dir = item.getRootDir();
         }
+        takeOrLater(dir);
+    }
+
+    /** Takes the shared files of a directory, or, failing that, has the {@link Publisher} take them. */
+    private static void takeOrLater(File dir) {
         try {
             take(dir);
             failed.remove(dir);
         } catch (IOException | RuntimeException e) {
-            LOGGER.log(Level.WARNING, "Could not take the shared files of " + key + "; trying again with the next publication", e);
+            LOGGER.log(Level.WARNING, "Could not take the shared files of " + dir + "; trying again with the next publication", e);
             failed.add(dir);
         }
     }
 
-    /** Directories whose shared files could not be taken when they changed elsewhere: taken again by the {@link Publisher}. */
+    /** Directories whose shared files could not be taken (at startup, or when they changed elsewhere): taken again by the {@link Publisher}. */
     private static final Set<File> failed = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     /** A fresh home takes every item's shared files. */
@@ -398,21 +434,50 @@ public final class ItemFiles {
                 jenkins.util.Timer.get().submit(() -> changedElsewhere(e.key()));
             }
         });
+        takeEvery();
+    }
+
+    /** Takes every item's and user's shared files; those that cannot be taken now are taken by the {@link Publisher}. */
+    static void takeEvery() {
         for (Item item : Jenkins.get().allItems()) {
             if (item instanceof AbstractItem) {
-                try {
-                    take(item);
-                } catch (IOException | RuntimeException e) {
-                    LOGGER.log(Level.WARNING, "Could not take the shared files of " + item.getFullName(), e);
-                }
+                takeOrLater(item.getRootDir());
             }
         }
         for (File dir : userDirs()) {
-            try {
-                take(dir);
-            } catch (IOException | RuntimeException e) {
-                LOGGER.log(Level.WARNING, "Could not take the shared files of " + dir, e);
+            takeOrLater(dir);
+        }
+    }
+
+    /**
+     * Removes the shared files of a user deleted here, as for a deleted item: a user made again with the same id (whose
+     * directory has the same name) takes none of them.
+     */
+    @Restricted(NoExternalUse.class)
+    public static void userDeleted(@NonNull File dir) {
+        PersistenceStore store = PersistenceStores.get();
+        String userKey = PersistenceStores.keyFor(dir);
+        if (store == null || userKey == null) {
+            return;
+        }
+        known.remove(userKey);
+        if (PersistenceStores.isApplyingRemoteChange()) {
+            return; // deleted elsewhere: that controller removes them
+        }
+        removeShared(store, userKey, dir.getName());
+    }
+
+    private static void removeShared(PersistenceStore store, String key, String what) {
+        BlobStore blobs = PersistenceStores.getBlobStore();
+        try {
+            if (store.read(key + "/" + MANIFEST) != null) {
+                store.delete(key + "/" + MANIFEST, PersistenceStore.ANY);
+                if (blobs != null) {
+                    blobs.delete(key + "/" + BLOBS);
+                }
             }
+        } catch (IOException | RuntimeException e) {
+            LOGGER.log(Level.WARNING, "Could not remove the shared files of " + what, e);
         }
     }
 
@@ -442,7 +507,6 @@ public final class ItemFiles {
         @Override
         public void onDeleted(Item item) {
             PersistenceStore store = PersistenceStores.get();
-            BlobStore blobs = PersistenceStores.getBlobStore();
             String itemKey = PersistenceStores.keyFor(item.getRootDir());
             if (store == null || itemKey == null) {
                 return;
@@ -451,15 +515,18 @@ public final class ItemFiles {
             if (PersistenceStores.isApplyingRemoteChange()) {
                 return; // deleted elsewhere: that controller removes them
             }
-            try {
-                if (store.read(itemKey + "/" + MANIFEST) != null) {
-                    store.delete(itemKey + "/" + MANIFEST, PersistenceStore.ANY);
-                    if (blobs != null) {
-                        blobs.delete(itemKey + "/" + BLOBS);
-                    }
-                }
-            } catch (IOException | RuntimeException e) {
-                LOGGER.log(Level.WARNING, "Could not remove the shared files of " + item.getFullName(), e);
+            removeShared(store, itemKey, item.getFullName());
+        }
+
+        /**
+         * An item created elsewhere takes its shared files once loaded here: a manifest applied before the item was (its
+         * creation behind here) found no item to take them for.
+         */
+        @Override
+        public void onCreated(Item item) {
+            if (enabled() && item instanceof AbstractItem && PersistenceStores.isApplyingRemoteChange()) {
+                File dir = item.getRootDir();
+                jenkins.util.Timer.get().submit(() -> takeOrLater(dir));
             }
         }
 

@@ -55,11 +55,26 @@ class ItemFilesTest {
                 failGet = null;
                 throw new java.io.UncheckedIOException(new java.io.IOException("the blob store is unreachable, this time"));
             }
+            java.util.function.Consumer<String> hook = beforeGet;
+            if (hook != null) {
+                hook.accept(key);
+            }
             return super.get(key);
+        }
+
+        @Override
+        public void put(String key, java.io.InputStream content, long length) throws java.io.IOException {
+            java.util.function.Consumer<String> hook = beforePut;
+            if (hook != null) {
+                hook.accept(key);
+            }
+            super.put(key, content, length);
         }
     };
     /** A blob whose next read fails. */
     static volatile String failGet;
+    /** While set, run as a blob is read or stored, before it is. */
+    static volatile java.util.function.Consumer<String> beforeGet, beforePut;
 
     @BeforeEach
     void enable() {
@@ -69,6 +84,8 @@ class ItemFilesTest {
     @AfterEach
     void disable() {
         System.clearProperty(ItemFiles.class.getName() + ".enabled");
+        beforeGet = null;
+        beforePut = null;
     }
 
     @Test
@@ -232,6 +249,136 @@ class ItemFilesTest {
                 manifest("jobs/retried/item-files.json").replace(sha256("v1".getBytes(StandardCharsets.UTF_8)), sha256(v2)).getBytes(StandardCharsets.UTF_8),
                 PersistenceStore.ANY);
         ItemFiles.changedElsewhere("jobs/retried/item-files.json");
+        assertNull(failGet, "it could not be taken");
+        assertEquals("v1", Files.readString(state));
+        new ItemFiles.Publisher().execute(hudson.model.TaskListener.NULL);
+        assertEquals("v2", Files.readString(state), "taken with the next publication");
+    }
+
+    @Test
+    void aFileRewrittenWhileItIsSharedIsNotStoredUnderTheChecksumOfWhatWasScanned(JenkinsRule r) throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("rewritten");
+        Path state = p.getRootDir().toPath().resolve("state.txt");
+        Files.writeString(state, "v1");
+        beforePut = key -> {
+            try {
+                Files.writeString(state, "v2, written by the plugin meanwhile");
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        };
+        ItemFiles.publish(p);
+        beforePut = null;
+        String sha1 = sha256("v1".getBytes(StandardCharsets.UTF_8));
+        try (java.io.InputStream in = BLOBS.get("jobs/rewritten/item-files/" + sha1)) {
+            assertNotNull(in);
+            assertEquals(sha1, sha256(in.readAllBytes()), "the blob holds what its name says");
+        }
+        ItemFiles.publish(p);
+        assertTrue(manifest("jobs/rewritten/item-files.json").contains(sha256("v2, written by the plugin meanwhile".getBytes(StandardCharsets.UTF_8))),
+                "the new content is shared next");
+    }
+
+    @Test
+    void ofTwoTakesAtOnceTheNewerManifestStays(JenkinsRule r) throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("overlapping");
+        Path state = p.getRootDir().toPath().resolve("state.txt");
+        Files.writeString(state, "v1");
+        ItemFiles.publish(p);
+        String v1 = manifest("jobs/overlapping/item-files.json");
+        byte[] v2 = "v2".getBytes(StandardCharsets.UTF_8);
+        byte[] v3 = "v3".getBytes(StandardCharsets.UTF_8);
+        BLOBS.put("jobs/overlapping/item-files/" + sha256(v2), new java.io.ByteArrayInputStream(v2), v2.length);
+        BLOBS.put("jobs/overlapping/item-files/" + sha256(v3), new java.io.ByteArrayInputStream(v3), v3.length);
+        String oldSha = sha256("v1".getBytes(StandardCharsets.UTF_8));
+        // (with this controller's origin, so the store listener does not take them too; they are taken below as if elsewhere)
+        STORE.write("jobs/overlapping/item-files.json", v1.replace(oldSha, sha256(v2)).getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        java.util.concurrent.CountDownLatch reading = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        String v2Blob = "jobs/overlapping/item-files/" + sha256(v2);
+        beforeGet = key -> {
+            if (key.equals(v2Blob)) {
+                reading.countDown();
+                try {
+                    release.await(30, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        };
+        Thread first = new Thread(() -> ItemFiles.changedElsewhere("jobs/overlapping/item-files.json"));
+        first.start();
+        assertTrue(reading.await(30, java.util.concurrent.TimeUnit.SECONDS), "the take of v2 reads its blob");
+        STORE.write("jobs/overlapping/item-files.json", v1.replace(oldSha, sha256(v3)).getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        Thread second = new Thread(() -> ItemFiles.changedElsewhere("jobs/overlapping/item-files.json"));
+        second.start();
+        // the take of v3 waits for the one of v2 (or, were they not made one at a time, finishes first)
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
+        while (second.isAlive() && second.getState() != Thread.State.BLOCKED && System.nanoTime() < deadline) {
+            Thread.sleep(10);
+        }
+        release.countDown();
+        first.join(30_000);
+        second.join(30_000);
+        assertEquals("v3", Files.readString(state), "the newer manifest's file");
+        long version = STORE.read("jobs/overlapping/item-files.json").version();
+        ItemFiles.publish(p);
+        assertEquals(version, STORE.read("jobs/overlapping/item-files.json").version(), "and its baseline: nothing to share back");
+    }
+
+    @Test
+    void theFilesOfADeletedUserGoWithIt(JenkinsRule r) throws Exception {
+        hudson.model.User bob = hudson.model.User.getById("bob", true);
+        bob.save();
+        java.io.File dir = bob.getUserFolder();
+        Files.writeString(dir.toPath().resolve("avatar.png"), "bob's");
+        new ItemFiles.Publisher().execute(hudson.model.TaskListener.NULL);
+        String key = PersistenceStores.keyFor(dir);
+        assertNotNull(manifest(key + "/item-files.json"));
+        bob.delete();
+        assertNull(manifest(key + "/item-files.json"));
+        assertNull(BLOBS.get(key + "/item-files/" + sha256("bob's".getBytes(StandardCharsets.UTF_8))));
+        // someone else given the id later, in the same directory, takes none of them
+        hudson.model.User other = hudson.model.User.getById("bob", true);
+        other.save();
+        assertEquals(dir, other.getUserFolder());
+        ItemFiles.take(other.getUserFolder());
+        assertFalse(Files.exists(dir.toPath().resolve("avatar.png")));
+    }
+
+    @Test
+    void anItemCreatedElsewhereTakesItsFilesSharedBeforeItWasLoadedHere(JenkinsRule r) throws Exception {
+        byte[] content = "made elsewhere".getBytes(StandardCharsets.UTF_8);
+        BLOBS.put("jobs/late/item-files/" + sha256(content), new java.io.ByteArrayInputStream(content), content.length);
+        // the manifest applied before the item is loaded here (with this controller's origin: as if applied already, with
+        // no item to take it for)
+        STORE.write("jobs/late/item-files.json", ("{\"state.txt\":\"" + sha256(content) + "\"}").getBytes(StandardCharsets.UTF_8),
+                PersistenceStore.ABSENT);
+        STORE.as("other-controller").write("jobs/late/config.xml",
+                "<?xml version='1.1' encoding='UTF-8'?><project/>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+        Path state = r.jenkins.getRootDir().toPath().resolve("jobs/late/state.txt");
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
+        while (!Files.exists(state) && System.nanoTime() < deadline) {
+            Thread.sleep(50);
+        }
+        assertNotNull(r.jenkins.getItem("late"));
+        assertEquals("made elsewhere", Files.readString(state));
+    }
+
+    @Test
+    void filesThatCouldNotBeTakenAtStartupAreTakenLater(JenkinsRule r) throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("booted");
+        Path state = p.getRootDir().toPath().resolve("state.txt");
+        Files.writeString(state, "v1");
+        ItemFiles.publish(p);
+        byte[] v2 = "v2".getBytes(StandardCharsets.UTF_8);
+        BLOBS.put("jobs/booted/item-files/" + sha256(v2), new java.io.ByteArrayInputStream(v2), v2.length);
+        // (with this controller's origin, so the store listener does not take it; it is taken below as at startup)
+        STORE.write("jobs/booted/item-files.json",
+                manifest("jobs/booted/item-files.json").replace(sha256("v1".getBytes(StandardCharsets.UTF_8)), sha256(v2)).getBytes(StandardCharsets.UTF_8),
+                PersistenceStore.ANY);
+        failGet = "jobs/booted/item-files/" + sha256(v2);
+        ItemFiles.takeEvery();
         assertNull(failGet, "it could not be taken");
         assertEquals("v1", Files.readString(state));
         new ItemFiles.Publisher().execute(hudson.model.TaskListener.NULL);

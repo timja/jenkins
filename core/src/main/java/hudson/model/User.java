@@ -939,6 +939,7 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
         if (route != null) {
             route.delete();
         }
+        jenkins.persistence.ItemFiles.userDeleted(getUserFolderFor(id)); // and its shared plugin files: a user made again with this id takes none
         Util.deleteRecursive(getUserFolderFor(id));
         UserDetailsCache.get().invalidate(idKey);
     }
@@ -1290,6 +1291,7 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
             }
             File dir = new File(getUsersDirectory(), dirName);
             if (!dirName.equals(".") && !dirName.equals("..") && getUsersDirectory().equals(dir.getParentFile())) {
+                jenkins.persistence.ItemFiles.userDeleted(dir); // what was shared of it is forgotten here
                 try {
                     Util.deleteRecursive(dir); // its local copy too: nothing here brings it back
                 } catch (IOException e) {
