@@ -665,6 +665,14 @@ public final class RunningBuilds {
                 // completed: its record is published only once it has, and its owner was gone before removing this
                 return false;
             }
+            Run<?, ?> local = BuildRecords.loadedCopy(job, number);
+            if (local != null && local.isLogUpdated()) {
+                // a copy still running here (lost to the owner now gone, and not stopped yet): not adopted over it, which
+                // would leave two; the next sweep tries again
+                throw new IOException(job.getFullName() + " #" + number + " still runs here; adopting it once it has stopped");
+            } else if (local != null) {
+                BuildRecords.forgetLocalCopy(job, number); // a stale copy (lost here before): the adopted build replaces it
+            }
             Placeholder p = Placeholder.fromBytes(key, number, entry.content(), entry.version());
             BuildAdopter.Adoption adoption = p == null ? null : prepare(job, p);
             if (adoption == null) {

@@ -616,6 +616,13 @@ public final class BuildRecords {
         forgetLocalCopy(job, number);
     }
 
+    /** This controller's copy of a build, if loaded. */
+    @CheckForNull
+    static Run<?, ?> loadedCopy(@NonNull Job<?, ?> job, int number) {
+        RunMap<?> runs = runsOf(job);
+        return runs == null ? null : runs.getLoadedBuilds().get(number);
+    }
+
     /** Drops this controller's copy of a build: the loaded object, and its directory. */
     static void forgetLocalCopy(@NonNull Job<?, ?> job, int number) throws IOException {
         RunMap<?> runs = runsOf(job);

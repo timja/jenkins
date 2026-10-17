@@ -347,6 +347,45 @@ class BuildLeasesTest {
         forget("overtaken");
     }
 
+    @Test
+    void aBuildStillRunningHereIsNotAdoptedOverIt() throws Exception {
+        CountDownLatch started = new CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicBoolean released = new java.util.concurrent.atomic.AtomicBoolean();
+        FreeStyleProject p = r.createFreeStyleProject("stubborn");
+        p.getBuildersList().add(new TestBuilder() {
+            @Override
+            public boolean perform(AbstractBuild<?, ?> build, Launcher launcher, BuildListener listener) {
+                started.countDown();
+                while (!released.get()) { // slow to stop, as a step that ignores interruption is
+                    try {
+                        Thread.sleep(50);
+                    } catch (InterruptedException e) {
+                        // carries on
+                    }
+                }
+                return true;
+            }
+        });
+        QueueTaskFuture<FreeStyleBuild> f = p.scheduleBuild2(0);
+        assertTrue(started.await(60, TimeUnit.SECONDS));
+        String key = "jobs/stubborn/running/1.xml";
+        try {
+            // taken over by another controller, which then went away, while the copy here still runs
+            live = Set.of("dead-controller");
+            long theirs = dead.leases().acquire(key);
+            dead.write(key, placeholder("dead-controller", 1, theirs, ""), PersistenceStore.ANY);
+            live = Set.of(STORE.getOrigin());
+            RunningBuilds.removeStale();
+            assertEquals(List.of(), Adopter.prepared, "not adopted over the copy running here");
+            assertThat("left for a later sweep", text(key), containsString("origin=dead-controller"));
+        } finally {
+            released.set(true);
+            live = null;
+        }
+        f.get(60, TimeUnit.SECONDS);
+        forget("stubborn");
+    }
+
     /** Removes what a test left in the store, which outlives it, so that later tests neither load nor sweep it. */
     private static void forget(String... jobs) throws java.io.IOException {
         for (String job : jobs) {
