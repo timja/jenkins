@@ -38,6 +38,7 @@ import java.io.File;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.Collection;
 import java.util.List;
@@ -45,6 +46,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -78,8 +80,10 @@ public final class PersistenceStores {
     public static /* non-final for script console */ String CONFLICTS = SystemProperties.getString(PersistenceStores.class.getName() + ".conflicts", "warn");
 
     private static volatile PersistenceStore testingStore;
+    private static volatile BlobStore testingBlobStore;
     private static volatile Jenkins resolvedFor;
     private static volatile PersistenceStore resolvedStore;
+    private static volatile BlobStore resolvedBlobStore;
 
     private static final Map<String, Long> versions = new ConcurrentHashMap<>();
     /**
@@ -116,6 +120,8 @@ public final class PersistenceStores {
             // and threads holding it (instantiating extensions) may themselves read XmlFiles and get here.
             ExtensionList<PersistenceStoreProvider> providers = ExtensionList.lookup(PersistenceStoreProvider.class);
             providers.size();
+            ExtensionList<BlobStoreProvider> blobProviders = ExtensionList.lookup(BlobStoreProvider.class);
+            blobProviders.size();
             synchronized (PersistenceStores.class) {
                 if (resolvedFor != j) {
                     PersistenceStore store = null;
@@ -126,7 +132,18 @@ public final class PersistenceStores {
                             break;
                         }
                     }
+                    BlobStore blobs = null;
+                    if (store != null) {
+                        for (BlobStoreProvider provider : blobProviders) {
+                            blobs = provider.create();
+                            if (blobs != null) {
+                                LOGGER.info(() -> "Using blob store " + provider.getClass().getName());
+                                break;
+                            }
+                        }
+                    }
                     resolvedStore = store;
+                    resolvedBlobStore = blobs;
                     versions.clear();
                     elements.clear();
                     resolvedFor = j;
@@ -136,6 +153,18 @@ public final class PersistenceStores {
         } finally {
             RESOLVING.remove();
         }
+    }
+
+    /**
+     * The active blob store, or null if none is configured.
+     * Only available while a {@link #get persistence store} is active.
+     */
+    @CheckForNull
+    public static BlobStore getBlobStore() {
+        if (testingStore != null) {
+            return testingBlobStore;
+        }
+        return get() == null ? null : resolvedBlobStore;
     }
 
     /** Set while this thread applies a change made by another controller. */
@@ -252,11 +281,17 @@ public final class PersistenceStores {
     }
 
     /**
-     * Moves the stored entries below one directory to another, as when an item is renamed or moved.
+     * Moves the stored entries (and blobs) below one directory to another, as when an item is renamed or moved.
      * Does nothing if no store is active or the directories are outside {@code JENKINS_HOME}.
      *
-     * @throws ConflictException if something is already stored at the destination, or the item's configuration is no
-     *     longer stored at the source (moved or deleted elsewhere)
+     * <p>The source and destination are claimed first, which excludes other moves of, to, into or out of them, on any
+     * controller. It does not exclude an item created at the destination while the move runs: should that item complete a
+     * build before the move fails (on finding it there), its snapshots can be overwritten by the moved ones, or moved back
+     * to the source with them.
+     *
+     * @throws ConflictException if something is already stored at the destination, the item's configuration is no
+     *     longer stored at the source (moved or deleted elsewhere), or another move holds either, or what holds them
+     *     (a folder being moved), or something in the source
      */
     public static void move(@NonNull File from, @NonNull File to) throws IOException {
         PersistenceStore store = get();
@@ -272,8 +307,142 @@ public final class PersistenceStores {
             // the entries would be moved below themselves (or over what holds them), and could not be moved back
             throw new IllegalArgumentException("Cannot move " + fromKey + " to " + toKey);
         }
-        List<PersistenceStore.Moved> moved = store.move(fromKey, toKey);
-        checkItemMoved(store, fromKey, toKey, moved);
+        // the destination is claimed first, so that no other move to it (on any controller) runs between checking it
+        // and moving there: blobs, moved before the entries, cannot be atomic with that check. The source too, so that
+        // two controllers moving the same item to two places do not split its blobs and entries between them. Moves of
+        // a folder and of something in it claim different keys: each looks for the other's claim once it holds its own
+        long claim = claim(store, toKey, fromKey);
+        try {
+            long sourceClaim = claim(store, fromKey, fromKey);
+            try {
+                checkNoOverlappingMove(store, fromKey, toKey);
+                moveClaimed(store, fromKey, toKey);
+            } finally {
+                release(store, fromKey, sourceClaim);
+            }
+        } finally {
+            release(store, toKey, claim);
+        }
+    }
+
+    private static void release(PersistenceStore store, String key, long claim) {
+        try {
+            store.delete(key + MOVING, claim);
+        } catch (IOException | RuntimeException e) {
+            LOGGER.log(Level.WARNING, "Could not release the claim on " + key + "; it lapses", e);
+        }
+    }
+
+    /** Suffix of the entry a move claims its destination with, next to (not below) the destination. */
+    static final String MOVING = ".moving";
+
+    /** A claim this old was left by a move that never finished (its controller died): it may be taken over. */
+    static final long CLAIM_LAPSE_MILLIS = TimeUnit.MINUTES.toMillis(10);
+
+    /**
+     * Fails if another move holds a claim on what holds either key (a folder being moved), or on something below the
+     * source (an item in the folder being moved). Each move looks only once it holds its own claims, so of two such
+     * moves at least one sees the other.
+     */
+    private static void checkNoOverlappingMove(PersistenceStore store, String fromKey, String toKey) throws IOException {
+        Set<String> ancestors = new TreeSet<>();
+        for (String key : List.of(fromKey, toKey)) {
+            for (int i = key.indexOf('/'); i > 0; i = key.indexOf('/', i + 1)) {
+                ancestors.add(key.substring(0, i));
+            }
+        }
+        for (String ancestor : ancestors) {
+            checkNotClaimed(store, ancestor + MOVING);
+        }
+        checkNothingClaimedBelow(store, fromKey);
+    }
+
+    private static void checkNothingClaimedBelow(PersistenceStore store, String prefix) throws IOException {
+        Set<String> children = store.children(prefix);
+        boolean item = children.contains("config.xml");
+        for (String child : children) {
+            if (child.endsWith(MOVING)) {
+                checkNotClaimed(store, prefix + "/" + child);
+            } else if (!(item && child.equals("builds"))) { // build records hold no items
+                checkNothingClaimedBelow(store, prefix + "/" + child);
+            }
+        }
+    }
+
+    private static void checkNotClaimed(PersistenceStore store, String claimKey) throws IOException {
+        PersistenceStore.Entry held = store.read(claimKey);
+        if (held != null && !lapsed(held)) {
+            throw new ConflictException(claimKey, PersistenceStore.ABSENT, held.version()); // another move overlaps this one
+        }
+    }
+
+    /** Whether a claim was left by a move that never finished (its controller died), and may be taken over. */
+    private static boolean lapsed(PersistenceStore.Entry held) {
+        String[] parts = new String(held.content(), StandardCharsets.UTF_8).split(" ", 2);
+        long since;
+        try {
+            since = Long.parseLong(parts[0]);
+        } catch (NumberFormatException x) {
+            since = 0;
+        }
+        return System.currentTimeMillis() - since >= CLAIM_LAPSE_MILLIS;
+    }
+
+    /** Claims a destination (or source) for a move, with a create-only write; returns the claim's version. */
+    private static long claim(PersistenceStore store, String toKey, String fromKey) throws IOException {
+        byte[] claim = (System.currentTimeMillis() + " " + store.getOrigin() + " " + fromKey).getBytes(StandardCharsets.UTF_8);
+        for (int attempt = 0; attempt < 3; attempt++) {
+            try {
+                return store.write(toKey + MOVING, claim, PersistenceStore.ABSENT);
+            } catch (ConflictException e) {
+                PersistenceStore.Entry held = store.read(toKey + MOVING);
+                if (held == null) {
+                    continue; // released meanwhile
+                }
+                if (!lapsed(held)) {
+                    throw new ConflictException(toKey, PersistenceStore.ABSENT, held.version()); // another move goes there now
+                }
+                LOGGER.warning(() -> "Taking over a lapsed claim on " + toKey + " (" + new String(held.content(), StandardCharsets.UTF_8) + ")");
+                try {
+                    store.delete(toKey + MOVING, held.version());
+                } catch (ConflictException x) {
+                    // taken over or released by someone else meanwhile: try again
+                }
+            }
+        }
+        throw new ConflictException(toKey, PersistenceStore.ABSENT, PersistenceStore.ANY);
+    }
+
+    private static void moveClaimed(PersistenceStore store, String fromKey, String toKey) throws IOException {
+        if (store.read(toKey) != null || !store.children(toKey).isEmpty()) {
+            // checked before touching blobs, which would otherwise overwrite those of whatever is at the destination
+            throw new ConflictException(toKey, PersistenceStore.ABSENT, PersistenceStore.ANY);
+        }
+        String config = fromKey + "/config.xml";
+        if (store.owns(config) && store.read(config) == null) {
+            // moved or deleted elsewhere, which this controller has not applied yet: checked before touching blobs too
+            throw new ConflictException(config, PersistenceStore.ANY, PersistenceStore.ABSENT);
+        }
+        BlobStore blobs = getBlobStore();
+        List<PersistenceStore.Moved> moved;
+        try {
+            // blobs first: moving the entries tells other controllers, which may then look for the blobs at the new
+            // location. A blob move may fail partway: what it moved is moved back below
+            if (blobs != null) {
+                blobs.move(fromKey, toKey);
+            }
+            moved = store.move(fromKey, toKey);
+            checkItemMoved(store, fromKey, toKey, moved);
+        } catch (IOException | RuntimeException e) {
+            if (blobs != null) {
+                try {
+                    blobs.move(toKey, fromKey);
+                } catch (IOException | RuntimeException x) {
+                    e.addSuppressed(x);
+                }
+            }
+            throw e;
+        }
         // the moved entries have new versions: take them as seen where this JVM had seen the entry as it was moved, so
         // that the moved item's next save is still checked for conflicts; where it had seen an older version (changed
         // elsewhere since), keep that older one, so that the next save conflicts and merges as it would have unmoved
@@ -562,7 +731,13 @@ public final class PersistenceStores {
 
     @Restricted(NoExternalUse.class)
     public static void setForTesting(@CheckForNull PersistenceStore store) {
+        setForTesting(store, null);
+    }
+
+    @Restricted(NoExternalUse.class)
+    public static void setForTesting(@CheckForNull PersistenceStore store, @CheckForNull BlobStore blobs) {
         testingStore = store;
+        testingBlobStore = blobs;
         versions.clear();
         elements.clear();
         conflicts.set(0);

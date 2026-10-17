@@ -124,6 +124,19 @@ public interface PersistenceStore {
     record Moved(@NonNull String from, long fromVersion, @NonNull String to, long version) {}
 
     /**
+     * Whether completed builds of a job are shared through this store, as described in {@link BuildRecords}.
+     * Their records ({@code <jobKey>/builds/<N>/build.xml}) are written directly, never routed,
+     * so a store must not {@linkplain #owns own} those keys.
+     * Sharing builds needs one sequence of build numbers: the store must also own {@code <jobKey>/nextBuildNumber},
+     * otherwise builds are not shared.
+     *
+     * @param jobKey the key of the job's directory, such as {@code jobs/folder/jobs/job}
+     */
+    default boolean storesBuildRecords(@NonNull String jobKey) {
+        return false;
+    }
+
+    /**
      * Identifies this store instance (and so this controller) as the origin of the changes it makes.
      */
     @NonNull
