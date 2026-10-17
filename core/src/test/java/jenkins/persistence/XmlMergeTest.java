@@ -177,6 +177,30 @@ class XmlMergeTest {
     }
 
     @Test
+    void attributeValuesReadBackUnchanged() throws Exception {
+        String base = """
+                <?xml version='1.1' encoding='UTF-8'?>
+                <project note="a&#10;b&#9;c&#x1;&gt;">
+                  <properties tag="d&#13;e&#x85;">
+                    <one>1</one>
+                    <two>2</two>
+                  </properties>
+                  <disabled>false</disabled>
+                </project>""";
+        String mine = base.replace("<one>1<", "<one>uno<");
+        String theirs = base.replace("<two>2<", "<two>dos<").replace("<disabled>false<", "<disabled>true<");
+        XmlMerge.Result r = XmlMerge.merge(b(base), b(mine), b(theirs));
+        assertNotNull(r);
+        assertEquals(0, r.conflicts());
+        org.w3c.dom.Element root = javax.xml.parsers.DocumentBuilderFactory.newInstance().newDocumentBuilder()
+                .parse(new java.io.ByteArrayInputStream(r.merged())).getDocumentElement();
+        assertEquals("a\nb\tc\u0001>", root.getAttribute("note"), s(r.merged()));
+        org.w3c.dom.Element properties = (org.w3c.dom.Element) root.getElementsByTagName("properties").item(0);
+        assertEquals("d\re\u0085", properties.getAttribute("tag"), s(r.merged()));
+        assertTrue(s(r.merged()).contains("<one>uno</one>") && s(r.merged()).contains("<two>dos</two>"), s(r.merged()));
+    }
+
+    @Test
     void notMergeable() {
         assertNull(XmlMerge.merge(b(BASE), b("not xml"), b(BASE)));
         assertNull(XmlMerge.merge(b(BASE), b(BASE), b("<other/>")), "different root");
