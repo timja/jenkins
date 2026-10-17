@@ -43,16 +43,20 @@ import hudson.slaves.OfflineCause;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import jenkins.persistence.PersistenceStores;
 import jenkins.util.SystemProperties;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
@@ -138,7 +142,7 @@ public class Nodes implements PersistenceRoot {
             NodeListener.fireOnDeleted(deletedNode);
             var nodeName = deletedNode.getNodeName();
             LOGGER.fine(() -> "deleting " + new File(getRootDir(), nodeName));
-            Util.deleteRecursive(new File(getRootDir(), nodeName));
+            deleteNodeDir(nodeName);
         }
     }
 
@@ -294,7 +298,7 @@ public class Nodes implements PersistenceRoot {
             updateNode(newOne, false);
             if (!newOne.getNodeName().equals(oldOne.getNodeName())) {
                 LOGGER.fine(() -> "deleting " + new File(getRootDir(), oldOne.getNodeName()));
-                Util.deleteRecursive(new File(getRootDir(), oldOne.getNodeName()));
+                deleteNodeDir(oldOne.getNodeName());
             }
             Queue.withLock(() -> {
                 jenkins.updateComputers(newOne);
@@ -328,7 +332,7 @@ public class Nodes implements PersistenceRoot {
             });
             // no need for a full save() so we just do the minimum
             LOGGER.fine(() -> "deleting " + new File(getRootDir(), node.getNodeName()));
-            Util.deleteRecursive(new File(getRootDir(), node.getNodeName()));
+            deleteNodeDir(node.getNodeName());
 
             if (match.get()) {
                 jenkins.updateComputers(node);
@@ -337,6 +341,18 @@ public class Nodes implements PersistenceRoot {
             NodeListener.fireOnDeleted(node);
             SaveableListener.fireOnDeleted(node, getConfigFile(node));
         }
+    }
+
+    /**
+     * Deletes a node's directory, and its configuration from a persistence store sharing it, so that it sees the deletion.
+     * The local configuration goes with the directory, which is only unlinked if it is a symbolic link.
+     */
+    private void deleteNodeDir(String nodeName) throws IOException {
+        PersistenceStores.Route route = PersistenceStores.route(getConfigFile(nodeName).getPath());
+        if (route != null) {
+            route.delete();
+        }
+        Util.deleteRecursive(new File(getRootDir(), nodeName));
     }
 
     @Override
@@ -373,9 +389,14 @@ public class Nodes implements PersistenceRoot {
      */
     public void load() throws IOException {
         final File nodesDir = getRootDir();
-        final File[] subdirs = nodesDir.listFiles(File::isDirectory);
+        final File[] localDirs = nodesDir.listFiles(File::isDirectory);
+        // nodes may also exist only in a persistence store shared with other controllers
+        final Set<File> subdirs = new TreeSet<>(localDirs == null ? List.of() : Arrays.asList(localDirs));
+        for (String name : PersistenceStores.storedItemNames(nodesDir)) {
+            subdirs.add(new File(nodesDir, name));
+        }
         final Map<String, Node> newNodes = new TreeMap<>();
-        if (subdirs != null) {
+        {
             for (File subdir : subdirs) {
                 try {
                     load(subdir, newNodes);

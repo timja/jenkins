@@ -75,6 +75,7 @@ import jenkins.model.IdStrategy;
 import jenkins.model.Jenkins;
 import jenkins.model.Loadable;
 import jenkins.model.ModelObjectWithContextMenu;
+import jenkins.persistence.PersistenceStores;
 import jenkins.scm.RunWithSCM;
 import jenkins.search.SearchGroup;
 import jenkins.security.HMACConfidentialKey;
@@ -909,6 +910,13 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
     public void delete() throws IOException {
         String idKey = idStrategy().keyFor(id);
         AllUsers.remove(id);
+        // from a persistence store too, if it holds users: deleting only the directory would leave the user there for
+        // every other controller (and for this one once restarted); the local files go with the directory, which is
+        // only unlinked if it is a symbolic link (XmlFile.delete would delete the file it links to)
+        PersistenceStores.Route route = PersistenceStores.route(getConfigFile().getPath());
+        if (route != null) {
+            route.delete();
+        }
         Util.deleteRecursive(getUserFolderFor(id));
         UserDetailsCache.get().invalidate(idKey);
     }
@@ -1122,9 +1130,12 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
             DIRNAMES.createMac(); // force the key to be saved during startup
             var instance = getInstance();
             instance.migrateUserIdMapper();
-            var subdirectories = getUsersDirectory().listFiles();
-            if (subdirectories == null) {
-                return;
+            var usersDirectory = getUsersDirectory();
+            var localDirectories = usersDirectory.listFiles();
+            // users may also exist only in a persistence store shared with other controllers
+            var subdirectories = new java.util.TreeSet<File>(localDirectories == null ? List.of() : Arrays.asList(localDirectories));
+            for (String name : PersistenceStores.storedItemNames(usersDirectory)) {
+                subdirectories.add(new File(usersDirectory, name));
             }
             var byName = instance.byName;
             var idStrategy = idStrategy();
@@ -1155,6 +1166,9 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
                     LOGGER.warning(() -> "ignoring " + xml + " with <id> " + user.id + " expected to be in " + expectedFolderName);
                     continue;
                 }
+                // a user stored only in the persistence store has a folder here too, as one made here would: it is
+                // where its other files go, and what lets it be deleted
+                Util.createDirectories(dir.toPath());
                 user.fixUpAfterLoad();
                 var old = byName.put(idStrategy.keyFor(user.id), user);
                 if (old != null) {
