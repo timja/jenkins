@@ -44,7 +44,6 @@ import hudson.model.listeners.RunListener;
 import hudson.model.queue.CauseOfBlockage;
 import hudson.model.queue.FoldableAction;
 import hudson.model.queue.QueueListener;
-import hudson.model.queue.ScheduleResult;
 import hudson.security.ACL;
 import hudson.security.ACLContext;
 import hudson.util.DaemonThreadFactory;
@@ -778,7 +777,8 @@ public final class SharedQueue {
             worker.setDaemon(true);
         }
 
-        @Initializer(after = InitMilestone.JOB_CONFIG_ADAPTED)
+        /** Once the queue is loaded, which clears it first (and would drop items mirrored before). */
+        @Initializer(after = InitMilestone.JOB_CONFIG_ADAPTED, requires = Queue.LOADED)
         public static synchronized void start() throws IOException {
             stop();
             ClusterQueue cq = queue();
@@ -910,11 +910,8 @@ public final class SharedQueue {
             know(r);
             Ids.MIRRORED.set(r.id());
             try {
-                ScheduleResult result = PersistenceStores.applyingRemoteChange(
-                        () -> Queue.getInstance().schedule2(task, quietPeriod, fromXml(r.actions())));
-                if (result.getItem() != null && result.getItem().getId() != r.id()) {
-                    LOGGER.warning(() -> "Queue item " + r.id() + " folded into local item " + result.getItem().getId() + " instead of being mirrored");
-                }
+                // never folded here: records the shared queue kept apart stay apart
+                PersistenceStores.applyingRemoteChange(() -> Queue.getInstance().scheduleShared(task, quietPeriod, fromXml(r.actions())));
             } finally {
                 Ids.MIRRORED.remove();
             }

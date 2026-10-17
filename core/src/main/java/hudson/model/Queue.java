@@ -824,6 +824,27 @@ public class Queue extends ResourceController implements Saveable {
     }
 
     /**
+     * Adds an item of a queue shared with other controllers, as mirrored from another controller: as a new item, never
+     * folded into one here (the shared queue decided which requests fold; the local queue's folding cannot see
+     * everything that decided it), and with no {@link QueueDecisionHandler} asked (the controller it was scheduled on did).
+     * Its id is whichever the {@link QueueIdStrategy} gives it.
+     */
+    @Restricted(NoExternalUse.class)
+    public @NonNull WaitingItem scheduleShared(@NonNull Task p, int quietPeriod, @NonNull List<Action> actions) {
+        lock.lock();
+        try { try {
+            Calendar due = new GregorianCalendar();
+            due.add(Calendar.SECOND, quietPeriod);
+            WaitingItem added = new WaitingItem(due, p, actions);
+            added.enter(this);
+            scheduleMaintenance();
+            return added;
+        } finally { updateSnapshot(); } } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
      * Cancels the item with this id wherever it is in this controller's queue now: an {@link Item} captured earlier is
      * stale once the item moved on (from waiting to blocked or buildable), and cancelling it would miss.
      *
@@ -3367,9 +3388,16 @@ public class Queue extends ResourceController implements Saveable {
     }
 
     /**
+     * The milestone attained once {@link #init} restored the queue: whatever adds items at startup should require it,
+     * as loading clears the queue first.
+     */
+    @Restricted(NoExternalUse.class)
+    public static final String LOADED = "hudson.model.Queue.loaded";
+
+    /**
      * Restores the queue content during the start up.
      */
-    @Initializer(after = JOB_CONFIG_ADAPTED)
+    @Initializer(after = JOB_CONFIG_ADAPTED, attains = LOADED)
     public static void init(Jenkins h) {
         Queue queue = h.getQueue();
         Item[] items = queue.getItems();
