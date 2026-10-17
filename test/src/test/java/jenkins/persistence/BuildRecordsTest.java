@@ -56,6 +56,7 @@ import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.function.Consumer;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
@@ -86,6 +87,11 @@ class BuildRecordsTest {
         }
 
         @Override
+        public Set<String> liveOrigins() {
+            return live;
+        }
+
+        @Override
         public Entry read(String key) {
             Entry e = super.read(key);
             Consumer<String> hook = afterRead;
@@ -96,6 +102,8 @@ class BuildRecordsTest {
         }
     };
     static volatile Consumer<String> afterRead;
+    /** Origins the store reports as alive; null means membership is not tracked. */
+    static volatile Set<String> live;
     static final InMemoryBlobStore BLOBS = new InMemoryBlobStore() {
         @Override
         public void move(String fromPrefix, String toPrefix) {
@@ -422,6 +430,40 @@ class BuildRecordsTest {
         p.renameTo("abandoned");
         assertNotNull(record("jobs/abandoned/builds/1/build.xml"));
         assertNull(STORE.read("jobs/abandoned.moving"));
+    }
+
+    @Test
+    void aClaimLapsesWhenItsControllerIsGoneHoweverOld() throws Exception {
+        FreeStyleProject p = project(r, "slow-claimer");
+        r.buildAndAssertSuccess(p);
+        long old = System.currentTimeMillis() - PersistenceStores.CLAIM_LAPSE_MILLIS - 1000;
+        STORE.as("slow").write("jobs/slow-dest.moving", (old + " slow jobs/x").getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+        live = Set.of(STORE.getOrigin(), "slow");
+        try {
+            // a move that has taken longer than the lapse is still going on
+            assertThrows(ConflictException.class, () -> p.renameTo("slow-dest"));
+            assertEquals("slow-claimer", p.getName());
+            // a claim however recent, of a controller that is gone
+            STORE.delete("jobs/slow-dest.moving", PersistenceStore.ANY);
+            STORE.as("dead").write("jobs/slow-dest.moving", (System.currentTimeMillis() + " dead jobs/x").getBytes(StandardCharsets.UTF_8),
+                    PersistenceStore.ABSENT);
+            p.renameTo("slow-dest");
+            assertNotNull(record("jobs/slow-dest/builds/1/build.xml"));
+            assertNull(STORE.read("jobs/slow-dest.moving"));
+        } finally {
+            live = null;
+        }
+    }
+
+    @Test
+    void aClaimOfThisControllerThatNoMoveHoldsIsTakenOver() throws Exception {
+        FreeStyleProject p = project(r, "own-claimer");
+        r.buildAndAssertSuccess(p);
+        // left by a move here whose release failed
+        STORE.write("jobs/own-dest.moving", (System.currentTimeMillis() + " " + STORE.getOrigin() + " jobs/x").getBytes(StandardCharsets.UTF_8),
+                PersistenceStore.ABSENT);
+        p.renameTo("own-dest");
+        assertNotNull(record("jobs/own-dest/builds/1/build.xml"));
     }
 
     @Test
