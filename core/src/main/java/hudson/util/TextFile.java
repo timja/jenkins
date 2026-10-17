@@ -33,11 +33,18 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.RandomAccessFile;
 import java.io.Reader;
+import java.io.StringReader;
 import java.io.StringWriter;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import java.util.stream.Stream;
+import jenkins.persistence.PersistenceStore;
+import jenkins.persistence.PersistenceStores;
+import jenkins.persistence.StoredBuildNumberAssigner;
 
 /**
  * Represents a text file.
@@ -55,10 +62,23 @@ public class TextFile {
     }
 
     public boolean exists() {
+        PersistenceStores.Route route = PersistenceStores.route(file);
+        if (route != null) {
+            try {
+                return route.exists();
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "Failed to check whether " + route.key() + " exists", e);
+                return false;
+            }
+        }
         return file.exists();
     }
 
     public void delete() throws IOException {
+        PersistenceStores.Route route = PersistenceStores.route(file);
+        if (route != null) {
+            route.delete();
+        }
         Files.deleteIfExists(Util.fileToPath(file));
     }
 
@@ -68,7 +88,7 @@ public class TextFile {
     public String read() throws IOException {
         StringWriter out = new StringWriter();
         PrintWriter w = new PrintWriter(out);
-        try (BufferedReader in = Files.newBufferedReader(Util.fileToPath(file), StandardCharsets.UTF_8)) {
+        try (BufferedReader in = openReader()) {
             String line;
             while ((line = in.readLine()) != null)
                 w.println(line);
@@ -90,6 +110,9 @@ public class TextFile {
      */
     @NonNull
     public Stream<String> lines() throws IOException {
+        if (PersistenceStores.route(file) != null) {
+            return openReader().lines();
+        }
         return Files.lines(Util.fileToPath(file));
     }
 
@@ -98,6 +121,13 @@ public class TextFile {
      */
     public void write(String text) throws IOException {
         Util.createDirectories(Util.fileToPath(file.getParentFile()));
+        PersistenceStores.Route route = PersistenceStores.route(file);
+        if (route != null) {
+            if (!StoredBuildNumberAssigner.writeNoLower(route, text)) {
+                route.write(text.getBytes(StandardCharsets.UTF_8));
+            }
+            return;
+        }
         try (AtomicFileWriter w = new AtomicFileWriter(file)) {
             try {
                 w.write(text);
@@ -114,7 +144,7 @@ public class TextFile {
     public @NonNull String head(int numChars) throws IOException {
         char[] buf = new char[numChars];
         int read = 0;
-        try (Reader r = new FileReader(file)) {
+        try (Reader r = PersistenceStores.route(file) != null ? openReader() : new FileReader(file)) {
             while (read < numChars) {
                 int d = r.read(buf, read, buf.length - read);
                 if (d < 0)
@@ -157,6 +187,12 @@ public class TextFile {
      * So all in all, this algorithm should work decently, and it works quite efficiently on a large text.
      */
     public @NonNull String fastTail(int numChars, Charset cs) throws IOException {
+        PersistenceStores.Route route = PersistenceStores.route(file);
+        if (route != null) {
+            // stored content is small: decode all of it
+            String all = cs.decode(java.nio.ByteBuffer.wrap(readStored(route))).toString();
+            return all.substring(Math.max(0, all.length() - numChars));
+        }
 
         try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
             long len = raf.length();
@@ -190,4 +226,25 @@ public class TextFile {
     public String toString() {
         return file.toString();
     }
+
+    /**
+     * Opens the content as UTF-8, from the {@link jenkins.persistence.PersistenceStore} if it serves this file.
+     */
+    private BufferedReader openReader() throws IOException {
+        PersistenceStores.Route route = PersistenceStores.route(file);
+        if (route == null) {
+            return Files.newBufferedReader(Util.fileToPath(file), StandardCharsets.UTF_8);
+        }
+        return new BufferedReader(new StringReader(new String(readStored(route), StandardCharsets.UTF_8)));
+    }
+
+    private byte[] readStored(PersistenceStores.Route route) throws IOException {
+        PersistenceStore.Entry entry = route.read();
+        if (entry == null) {
+            throw new NoSuchFileException(file.toString(), null, "not found in persistence store as " + route.key());
+        }
+        return entry.content();
+    }
+
+    private static final Logger LOGGER = Logger.getLogger(TextFile.class.getName());
 }
