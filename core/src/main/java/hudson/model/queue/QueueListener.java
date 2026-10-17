@@ -70,7 +70,8 @@ public abstract class QueueListener implements ExtensionPoint {
 
     /**
      * The item has left the queue, either by getting {@link Queue#cancel(Item) cancelled} or by getting
-     * picked up by an executor and starts running.
+     * picked up by an executor and starts running, or because another controller sharing the queue took it
+     * ({@link LeftItem#isTakenElsewhere()}).
      */
     public void onLeft(LeftItem li) {}
 
