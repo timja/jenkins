@@ -131,7 +131,11 @@ public interface ClusterQueue {
     @NonNull
     List<Record> pending() throws IOException;
 
-    /** Receives every change of any record, in order, including this controller's own. */
+    /**
+     * Receives every change of any record, in order, including this controller's own.
+     * Listeners should not throw; one which does is logged, and neither stops the others getting the change nor makes
+     * the change fail.
+     */
     @NonNull
     AutoCloseable subscribe(@NonNull Consumer<Record> listener);
 }

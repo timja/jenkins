@@ -70,6 +70,21 @@ class InMemoryPersistenceStoreTest {
     }
 
     @Test
+    void aQueueListenerFailingDoesNotStopTheOthersNorTheChange() throws Exception {
+        InMemoryPersistenceStore store = new InMemoryPersistenceStore(key -> true);
+        ClusterQueue cq = store.clusterQueue();
+        cq.subscribe(r -> {
+            throw new IllegalStateException("broken listener");
+        });
+        List<Long> delivered = new ArrayList<>();
+        cq.subscribe(r -> delivered.add(r.id()));
+        long id = cq.nextId();
+        cq.publish(new ClusterQueue.Record(id, "j", "j", "", 0, ClusterQueue.State.WAITING, store.getOrigin(), null, null, 0));
+        assertEquals(List.of(id), delivered);
+        assertEquals(id, cq.get(id).id());
+    }
+
+    @Test
     void queueChangesAreDeliveredInTheOrderMade() throws Exception {
         InMemoryPersistenceStore store = new InMemoryPersistenceStore(key -> true);
         ClusterQueue cq = store.clusterQueue();
