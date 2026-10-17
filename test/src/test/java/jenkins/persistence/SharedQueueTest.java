@@ -737,6 +737,40 @@ class SharedQueueTest {
     }
 
     @Test
+    void anItemWaitingElsewhereAtStartupIsMirroredOnceTheQueueIsLoaded() throws Throwable {
+        r.createFreeStyleProject("waiting-at-startup");
+        ClusterQueue.Record rec = publishElsewhere("waiting-at-startup", 600_000, "bea");
+        // not in the queue this controller saves: only the mirror can bring it back after the restart
+        assertTrue(PersistenceStores.applyingRemoteChange(() -> Queue.getInstance().cancelLocal(rec.id())));
+        r.restart(); // loading the queue clears it first: the mirror starts after that
+        awaitMirrored();
+        assertNotNull(Queue.getInstance().getLocalItem(rec.id()), "mirrored at startup, and kept");
+        other.cancel(rec.id()); // the store outlives this test
+    }
+
+    @Test
+    void recordsKeptApartInTheStoreAreMirroredApart() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("mirrored-apart");
+        long[] ids = new long[2];
+        String[] what = {"a", "b"};
+        for (int i = 0; i < 2; i++) {
+            // e.g. two controllers' build steps scheduled it at once
+            List<Action> actions = List.of(new CauseAction(new Cause.UserIdCause("step-" + what[i])), new Folds(what[i]));
+            ids[i] = other.nextId();
+            other.publish(new ClusterQueue.Record(ids[i], "mirrored-apart", SharedQueue.dedupKey(p, actions), SharedQueue.toXml(actions),
+                    System.currentTimeMillis() + 60_000, ClusterQueue.State.WAITING, "other-controller", null, null, 0));
+        }
+        awaitMirrored();
+        for (int i = 0; i < 2; i++) {
+            Queue.Item local = Queue.getInstance().getLocalItem(ids[i]);
+            assertNotNull(local, "mirrored as an item of its own");
+            assertEquals(1, local.getActions(Folds.class).size());
+            assertEquals(what[i], local.getActions(Folds.class).get(0).what);
+            other.cancel(ids[i]); // the store outlives this test
+        }
+    }
+
+    @Test
     void dedupKeysAreUnambiguousAndKeepSensitiveValuesOut() throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("keys");
         String one = SharedQueue.dedupKey(p, List.of(new ParametersAction(new StringParameterValue("a", "x\nb=y"))));
