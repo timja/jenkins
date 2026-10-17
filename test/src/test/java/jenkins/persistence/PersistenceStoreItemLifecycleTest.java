@@ -170,7 +170,7 @@ class PersistenceStoreItemLifecycleTest {
         try {
             assertThrows(ConflictException.class, () -> p.setDescription("here"));
         } finally {
-            PersistenceStores.CONFLICTS = "warn";
+            PersistenceStores.CONFLICTS = "refuse";
         }
     }
 
@@ -185,7 +185,7 @@ class PersistenceStoreItemLifecycleTest {
         try {
             assertThrows(ConflictException.class, () -> p.setDescription("here"), "not taken as seen by the move");
         } finally {
-            PersistenceStores.CONFLICTS = "warn";
+            PersistenceStores.CONFLICTS = "refuse";
         }
     }
 
@@ -300,7 +300,7 @@ class PersistenceStoreItemLifecycleTest {
             // as a save resolving the old name would
             assertThrows(ConflictException.class, () -> old.write("<project/>".getBytes(StandardCharsets.UTF_8)));
         } finally {
-            PersistenceStores.CONFLICTS = "warn";
+            PersistenceStores.CONFLICTS = "refuse";
         }
     }
 
