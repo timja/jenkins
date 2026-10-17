@@ -25,20 +25,27 @@
 package jenkins.persistence;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeFalse;
 
+import hudson.Functions;
 import hudson.Util;
 import hudson.model.User;
 import hudson.security.HudsonPrivateSecurityRealm;
 import hudson.slaves.DumbSlave;
 import java.io.File;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
 import java.util.Set;
 import jenkins.model.GlobalConfiguration;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.TestExtension;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
@@ -111,6 +118,48 @@ class StaticStateRoutingTest {
         r.jenkins.removeNode(r.jenkins.getNode("agent-x"));
         assertNull(STORE.read("nodes/agent-x/config.xml"), "deletion reached the store");
         assertNull(agent.toComputer());
+    }
+
+    @Test
+    void deletingAUserWhoseDirectoryIsALinkLeavesWhatItLinksTo(JenkinsRule r, @TempDir Path elsewhere) throws Exception {
+        assumeFalse(Functions.isWindows(), "symbolic links need a privilege on Windows");
+        HudsonPrivateSecurityRealm realm = new HudsonPrivateSecurityRealm(false, false, null);
+        r.jenkins.setSecurityRealm(realm);
+        realm.createAccount("carol", "carol-password-1");
+        Path dir = User.getById("carol", false).getUserFolder().toPath();
+        Path target = linkElsewhere(dir, elsewhere);
+
+        User.getById("carol", false).delete();
+
+        assertFalse(Files.exists(dir, LinkOption.NOFOLLOW_LINKS), "the link is removed");
+        assertTrue(Files.isRegularFile(target.resolve("config.xml")), "what it links to is left alone");
+        assertTrue(STORE.children("users").stream().noneMatch(n -> n.startsWith("carol_")), "deleted from the store");
+    }
+
+    @Test
+    void deletingANodeWhoseDirectoryIsALinkLeavesWhatItLinksTo(JenkinsRule r, @TempDir Path elsewhere) throws Exception {
+        assumeFalse(Functions.isWindows(), "symbolic links need a privilege on Windows");
+        r.createSlave("agent-l", null, null);
+        Path dir = new File(r.jenkins.getRootDir(), "nodes/agent-l").toPath();
+        Path target = linkElsewhere(dir, elsewhere);
+
+        r.jenkins.removeNode(r.jenkins.getNode("agent-l"));
+
+        assertFalse(Files.exists(dir, LinkOption.NOFOLLOW_LINKS), "the link is removed");
+        assertTrue(Files.isRegularFile(target.resolve("config.xml")), "what it links to is left alone");
+        assertNull(STORE.read("nodes/agent-l/config.xml"), "deleted from the store");
+    }
+
+    /**
+     * Moves a directory elsewhere and puts a symbolic link to it in its place, with a local copy of the configuration
+     * there (as one materialized for a reader of the file).
+     */
+    private static Path linkElsewhere(Path dir, Path elsewhere) throws Exception {
+        Path target = elsewhere.resolve(dir.getFileName().toString());
+        Files.move(dir, target);
+        Files.createSymbolicLink(dir, target);
+        Files.writeString(target.resolve("config.xml"), "<local-copy/>");
+        return target;
     }
 
     @Test
