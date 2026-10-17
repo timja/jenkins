@@ -283,6 +283,11 @@ public final class BuildRecords {
         RunningBuilds.Placeholder lease = PersistenceStores.get().leases() == null ? null : RunningBuilds.ownedPlaceholder(run);
         // uploaded under a name of its own first, which a controller that lost the build cannot put over the owner's
         String upload = lease == null ? SNAPSHOT : SNAPSHOT + "." + lease.getEpoch();
+        if (filesChanged) {
+            // files added to the build elsewhere since this copy was last in sync are kept in what it publishes, whichever
+            // way it is published (a save here before the change elsewhere is applied, late files)
+            addFilesAddedElsewhere(base, dir);
+        }
         // before the snapshot: a file added while it is made and uploaded then differs from this, and is published later
         String signature = signature(dir);
         BlobStore blobs = PersistenceStores.getBlobStore();
@@ -352,7 +357,16 @@ public final class BuildRecords {
                 content = (new String(content, StandardCharsets.UTF_8) + "\n<!-- files updated " + System.currentTimeMillis() + " -->")
                         .getBytes(StandardCharsets.UTF_8);
             }
-            publishRecord(lease, base + "/" + RECORD, content);
+            // over the record read above (or a later edit of it), when there is one: a build deleted elsewhere since is
+            // not brought back
+            Long version = stored != null ? writeOver(lease, base + "/" + RECORD, content, stored.version())
+                    : Long.valueOf(publishRecord(lease, base + "/" + RECORD, content, PersistenceStore.ANY));
+            if (version == null) {
+                discardSnapshot(base);
+                recentlyPublished.remove(base);
+                LOGGER.fine(() -> "Not publishing the record of " + run + " saved here: deleted elsewhere");
+                return;
+            }
             recentlyPublished.put(base, new Published(new java.lang.ref.WeakReference<>(run), signature, System.currentTimeMillis()));
             Manifest.write(dir, signature);
             // a save made while publishing found no record yet, so republish left it to this: include it
@@ -361,7 +375,13 @@ public final class BuildRecords {
                 if (Arrays.equals(now, published)) {
                     break;
                 }
-                publishRecord(lease, base + "/" + RECORD, now);
+                version = writeOver(lease, base + "/" + RECORD, now, version);
+                if (version == null) {
+                    discardSnapshot(base);
+                    recentlyPublished.remove(base);
+                    LOGGER.fine(() -> "Not publishing " + run + " further: deleted elsewhere");
+                    return;
+                }
                 published = now;
             }
         } catch (NoSuchFileException e) {
@@ -381,12 +401,39 @@ public final class BuildRecords {
         LOGGER.fine(() -> "Published " + run);
     }
 
-    /** Writes a build record, while holding the build's lease if it has one (the store checks it with the write). */
-    private static void publishRecord(@CheckForNull RunningBuilds.Placeholder lease, String key, byte[] content) throws IOException {
-        if (lease == null) {
-            seen(key, PersistenceStores.get().write(key, content, PersistenceStore.ANY));
-        } else {
-            seen(key, PersistenceStores.get().writeIfHeld(lease.getKey(), lease.getEpoch(), key, content, PersistenceStore.ANY));
+    /**
+     * Writes a build record, while holding the build's lease if it has one (the store checks it with the write).
+     *
+     * @return its new version
+     */
+    private static long publishRecord(@CheckForNull RunningBuilds.Placeholder lease, String key, byte[] content, long expected) throws IOException {
+        long version = lease == null ? PersistenceStores.get().write(key, content, expected)
+                : PersistenceStores.get().writeIfHeld(lease.getKey(), lease.getEpoch(), key, content, expected);
+        seen(key, version);
+        return version;
+    }
+
+    /**
+     * Writes a build record over the version expected, or over a later one if it changed meanwhile (as {@link #republish}
+     * does), but never brings it back once deleted.
+     *
+     * @return its new version, or null if it was deleted (elsewhere: this controller has not applied that yet)
+     */
+    @CheckForNull
+    private static Long writeOver(@CheckForNull RunningBuilds.Placeholder lease, String key, byte[] content, long expected) throws IOException {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return publishRecord(lease, key, content, expected);
+            } catch (ConflictException x) {
+                if (attempt == 5) {
+                    throw x;
+                }
+                PersistenceStore.Entry e = PersistenceStores.get().read(key);
+                if (e == null) {
+                    return null;
+                }
+                expected = e.version();
+            }
         }
     }
 
@@ -967,6 +1014,10 @@ public final class BuildRecords {
      * Adds to a build's directory the files of its shared snapshot that it lacks, and did not remove since it was last in
      * sync (its {@link Manifest}): files added to the build on another controller, which publishing this directory with
      * the files added here would otherwise drop. A file in both is kept as it is here.
+     *
+     * <p>Two controllers publishing files of one build at the same moment may still each put a snapshot without the
+     * other's file over the other's: accepted (eventual consistency, as for the last writer of a record), being rare (files
+     * added to one completed build on two controllers within one publication).
      */
     private static void addFilesAddedElsewhere(String base, File dir) throws IOException {
         BlobStore blobs = PersistenceStores.getBlobStore();
@@ -1102,8 +1153,7 @@ public final class BuildRecords {
             }
         }
         if (toPublish != null) {
-            // not under the lock: it downloads and uploads
-            addFilesAddedElsewhere(builds + "/" + number, dir);
+            // not under the lock: it downloads and uploads (keeping the files of the snapshot made elsewhere)
             publish(toPublish, true);
             runs.unload(number); // loaded again with the record as written elsewhere
         }

@@ -487,6 +487,71 @@ class BuildRecordsTest {
     }
 
     @Test
+    void aSaveHereWithFilesAddedKeepsTheFilesAddedElsewhere() throws Exception {
+        FreeStyleProject p = project(r, "saved-late");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p);
+        String key = "jobs/saved-late/builds/1/build.xml";
+        String snapshot = "jobs/saved-late/builds/1/files.tgz";
+        // another controller added a.txt to its copy and republished the build with it; this one has not applied that
+        // yet (the record marked as this controller, so that it is never applied here)
+        Path elsewhere = Files.createTempDirectory("elsewhere");
+        try {
+            try (InputStream in = BLOBS.get(snapshot)) {
+                new hudson.FilePath(elsewhere.toFile()).untarFrom(in, hudson.FilePath.TarCompression.GZIP);
+            }
+            Files.writeString(elsewhere.resolve("a.txt"), "added elsewhere");
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (java.io.OutputStream out = new GZIPOutputStream(bytes)) {
+                new hudson.FilePath(elsewhere.toFile()).tar(out, "**");
+            }
+            BLOBS.put(snapshot, new ByteArrayInputStream(bytes.toByteArray()), bytes.size());
+        } finally {
+            Util.deleteRecursive(elsewhere.toFile());
+        }
+        STORE.write(key, (record(key) + "\n<!-- files updated 1 -->").getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        // here b.txt is added, and the build saved
+        Files.writeString(new File(b.getRootDir(), "b.txt").toPath(), "added here");
+        b.setDescription("saved here");
+        List<String> names = new ArrayList<>();
+        try (TarInputStream tar = new TarInputStream(new GZIPInputStream(BLOBS.get(snapshot)))) {
+            for (TarEntry e = tar.getNextEntry(); e != null; e = tar.getNextEntry()) {
+                names.add(e.getName());
+            }
+        }
+        assertThat(names, hasItem("b.txt"));
+        assertThat("the file added elsewhere is not dropped by publishing this copy", names, hasItem("a.txt"));
+        assertThat(record(key), containsString("saved here"));
+    }
+
+    @Test
+    void aSaveHereWithFilesAddedDoesNotBringBackABuildDeletedElsewhereMeanwhile() throws Exception {
+        FreeStyleProject p = project(r, "deleted-meanwhile");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p);
+        String key = "jobs/deleted-meanwhile/builds/1/build.xml";
+        Files.writeString(new File(b.getRootDir(), "late.txt").toPath(), "added later");
+        // another controller deletes the build just after the publication read its record (deleted as this controller,
+        // so that it is never applied here)
+        afterRead = k -> {
+            if (k.equals(key) && StackWalker.getInstance().walk(f -> f.anyMatch(x -> x.getClassName().equals(BuildRecords.class.getName())
+                    && x.getMethodName().equals("publish")))) {
+                afterRead = null;
+                try {
+                    STORE.delete(key, PersistenceStore.ANY);
+                } catch (IOException e) {
+                    throw new java.io.UncheckedIOException(e);
+                }
+            }
+        };
+        try {
+            b.setDescription("saved here");
+        } finally {
+            afterRead = null;
+        }
+        assertNull(record(key), "not brought back");
+        assertNull(BLOBS.get("jobs/deleted-meanwhile/builds/1/files.tgz"));
+    }
+
+    @Test
     void fileAddedLongAfterIsPublishedWhenTheBuildIsSaved() throws Exception {
         FreeStyleProject p = project(r, "later");
         FreeStyleBuild b = r.buildAndAssertSuccess(p);
