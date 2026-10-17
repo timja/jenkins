@@ -449,6 +449,29 @@ class RunningBuildsTest {
         }
     }
 
+    @Test
+    void theConsoleOfTheLastBuildIsOfOneRunningElsewhereWhenNewer() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("latest");
+        r.buildAndAssertSuccess(p);
+        other.write("jobs/latest/running/2.xml", placeholder("other-controller", "jenkins-a", 2), PersistenceStore.ABSENT);
+        awaitApplied();
+        hudson.cli.CLICommandInvoker.Result result = new hudson.cli.CLICommandInvoker(r, "console")
+                .authorizedTo(jenkins.model.Jenkins.READ, hudson.model.Item.READ).invokeWithArgs("latest");
+        assertThat(result, hudson.cli.CLICommandInvoker.Matcher.succeeded());
+        assertEquals("the newest build, elsewhere\n", result.stdout(), "not the older build #1 here");
+        other.delete("jobs/latest/running/2.xml", PersistenceStore.ANY); // the store outlives this test
+    }
+
+    @TestExtension("theConsoleOfTheLastBuildIsOfOneRunningElsewhereWhenNewer")
+    public static class NewestLog implements RunningBuilds.RemoteLog {
+        @Override
+        public long copy(Job<?, ?> job, int number, long offset, java.io.OutputStream out) throws java.io.IOException {
+            byte[] log = (number == 2 ? "the newest build, elsewhere\n" : "#" + number + "\n").getBytes(StandardCharsets.UTF_8);
+            out.write(log, (int) offset, log.length - (int) offset);
+            return log.length;
+        }
+    }
+
     @TestExtension("followingABuildElsewhereEndsWithTheRestOfItsRecord")
     public static class ShippedLog implements RunningBuilds.RemoteLog {
         static byte[] prefix;

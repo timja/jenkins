@@ -59,6 +59,11 @@ public class ConsoleCommand extends CLICommand {
             // maybe a permalink?
             Permalink p = job.getPermalinks().get(build);
             if (p != null) {
+                // the last build may be running on another controller of a cluster, newer than any here (Target 15)
+                int elsewhere = p.getId().equals("lastBuild") ? jenkins.persistence.RunningBuilds.newerElsewhere(job) : 0;
+                if (elsewhere > 0 && jenkins.persistence.RunningBuilds.followElsewhere(job, elsewhere, follow, stdout, this.n)) {
+                    return 0;
+                }
                 run = p.resolve(job);
                 if (run == null)
                     throw new IllegalStateException("Permalink " + build + " produced no build", e);
