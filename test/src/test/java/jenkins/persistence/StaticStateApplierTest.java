@@ -278,6 +278,31 @@ class StaticStateApplierTest {
     }
 
     @Test
+    void aUserChangeElsewhereWhoseSecondReadFailsIsAppliedByTheRetry() throws Exception {
+        User kim = User.getById("kim", true);
+        kim.setFullName("Kim One");
+        kim.save();
+        String kimKey = STORE.children("users").stream().filter(d -> d.startsWith("kim_")).map(d -> "users/" + d + "/config.xml").findFirst().orElseThrow();
+        int[] reads = {0};
+        onRead = (k, read) -> {
+            if (k.equals(kimKey) && Thread.currentThread().getName().equals("Persistence store item change applier") && ++reads[0] == 2) {
+                onRead = null;
+                throw new UncheckedIOException(new IOException("store unreachable"));
+            }
+            return read.get();
+        };
+        other.write(kimKey, text(kimKey).replace("Kim One", "Kim Elsewhere").getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        for (int i = 0; i < 1000 && !"Kim Elsewhere".equals(kim.getFullName()); i++) {
+            Thread.sleep(10); // the first attempt may fail, then the retry applies it
+        }
+        awaitApplied();
+        assertEquals("Kim Elsewhere", User.getById("kim", false).getFullName());
+        kim.setDescription("about Kim");
+        kim.save();
+        assertTrue(text(kimKey).contains("Kim Elsewhere"), "a save here keeps the change made elsewhere");
+    }
+
+    @Test
     void aUserChangedElsewhereWhileUsersAreScannedHasTheChange() throws Exception {
         User grace = User.getById("grace", true);
         grace.setFullName("Grace One");
