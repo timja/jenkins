@@ -911,8 +911,12 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
         String idKey = idStrategy().keyFor(id);
         AllUsers.remove(id);
         // from a persistence store too, if it holds users: deleting only the directory would leave the user there for
-        // every other controller (and for this one once restarted)
-        getConfigFile().delete();
+        // every other controller (and for this one once restarted); the local files go with the directory, which is
+        // only unlinked if it is a symbolic link (XmlFile.delete would delete the file it links to)
+        PersistenceStores.Route route = PersistenceStores.route(getConfigFile().getPath());
+        if (route != null) {
+            route.delete();
+        }
         Util.deleteRecursive(getUserFolderFor(id));
         UserDetailsCache.get().invalidate(idKey);
     }

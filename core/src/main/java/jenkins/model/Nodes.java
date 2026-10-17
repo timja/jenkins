@@ -344,10 +344,14 @@ public class Nodes implements PersistenceRoot {
     }
 
     /**
-     * Deletes a node's directory, and its configuration through {@link XmlFile} so that a persistence store sharing it sees the deletion.
+     * Deletes a node's directory, and its configuration from a persistence store sharing it, so that it sees the deletion.
+     * The local configuration goes with the directory, which is only unlinked if it is a symbolic link.
      */
     private void deleteNodeDir(String nodeName) throws IOException {
-        getConfigFile(nodeName).delete();
+        PersistenceStores.Route route = PersistenceStores.route(getConfigFile(nodeName).getPath());
+        if (route != null) {
+            route.delete();
+        }
         Util.deleteRecursive(new File(getRootDir(), nodeName));
     }
 
