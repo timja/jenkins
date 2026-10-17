@@ -344,6 +344,43 @@ public class Nodes implements PersistenceRoot {
     }
 
     /**
+     * Applies a change another controller made to a node's configuration in a shared persistence store:
+     * loads it again (or for the first time), or forgets it if it was deleted. Nothing is saved.
+     */
+    @Restricted(NoExternalUse.class)
+    public void changedElsewhere(@NonNull String name, boolean deleted) {
+        Node old = getNode(name);
+        if (deleted) {
+            if (old != null) {
+                unload(old);
+                jenkins.updateComputerList();
+                jenkins.trimLabels();
+                NodeListener.fireOnDeleted(old);
+            }
+            try {
+                // a copy left here (read from the store, say) must not bring the node back at the next startup
+                Util.deleteRecursive(new File(getRootDir(), name));
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "could not delete the directory of " + name + ", deleted elsewhere", e);
+            }
+            return;
+        }
+        Node loaded = load(name, true);
+        if (loaded == null) {
+            return; // gone meanwhile, or vetoed here (then dropped here too, as at startup)
+        }
+        if (old != null) {
+            Queue.withLock(() -> {
+                jenkins.updateComputerList(); // rebind the computer to the new node object
+                jenkins.trimLabels(old, loaded); // as a local replacement does: a label removed elsewhere leaves it now
+            });
+            NodeListener.fireOnUpdated(old, loaded);
+        } else {
+            NodeListener.fireOnCreated(loaded);
+        }
+    }
+
+    /**
      * Deletes a node's directory, and its configuration from a persistence store sharing it, so that it sees the deletion.
      * The local configuration goes with the directory, which is only unlinked if it is a symbolic link.
      */
@@ -420,6 +457,17 @@ public class Nodes implements PersistenceRoot {
         });
     }
 
+    /** Whether every {@link NodeListener} allows a node to be loaded, as {@link #load()} asks. */
+    private static boolean allowLoad(Node node) {
+        return ExtensionList.lookup(NodeListener.class).stream().allMatch(nodeListener -> {
+            if (!nodeListener.allowLoad(node)) {
+                LOGGER.log(Level.FINE, () -> "Loading of node " + node.getNodeName() + " vetoed by " + nodeListener);
+                return false;
+            }
+            return true;
+        });
+    }
+
     @CheckForNull
     public Node getOrLoad(String name) {
         Node node = getNode(name);
@@ -429,10 +477,29 @@ public class Nodes implements PersistenceRoot {
 
     @CheckForNull
     public Node load(String name) {
+        return load(name, false);
+    }
+
+    /**
+     * @param vetoable whether {@link NodeListener#allowLoad} may veto the node, as at startup ({@link #load()}): a node
+     *     vetoed is not loaded, and one of that name loaded before is dropped
+     */
+    @CheckForNull
+    private Node load(String name, boolean vetoable) {
         try {
             XmlFile xmlFile = getConfigFile(name);
             if (xmlFile.exists()) {
                 Node n = (Node) xmlFile.read();
+                if (vetoable && !allowLoad(n)) {
+                    Node old = nodes.get(n.getNodeName());
+                    if (old != null) { // as if deleted: it would not be here after a restart either
+                        unload(old);
+                        jenkins.updateComputerList();
+                        jenkins.trimLabels();
+                        NodeListener.fireOnDeleted(old);
+                    }
+                    return null;
+                }
                 nodes.put(n.getNodeName(), n);
                 n.onLoad(this, n.getNodeName());
                 jenkins.updateNewComputer(n);

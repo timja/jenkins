@@ -3589,6 +3589,28 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
     }
 
     /**
+     * Applies global configuration saved by another controller sharing a {@link jenkins.persistence.PersistenceStore}:
+     * re-reads {@code config.xml} into this instance, as {@link #load} does at startup, and re-derives what depends on it,
+     * including the inbound agent listener's port.
+     * Unlike {@link #reload}, it neither reloads items nor blocks requests.
+     * Synchronized like {@link #save}, so it cannot interleave with a local save.
+     */
+    @Restricted(Beta.class)
+    public synchronized void reloadGlobalConfig() throws IOException {
+        IdStrategy userIdStrategy = securityRealm == null ? null : securityRealm.getUserIdStrategy();
+        jenkins.persistence.PersistenceStores.reload(getConfigFile(), this, this::load); // a system message cleared, say
+        if (userIdStrategy != null && securityRealm != null && !userIdStrategy.equals(securityRealm.getUserIdStrategy())) {
+            // as setSecurityRealm does on the controller that changed it, which moved them in the store (User.rekey)
+            LOGGER.info("User ID strategy changed elsewhere; reloading users");
+            User.reload();
+        }
+        _setLabelString(label);
+        trimLabels();
+        launchTcpSlaveAgentListener(); // on the port now configured, or none
+        LOGGER.fine("Reloaded global configuration changed elsewhere");
+    }
+
+    /**
      * Save the settings to a file.
      */
     @Override

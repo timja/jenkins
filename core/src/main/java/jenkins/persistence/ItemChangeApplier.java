@@ -44,6 +44,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.BlockingQueue;
@@ -81,6 +82,16 @@ public final class ItemChangeApplier {
     /** Changes to items whose parent does not exist yet, by parent full name. Only touched by the worker. */
     private final Map<String, List<ChangeEvent>> parked = new HashMap<>();
     private final AtomicLong applied = new AtomicLong();
+    /**
+     * The version of the last deletion applied, per key, until it is written again: a delivery repeated is skipped.
+     * Only the applier's thread uses it; the oldest are forgotten past a bound.
+     */
+    private final Map<String, Long> deletions = new LinkedHashMap<>() {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, Long> eldest) {
+            return size() > 10_000;
+        }
+    };
     /** Changes received and not yet fully processed. */
     private final AtomicLong pending = new AtomicLong();
     private Thread worker;
@@ -183,8 +194,18 @@ public final class ItemChangeApplier {
         try (ACLContext ctx = ACL.as2(ACL.SYSTEM2)) {
             PersistenceStores.applyingRemoteChange(() -> {
                 switch (e.kind()) {
-                    case WRITTEN -> written(e);
-                    case DELETED -> deleted(e);
+                    case WRITTEN -> {
+                        deletions.remove(e.key());
+                        written(e);
+                    }
+                    case DELETED -> {
+                        Long last = deletions.get(e.key());
+                        if (last != null && e.version() <= last) {
+                            return null; // delivered again (subscribers get changes at least once): applied already
+                        }
+                        deleted(e);
+                        deletions.put(e.key(), e.version());
+                    }
                     case MOVED -> moved(e);
                     default -> throw new IllegalStateException(e.toString());
                 }
@@ -199,6 +220,12 @@ public final class ItemChangeApplier {
 
     private void written(ChangeEvent e) throws Exception {
         if (build(e)) {
+            return;
+        }
+        if (!e.key().startsWith("jobs/")) {
+            if (e.version() > PersistenceStores.lastSeen(e.key()) && StaticStateApplier.apply(e.key(), false)) {
+                applied.incrementAndGet();
+            }
             return;
         }
         List<String> names = itemPath(e.key());
@@ -269,6 +296,16 @@ public final class ItemChangeApplier {
 
     private void deleted(ChangeEvent e) throws Exception {
         if (build(e)) {
+            return;
+        }
+        if (!e.key().startsWith("jobs/")) {
+            if (e.version() <= PersistenceStores.lastSeen(e.key())) {
+                return; // deleted before what this controller has: saved here since (a deletion it then overwrote), say
+            }
+            PersistenceStores.seen(e.key(), PersistenceStore.ABSENT);
+            if (StaticStateApplier.apply(e.key(), true)) {
+                applied.incrementAndGet();
+            }
             return;
         }
         List<String> names = itemPath(e.key());
