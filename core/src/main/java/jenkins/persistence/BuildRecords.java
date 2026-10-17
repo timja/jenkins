@@ -32,10 +32,12 @@ import hudson.ExtensionPoint;
 import hudson.FilePath;
 import hudson.Util;
 import hudson.XmlFile;
+import hudson.model.Item;
 import hudson.model.Job;
 import hudson.model.Run;
 import hudson.model.RunMap;
 import hudson.model.Saveable;
+import hudson.model.listeners.ItemListener;
 import hudson.model.listeners.RunListener;
 import hudson.model.listeners.SaveableListener;
 import hudson.util.DirScanner;
@@ -45,6 +47,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InterruptedIOException;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
@@ -53,9 +56,12 @@ import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -102,6 +108,30 @@ public final class BuildRecords {
 
     /** Set while this thread loads a build, so that saves made while loading are not republished. */
     private static final ThreadLocal<Boolean> LOADING = new ThreadLocal<>();
+
+    /**
+     * The version of each build record this controller last wrote, read or was told of, by job ({@code jobs/p/builds})
+     * and number: what it knows to be that job's, so that a deletion applied once the name is taken again removes only
+     * that ({@link ItemDeleted}).
+     */
+    private static final Map<String, Map<Integer, Long>> seenRecords = new ConcurrentHashMap<>();
+
+    /** Notes the version of a build record seen; {@link PersistenceStore#ABSENT} (or less) when it is gone. */
+    static void seen(@NonNull String recordKey, long version) {
+        RecordKey record = RecordKey.parse(recordKey);
+        if (record == null) {
+            return;
+        }
+        String builds = record.jobKey() + "/builds";
+        if (version > PersistenceStore.ABSENT) {
+            seenRecords.computeIfAbsent(builds, k -> new ConcurrentHashMap<>()).put(record.number(), version);
+        } else {
+            Map<Integer, Long> seen = seenRecords.get(builds);
+            if (seen != null) {
+                seen.remove(record.number());
+            }
+        }
+    }
 
     private BuildRecords() {}
 
@@ -210,14 +240,14 @@ public final class BuildRecords {
             }
         }
         byte[] published = Files.readAllBytes(record);
-        PersistenceStores.get().write(base + "/" + RECORD, published, PersistenceStore.ANY);
+        seen(base + "/" + RECORD, PersistenceStores.get().write(base + "/" + RECORD, published, PersistenceStore.ANY));
         // a save made while publishing found no record yet, so republish left it to this: include it
         for (int i = 0; i < 10; i++) {
             byte[] now = Files.readAllBytes(record);
             if (Arrays.equals(now, published)) {
                 break;
             }
-            PersistenceStores.get().write(base + "/" + RECORD, now, PersistenceStore.ANY);
+            seen(base + "/" + RECORD, PersistenceStores.get().write(base + "/" + RECORD, now, PersistenceStore.ANY));
             published = now;
         }
         LOGGER.fine(() -> "Published " + run);
@@ -242,7 +272,7 @@ public final class BuildRecords {
             }
             try {
                 // only over the record read: a build deleted elsewhere since must not be written again
-                store.write(key, content, e.version());
+                seen(key, store.write(key, content, e.version()));
                 break;
             } catch (ConflictException x) {
                 if (attempt == 5) {
@@ -265,11 +295,138 @@ public final class BuildRecords {
         }
         String base = builds + "/" + run.getNumber();
         PersistenceStores.get().delete(base + "/" + RECORD, PersistenceStore.ANY);
+        seen(base + "/" + RECORD, PersistenceStore.ABSENT);
         BlobStore blobs = PersistenceStores.getBlobStore();
         if (blobs != null) {
             blobs.delete(base);
         }
         LOGGER.fine(() -> "Deleted stored " + run);
+    }
+
+    /**
+     * Removes every build record, snapshot and running placeholder of a job, as when the job is deleted.
+     * The job's {@code nextBuildNumber} is kept, so that a job recreated with the same name never reuses a number.
+     * Should the job be made again under the same name while this runs, the snapshots of builds it publishes once the
+     * records are deleted are kept; one it records in the moment before is deleted with the rest.
+     */
+    @Restricted(NoExternalUse.class)
+    public static void deleteAll(@NonNull Job<?, ?> job) throws IOException {
+        String builds = buildsKey(job);
+        if (builds == null) {
+            return;
+        }
+        PersistenceStore store = PersistenceStores.get();
+        Set<String> numbers = store.children(builds);
+        for (String number : numbers) {
+            store.delete(builds + "/" + number + "/" + RECORD, PersistenceStore.ANY);
+        }
+        String running = builds.substring(0, builds.length() - "builds".length()) + RunningBuilds.PREFIX;
+        for (String name : store.children(running)) {
+            store.delete(running + "/" + name, PersistenceStore.ANY);
+        }
+        BlobStore blobs = PersistenceStores.getBlobStore();
+        if (blobs != null) {
+            if (recreated(job)) {
+                // made again meanwhile: only the snapshots of the records deleted above, not those of the new job's builds
+                for (String number : numbers) {
+                    blobs.delete(builds + "/" + number);
+                }
+            } else {
+                blobs.delete(builds);
+            }
+        }
+        seenRecords.remove(builds);
+        RunningBuilds.invalidate(builds.substring(0, builds.length() - "/builds".length()));
+        LOGGER.fine(() -> "Deleted stored builds of " + job.getFullName());
+    }
+
+    /**
+     * Removes the build records, snapshots and running placeholders of a deleted job numbered below {@code below},
+     * as {@link #deleteAll} does for all of them, when a job was made again under the same name meanwhile:
+     * that job's builds are numbered from where the deleted one stopped, so they are kept.
+     * Snapshots below the cutoff that have no record (a publication cut short, or an earlier cleanup that failed
+     * partway) are left, as the blob store cannot be listed; they are never shown, as a build needs its record.
+     */
+    private static void deleteBelow(@NonNull Job<?, ?> job, int below) throws IOException {
+        String builds = buildsKey(job);
+        if (builds == null) {
+            return;
+        }
+        PersistenceStore store = PersistenceStores.get();
+        BlobStore blobs = PersistenceStores.getBlobStore();
+        for (String number : store.children(builds)) {
+            if (numberOf(number) < below) {
+                store.delete(builds + "/" + number + "/" + RECORD, PersistenceStore.ANY);
+                seen(builds + "/" + number + "/" + RECORD, PersistenceStore.ABSENT);
+                if (blobs != null) {
+                    blobs.delete(builds + "/" + number);
+                }
+            }
+        }
+        String running = builds.substring(0, builds.length() - "builds".length()) + RunningBuilds.PREFIX;
+        for (String name : store.children(running)) {
+            if (numberOf(name) < below) {
+                store.delete(running + "/" + name, PersistenceStore.ANY);
+            }
+        }
+        RunningBuilds.invalidate(builds.substring(0, builds.length() - "/builds".length()));
+        LOGGER.fine(() -> "Deleted stored builds of " + job.getFullName() + " below #" + below);
+    }
+
+    /**
+     * Removes the build records of a deleted job that this controller saw, where still stored at the version it saw,
+     * with their snapshots, when a job is at the same name again by the time this controller applies a deletion made
+     * elsewhere. What is stored there now under a number the deleted job had too, a build of a job renamed to the name
+     * (which keeps its numbers) or of a new job, has another version, and is kept; the controller which made the
+     * deletion removed the rest. Running placeholders are removed below {@code below}, as {@link #deleteBelow} does.
+     */
+    private static void deleteSeen(@NonNull Job<?, ?> job, int below) throws IOException {
+        String builds = buildsKey(job);
+        if (builds == null) {
+            return;
+        }
+        PersistenceStore store = PersistenceStores.get();
+        BlobStore blobs = PersistenceStores.getBlobStore();
+        Map<Integer, Long> seen = seenRecords.getOrDefault(builds, Map.of());
+        seenRecords.remove(builds);
+        for (Map.Entry<Integer, Long> record : seen.entrySet()) {
+            String key = builds + "/" + record.getKey() + "/" + RECORD;
+            PersistenceStore.Entry now = store.read(key);
+            if (now == null || now.version() != record.getValue()) {
+                continue; // deleted (with its snapshot), or not what this controller saw: kept
+            }
+            try {
+                store.delete(key, record.getValue());
+            } catch (ConflictException e) {
+                continue; // changed since: kept, with its snapshot
+            }
+            if (blobs != null) {
+                blobs.delete(builds + "/" + record.getKey());
+            }
+        }
+        String running = builds.substring(0, builds.length() - "builds".length()) + RunningBuilds.PREFIX;
+        for (String name : store.children(running)) {
+            if (numberOf(name) < below) {
+                store.delete(running + "/" + name, PersistenceStore.ANY);
+            }
+        }
+        RunningBuilds.invalidate(builds.substring(0, builds.length() - "/builds".length()));
+        LOGGER.fine(() -> "Deleted stored builds of " + job.getFullName() + " seen here");
+    }
+
+    /**
+     * The build number a stored name starts with ({@code 5}, {@code 5.xml}), or {@link Integer#MAX_VALUE} if none, or if
+     * it is larger than any build number: never taken for a lower number, which a cleanup by number would delete.
+     */
+    static int numberOf(String name) {
+        int end = 0;
+        while (end < name.length() && Character.isDigit(name.charAt(end))) {
+            end++;
+        }
+        if (end == 0 || end > 18) {
+            return Integer.MAX_VALUE;
+        }
+        return (int) Math.min(Long.parseLong(name.substring(0, end)), Integer.MAX_VALUE);
     }
 
     /**
@@ -312,6 +469,7 @@ public final class BuildRecords {
         }
         // last, as on the publishing side: a local build.xml means the directory is complete
         writeRecord(dir, record.content());
+        seen(base + "/" + RECORD, record.version());
         LOGGER.fine(() -> "Materialized " + job.getFullName() + " #" + dir.getName());
         return true;
     }
@@ -371,6 +529,7 @@ public final class BuildRecords {
                 }
                 LOGGER.fine(() -> "Refreshing " + job.getFullName() + " #" + number + " changed elsewhere");
                 writeRecord(dir, record.content());
+                seen(builds + "/" + number + "/" + RECORD, record.version());
                 runs.unload(number);
             } else {
                 LOGGER.fine(() -> "Recognizing " + job.getFullName() + " #" + number + " completed elsewhere");
@@ -518,6 +677,80 @@ public final class BuildRecords {
                 delete(run);
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.WARNING, "Failed to delete stored " + run, e);
+            }
+        }
+    }
+
+    /** Whether a job deleted elsewhere has been made again since. */
+    private static boolean recreated(Job<?, ?> job) throws IOException {
+        String builds = buildsKey(job);
+        return builds != null && PersistenceStores.get().read(builds.substring(0, builds.length() - "builds".length()) + "config.xml") != null;
+    }
+
+    @Restricted(NoExternalUse.class)
+    @Extension
+    public static final class ItemDeleted extends ItemListener {
+
+        /**
+         * The next build number of each job as its deletion starts: a job made again elsewhere meanwhile, under the same
+         * name, may be loaded into the same object before the deletion is over, with the new job's number.
+         */
+        private final Map<Job<?, ?>, Integer> nextBuildNumbers = Collections.synchronizedMap(new WeakHashMap<>());
+
+        @Override
+        public void onCheckDelete(Item item) {
+            if (item instanceof Job<?, ?> job) {
+                // where the deletion is made, its configuration is still stored: so is its sequence, which other
+                // controllers' builds advance (the field only this controller's). Where it is applied, the stored one
+                // may be a new job's already
+                nextBuildNumbers.put(job, PersistenceStores.isApplyingRemoteChange()
+                        ? job.getNextBuildNumber() : Math.max(job.getNextBuildNumber(), storedNextBuildNumber(job)));
+            }
+        }
+
+        /** The job's next build number as stored, or 0 if unknown. */
+        private static int storedNextBuildNumber(Job<?, ?> job) {
+            String builds = buildsKey(job);
+            if (builds == null) {
+                return 0;
+            }
+            try {
+                PersistenceStore.Entry entry = PersistenceStores.get().read(builds.substring(0, builds.length() - "builds".length()) + "nextBuildNumber");
+                return entry == null ? 0 : Integer.parseInt(new String(entry.content(), StandardCharsets.UTF_8).trim());
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.FINE, "Could not read the stored next build number of " + job.getFullName(), e);
+                return 0;
+            }
+        }
+
+        @Override
+        public void onDeleted(Item item) {
+            // folders delete their children one by one, so each job gets here
+            if (!(item instanceof Job<?, ?> job)) {
+                return;
+            }
+            Integer next = nextBuildNumbers.remove(job);
+            try {
+                if (recreated(job)) {
+                    if (PersistenceStores.isApplyingRemoteChange()) {
+                        // something is at the name again, made or renamed there after the controller which deleted the
+                        // job removed its builds: what is left of the deleted job are records published late, from
+                        // here (or seen from elsewhere), known by version. A job renamed there keeps its numbers, so
+                        // a number tells nothing
+                        deleteSeen(job, next != null ? next : job.getNextBuildNumber());
+                    } else {
+                        // made again elsewhere while this controller deleted the job's directory: renaming a job to the
+                        // name fails while the deleted job's records are there, and the new job's builds are numbered
+                        // from where this one stopped, so only those below are this job's
+                        deleteBelow(job, next != null ? next : job.getNextBuildNumber());
+                    }
+                    return;
+                }
+                // also when the deletion was made elsewhere: a build that completed here before this controller
+                // applied it published a record after that controller had cleaned up (idempotent)
+                deleteAll(job);
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.WARNING, "Failed to delete stored builds of " + job.getFullName(), e);
             }
         }
     }

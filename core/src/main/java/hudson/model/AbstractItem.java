@@ -464,7 +464,7 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
                 } catch (IOException | RuntimeException | Error e) {
                     if (storeMoved) {
                         try {
-                            PersistenceStores.move(newRoot, oldRoot); // put the stored entries back with the old name
+                            PersistenceStores.moveBack(newRoot, oldRoot); // put the stored entries back with the old name
                         } catch (IOException | RuntimeException x) {
                             e.addSuppressed(x);
                         }

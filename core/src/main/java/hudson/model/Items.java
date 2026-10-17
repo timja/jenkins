@@ -628,7 +628,7 @@ public class Items {
                 FileUtils.moveDirectory(item.getRootDir(), destDir);
             } catch (IOException e) {
                 try {
-                    PersistenceStores.move(destDir, item.getRootDir()); // put the stored entries back where the item still is
+                    PersistenceStores.moveBack(destDir, item.getRootDir()); // put the stored entries back where the item still is
                 } catch (IOException x) {
                     e.addSuppressed(x);
                 }
