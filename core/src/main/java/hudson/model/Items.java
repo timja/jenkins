@@ -52,6 +52,7 @@ import java.util.StringTokenizer;
 import java.util.function.Predicate;
 import jenkins.model.DirectlyModifiableTopLevelItemGroup;
 import jenkins.model.Jenkins;
+import jenkins.persistence.PersistenceStores;
 import jenkins.util.MemoryReductionUtil;
 import jenkins.util.ThrowingCallable;
 import jenkins.util.ThrowingRunnable;
@@ -599,7 +600,9 @@ public class Items {
         if (oldParent == destination) {
             throw new IllegalArgumentException();
         }
-        // TODO verify that destination is to not equal to, or inside, item
+        if (destination instanceof Item d && (d == item || d.getFullName().startsWith(item.getFullName() + "/"))) {
+            throw new IllegalArgumentException("Cannot move " + item.getFullName() + " into itself");
+        }
         if (!destination.canAdd(item)) {
             throw new IllegalArgumentException();
         }
@@ -609,10 +612,30 @@ public class Items {
         // TODO AbstractItem.renameTo has a more baroque implementation; factor it out into a utility method perhaps?
         File destDir = destination.getRootDirFor(item);
         FileUtils.forceMkdir(destDir.getParentFile());
-        FileUtils.moveDirectory(item.getRootDir(), destDir);
-        oldParent.remove(item);
-        I newItem = destination.add(item, name);
-        item.movedTo(destination, newItem, destDir);
+        I newItem;
+        // the item's own saves (synchronized on it) wait until it is in its new place: a save made in between would
+        // resolve the old location and store the item there again. Saves of its children (when moving a folder) are not
+        // held off: a child saved during the move may still be written at its old location
+        synchronized (item) {
+            if (destDir.exists()) {
+                // checked before the store moves anything: the directory move below would fail, leaving the two apart
+                throw new IOException(destDir + " already exists");
+            }
+            PersistenceStores.move(item.getRootDir(), destDir);
+            try {
+                FileUtils.moveDirectory(item.getRootDir(), destDir);
+            } catch (IOException e) {
+                try {
+                    PersistenceStores.move(destDir, item.getRootDir()); // put the stored entries back where the item still is
+                } catch (IOException x) {
+                    e.addSuppressed(x);
+                }
+                throw e;
+            }
+            oldParent.remove(item);
+            newItem = destination.add(item, name);
+            item.movedTo(destination, newItem, destDir);
+        }
         ItemListener.fireLocationChange(newItem, oldFullName);
         return newItem;
     }

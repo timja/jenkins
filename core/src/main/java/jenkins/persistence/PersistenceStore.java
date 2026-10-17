@@ -27,6 +27,7 @@ package jenkins.persistence;
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import java.io.IOException;
+import java.util.List;
 import java.util.Set;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
@@ -62,6 +63,8 @@ public interface PersistenceStore {
     /**
      * Whether this store serves the given key.
      * Must be cheap and must not change over the lifetime of the store.
+     * Below an item's directory it must depend only on the path relative to that directory, not on where the item is,
+     * so that moving or renaming an item ({@link #move}) never changes which of its files the store serves.
      */
     boolean owns(@NonNull String key);
 
@@ -101,6 +104,23 @@ public interface PersistenceStore {
      */
     @NonNull
     Set<String> children(@NonNull String parentKey) throws IOException;
+
+    /**
+     * Atomically renames a key and every key below it, as when an item directory is renamed or moved.
+     * For example moving {@code jobs/a} to {@code jobs/f/jobs/a} moves {@code jobs/a/config.xml}
+     * and {@code jobs/a/jobs/x/config.xml}, but not {@code jobs/ab/config.xml}.
+     * Moved entries get new versions.
+     *
+     * @return each entry moved: its key and version before, and its key and version now
+     * @throws ConflictException if {@code toPrefix} or anything below it already exists
+     */
+    @NonNull
+    List<Moved> move(@NonNull String fromPrefix, @NonNull String toPrefix) throws IOException;
+
+    /**
+     * An entry {@linkplain #move moved}: from {@code from} at {@code fromVersion} to {@code to} at {@code version}.
+     */
+    record Moved(@NonNull String from, long fromVersion, @NonNull String to, long version) {}
 
     /**
      * Stored content with its version.

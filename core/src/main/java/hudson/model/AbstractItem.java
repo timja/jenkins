@@ -70,6 +70,9 @@ import jenkins.model.DirectlyModifiableTopLevelItemGroup;
 import jenkins.model.Jenkins;
 import jenkins.model.Loadable;
 import jenkins.model.queue.ItemDeletion;
+import jenkins.persistence.ConflictException;
+import jenkins.persistence.PersistenceStore;
+import jenkins.persistence.PersistenceStores;
 import jenkins.security.ExtendedReadRedaction;
 import jenkins.security.XStreamNotDeserializable;
 import jenkins.security.stapler.StaplerNotDispatchable;
@@ -261,7 +264,16 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
             throw new Failure(validationError.getMessage());
         }
 
-        renameTo(newName);
+        try {
+            renameTo(newName);
+        } catch (ConflictException e) {
+            if (e.getActualVersion() == PersistenceStore.ABSENT) {
+                // this item is gone from where it was stored (another controller sharing the store)
+                throw new Failure(Messages.AbstractItem_MovedElsewhere());
+            }
+            // made elsewhere since the check above (another controller sharing the store)
+            throw new Failure(Messages.AbstractItem_NewNameInUse(newName));
+        }
         // send to the new job page
         // note we can't use getUrl() because that would pick up old name in the
         // Ancestor.getUrl()
@@ -387,8 +399,14 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
                 File newRoot = this.getRootDir();
 
                 boolean success = false;
+                boolean storeMoved = false;
 
                 try { // rename data files
+                    // stored state first: fails if something else already exists at the new name
+                    // (this item's saves wait on its monitor until it is renamed; its children's, in a folder, do not)
+                    PersistenceStores.move(oldRoot, newRoot);
+                    storeMoved = true;
+
                     boolean interrupted = false;
                     boolean renamed = false;
 
@@ -443,6 +461,15 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
                     }
 
                     success = true;
+                } catch (IOException | RuntimeException | Error e) {
+                    if (storeMoved) {
+                        try {
+                            PersistenceStores.move(newRoot, oldRoot); // put the stored entries back with the old name
+                        } catch (IOException | RuntimeException x) {
+                            e.addSuppressed(x);
+                        }
+                    }
+                    throw e;
                 } finally {
                     // if failed, back out the rename.
                     if (!success)
@@ -928,7 +955,6 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
     @SuppressWarnings("unchecked")
     public void updateByXml(Source source) throws IOException {
         checkPermission(CONFIGURE);
-        XmlFile configXmlFile = getConfigFile();
         final StringWriter out = new StringWriter();
         try {
             XMLUtils.safeTransform(source, new StreamResult(out));
@@ -949,7 +975,10 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
         Jenkins.get().rebuildDependencyGraphAsync();
 
         // if everything went well, re-serialize from memory to encrypt secrets submitted in plaintext
-        configXmlFile.write(this);
+        // (where the item is now, under the lock renames and moves hold, as save() does: not where it was before one)
+        synchronized (this) {
+            getConfigFile().write(this);
+        }
         SaveableListener.fireOnChange(this, getConfigFile());
         ItemListener.fireOnUpdated(this);
     }
