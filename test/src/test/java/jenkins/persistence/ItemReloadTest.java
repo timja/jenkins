@@ -166,6 +166,31 @@ class ItemReloadTest {
         assertEquals("remote", p.getProperty(OtherProp.class).value);
     }
 
+    @Test
+    void aChangeHereToAFieldNotChangedElsewhereIsNotTakenAsInSync() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("unsaved");
+        p.addProperty(new Prop("x"));
+        p.addProperty(new OtherProp("y"));
+        String key = "jobs/unsaved/config.xml";
+        p.getProperty(Prop.class).value = "local"; // changed here, never saved
+        other.write(key, withDisplayName(key, "remote"), PersistenceStore.ANY);
+        // put off while the change here is not saved, then applied: only the display name changed elsewhere
+        awaitApplied();
+        assertEquals("remote", p.getDisplayName());
+        assertTrue(PersistenceStores.hasUnsavedChanges(p.getConfigFile(), p), "the change here is still one not saved");
+        // a later change elsewhere of the field changed here does not overwrite it
+        String stored = new String(STORE.read(key).content(), StandardCharsets.UTF_8);
+        other.write(key, stored.replace("<value>y</value>", "<value>remote</value>").getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        awaitApplied();
+        assertEquals("local", p.getProperty(Prop.class).value);
+        p.save();
+        awaitApplied();
+        String now = new String(STORE.read(key).content(), StandardCharsets.UTF_8);
+        assertThat(now, containsString("<value>local</value>"));
+        assertThat("the change made elsewhere is merged, not written over", now, containsString("<value>remote</value>"));
+        assertThat(now, containsString("<displayName>remote</displayName>"));
+    }
+
     public static final class OtherProp extends JobProperty<Job<?, ?>> {
         String value;
 
