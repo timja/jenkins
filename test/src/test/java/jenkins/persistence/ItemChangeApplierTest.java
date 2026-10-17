@@ -71,8 +71,10 @@ class ItemChangeApplierTest {
         @Override
         public Entry read(String key) {
             Runnable r = beforeLoading;
+            // an item reloaded field by field reads its file once, to prepare the reload: that read counts as loading
             if (r != null && StackWalker.getInstance().walk(s -> s.anyMatch(f -> f.getMethodName().equals("load")
-                    && f.getClassName().equals(AbstractItem.class.getName())))) {
+                    && f.getClassName().equals(AbstractItem.class.getName())
+                    || f.getMethodName().equals("prepare") && f.getClassName().equals(ItemReload.class.getName())))) {
                 beforeLoading = null;
                 r.run();
             }
