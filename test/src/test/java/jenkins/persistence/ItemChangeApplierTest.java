@@ -25,7 +25,9 @@
 package jenkins.persistence;
 
 import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.instanceOf;
+import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.sameInstance;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -432,7 +434,8 @@ class ItemChangeApplierTest {
 
     @Test
     void aDeletionRetriedAfterTheItemWasMadeAgainDoesNotDeleteIt() throws Exception {
-        r.createFreeStyleProject("retried");
+        FreeStyleProject old = r.createFreeStyleProject("retried");
+        r.buildAndAssertSuccess(old);
         pauseApplier();
         try {
             refuseDeletion = "retried";
@@ -446,6 +449,10 @@ class ItemChangeApplierTest {
         FreeStyleProject again = r.jenkins.getItemByFullName("retried", FreeStyleProject.class);
         assertNotNull(again, "not deleted by the deletion retried after it was made again");
         assertEquals("made again elsewhere", again.getDescription());
+        // the failed deletion was applied before the item was made again: the new one is another item
+        assertThat(again, not(sameInstance(old)));
+        assertThat(again.getBuilds(), empty());
+        assertEquals(1, again.getNextBuildNumber());
     }
 
     @Test
