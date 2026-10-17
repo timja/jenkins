@@ -601,6 +601,15 @@ public final class BuildRecords {
             return;
         }
         LOGGER.fine(() -> "Forgetting " + job.getFullName() + " #" + number + " deleted elsewhere");
+        forgetLocalCopy(job, number);
+    }
+
+    /** Drops this controller's copy of a build: the loaded object, and its directory. */
+    static void forgetLocalCopy(@NonNull Job<?, ?> job, int number) throws IOException {
+        RunMap<?> runs = runsOf(job);
+        if (runs == null) {
+            return;
+        }
         runs.forget(number);
         Util.deleteRecursive(new File(job.getBuildDir(), String.valueOf(number)));
         PeepholePermalink.changedElsewhere(job, number, true);
@@ -802,6 +811,12 @@ public final class BuildRecords {
 
         @Override
         public void onChange(Saveable o, XmlFile file) {
+            if (o instanceof Run<?, ?> stale && RunningBuilds.wasDiscarded(stale) && !PersistenceStores.isApplyingRemoteChange()) {
+                // a copy of a build lost to another controller, discarded here but still referenced, saved its build.xml
+                // again: never published, and dropped again, as it would stand for the new owner's record here
+                RunningBuilds.discardAgain(stale);
+                return;
+            }
             if (!(o instanceof Run<?, ?> run) || run.isLogUpdated() || LOADING.get() != null || PersistenceStores.isApplyingRemoteChange()
                     || RunningBuilds.wasLost(run)) {
                 return;
