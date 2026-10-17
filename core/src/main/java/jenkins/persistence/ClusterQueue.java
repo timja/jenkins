@@ -41,6 +41,9 @@ import org.kohsuke.accmod.restrictions.Beta;
  * yet learn it: a store should expire them some time later, at the soonest five minutes after (as long as the local
  * queue remembers items that left), so that they do not accumulate. Waiting and claimed records must never expire: an
  * item with no record may start anywhere.
+ * That retention also bounds how long a controller can be down and still recognise items of its saved queue which ran
+ * elsewhere meanwhile (it publishes again an item it finds no record of): a store should keep finished records much
+ * longer than the minimum, such as a day.
  *
  * @since TODO
  */
