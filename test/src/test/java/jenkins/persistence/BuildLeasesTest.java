@@ -907,6 +907,33 @@ class BuildLeasesTest {
         }
     }
 
+    @Test
+    void aBuildLostBeforeItIsCompletedAgainIsNotPublishedFromHere() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("relost");
+        FreeStyleBuild b = r.buildAndAssertSuccess(p);
+        String key = "jobs/relost/running/1.xml";
+        String record = "jobs/relost/builds/1/build.xml";
+        long published = STORE.read(record).version();
+        // taken over by another controller (its registration here having raced its completion), whose placeholder is
+        // now stored; this controller is to discard its copy
+        live = Set.of("dead-controller");
+        long theirs = dead.leases().acquire(key);
+        dead.write(key, placeholder("dead-controller", 1, theirs, ""), PersistenceStore.ANY);
+        live = null;
+        RunningBuilds.lost(b);
+
+        BuildRecords.complete(b); // as completeLater does, the registration having found it completed
+        assertEquals(published, STORE.read(record).version(), "not published again from here");
+        assertNotNull(text(key), "the new owner's placeholder is left alone");
+        assertEquals(0, BuildRecords.unpublishedCount());
+
+        RunningBuilds.discard(b);
+        awaitDiscarded(b);
+        BuildRecords.complete(b);
+        assertNotNull(text(key));
+        forget("relost");
+    }
+
     /** As "late" is published, after its lease is read: lets the registration go on, and waits for it. */
     @TestExtension("aBuildRegisteredAsItCompletesIsPublishedUnderThatLease")
     public static class RegisteredWhilePublishing implements BuildRecords.Exclusion {
