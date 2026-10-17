@@ -1560,6 +1560,12 @@ public abstract class Run<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
         }
     }
 
+    /** Whether this build is being deleted (or was): from when {@link #delete} starts, before its listeners run. */
+    @Restricted(NoExternalUse.class)
+    public synchronized boolean isPendingDelete() {
+        return isPendingDelete;
+    }
+
     /**
      * Deletes this build and its entire log
      *

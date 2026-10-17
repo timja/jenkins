@@ -194,6 +194,32 @@ class StoredPermalinksTest {
         assertEquals(PeepholePermalink.Cache.NONE, cache.get(p, "test-b"), "the older cache is not taken over the newer one");
     }
 
+    @Test
+    void aJobRenamedToTheNameOfADeletedOneDoesNotGetItsPermalinks() throws Exception {
+        FreeStyleProject a = r.createFreeStyleProject("renamed");
+        a.getBuildersList().add(new org.jvnet.hudson.test.FailureBuilder());
+        r.buildAndAssertStatus(hudson.model.Result.FAILURE, a);
+        FreeStyleProject b = r.createFreeStyleProject("deleted-before");
+        r.buildAndAssertSuccess(b);
+        assertNull(b.getLastFailedBuild());
+        assertThat(stored("deleted-before"), containsString("lastFailedBuild -1"));
+        b.delete();
+        a.renameTo("deleted-before");
+        assertEquals(1, a.getLastFailedBuild().getNumber(), "its own failed build, not the deleted job's none");
+    }
+
+    @Test
+    void deletingTheBuildAPermalinkNamesMovesItBack() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("moved-back");
+        r.buildAndAssertSuccess(p);
+        p.getBuildersList().add(new org.jvnet.hudson.test.FailureBuilder());
+        r.buildAndAssertStatus(hudson.model.Result.FAILURE, p);
+        assertThat(stored("moved-back"), containsString("lastFailedBuild 2"));
+        p.getBuildByNumber(2).delete();
+        assertThat("whichever of the deletion's listeners runs first", stored("moved-back"), containsString("lastFailedBuild -1"));
+        assertNull(p.getLastFailedBuild());
+    }
+
     @TestExtension
     public static class Provider implements PersistenceStoreProvider {
         @Override
