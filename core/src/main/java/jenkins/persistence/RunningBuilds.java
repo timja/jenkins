@@ -981,7 +981,7 @@ public final class RunningBuilds {
             }
             if (BuildRecords.isStored(job, number)) {
                 // completed: its record is published only once it has, and its owner was gone before removing this
-                return false;
+                return Adoption.NONE;
             }
             Placeholder p = Placeholder.fromBytes(key, number, entry.content(), entry.version());
             BuildAdopter.Adoption adoption = p == null ? null : prepare(job, p);
