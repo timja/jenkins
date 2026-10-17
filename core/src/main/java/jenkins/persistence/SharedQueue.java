@@ -741,9 +741,9 @@ public final class SharedQueue {
             if (id != null) {
                 return id;
             }
-            // the pool ran dry (a burst of items larger than it, before it was refilled): the one store call made under
-            // the queue lock, as an exception (an id is needed now, and one from a local range would leave the item
-            // unshared)
+            // the pool ran dry (a burst of items larger than it, before it was refilled): a store call made under the
+            // queue lock, as an exception (an id is needed now, and one from a local range would leave the item
+            // unshared); the other is a shared job's build number (StoredBuildNumberAssigner)
             return cq.nextId();
         }
 
