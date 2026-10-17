@@ -97,6 +97,9 @@ class SharedQueueTest {
     /** If set, called with the id of an item about to be updated (folded into). */
     static volatile java.util.function.LongConsumer beforeUpdate;
 
+    /** Run once as this controller next records that an item started, before it does. */
+    static volatile java.util.function.LongConsumer beforeStarted;
+
     /** While set, queue changes are not delivered to this controller's mirror but kept here: they come late. */
     static volatile List<Runnable> heldChanges;
 
@@ -155,8 +158,13 @@ class SharedQueueTest {
             }
 
             @Override
-            public void started(long id, int buildNumber) throws java.io.IOException {
-                cq.started(id, buildNumber);
+            public boolean started(long id, int buildNumber) throws java.io.IOException {
+                java.util.function.LongConsumer hook = beforeStarted;
+                if (hook != null) {
+                    beforeStarted = null;
+                    hook.accept(id);
+                }
+                return cq.started(id, buildNumber);
             }
 
             @Override
@@ -196,6 +204,7 @@ class SharedQueueTest {
     @BeforeEach
     void setUp(JenkinsRule rule) {
         r = rule;
+        beforeStarted = null;
         other = STORE.as("other-controller").clusterQueue();
     }
 
@@ -250,6 +259,26 @@ class SharedQueueTest {
         assertEquals(ClusterQueue.State.STARTED, rec.state());
         assertEquals(STORE.getOrigin(), rec.claimedBy());
         assertEquals(1, rec.buildNumber());
+    }
+
+    @Test
+    void aBuildStartedForAnItemTakenElsewhereSinceItsClaimIsStopped() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("reclaimed");
+        p.getBuildersList().add(new org.jvnet.hudson.test.SleepBuilder(60_000)); // working when stopped
+        // this controller paused past its claim lapsing: the store put the item back, and another controller took it
+        beforeStarted = id -> {
+            STORE.requeue(id);
+            try {
+                assertTrue(other.claim(id));
+            } catch (java.io.IOException e) {
+                throw new java.io.UncheckedIOException(e);
+            }
+        };
+        hudson.model.FreeStyleBuild b = r.assertBuildStatus(hudson.model.Result.ABORTED, p.scheduleBuild2(0));
+        assertNull(beforeStarted);
+        assertEquals("other-controller", STORE.clusterQueue().get(b.getQueueId()).claimedBy());
+        assertEquals(ClusterQueue.State.CLAIMED, STORE.clusterQueue().get(b.getQueueId()).state(), "not recorded as started here");
+        r.assertLogContains("Another controller took the queue item of this build", b);
     }
 
     @Test

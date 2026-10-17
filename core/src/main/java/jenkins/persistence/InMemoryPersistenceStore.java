@@ -296,18 +296,19 @@ public class InMemoryPersistenceStore implements PersistenceStore {
             }
 
             @Override
-            public void started(long id, int buildNumber) {
+            public boolean started(long id, int buildNumber) {
                 Record next;
                 synchronized (root) {
                     Record r = queueRecords.get(id);
-                    if (r == null || !origin.equals(r.claimedBy())) {
-                        return;
+                    if (r == null || !origin.equals(r.claimedBy()) || r.state() != State.CLAIMED && r.state() != State.STARTED) {
+                        return false;
                     }
                     next = with(r, State.STARTED, origin, buildNumber, r.actions(), r.dueAt());
                     queueRecords.put(id, next);
                     fire(next);
                 }
                 deliverQueue();
+                return true;
             }
 
             @Override

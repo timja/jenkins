@@ -126,8 +126,14 @@ public interface ClusterQueue {
         return r != null && claim(id, r.pinnedTo());
     }
 
-    /** Records that an item claimed here started as the given build. */
-    void started(long id, int buildNumber) throws IOException;
+    /**
+     * Records that an item claimed here started as the given build, if it is still claimed by this controller (or
+     * recorded as started by it as that build already: a retry). Stores must compare and record atomically: this is
+     * the fence that keeps a controller whose claim lapsed (paused, say) from building an item another one took.
+     *
+     * @return false if this controller no longer has it: put back into the queue, claimed elsewhere, or cancelled
+     */
+    boolean started(long id, int buildNumber) throws IOException;
 
     /**
      * Cancels an item which has not started: a waiting one, or one claimed by this controller (whose copy here was

@@ -650,12 +650,37 @@ public final class SharedQueue {
             }
             try {
                 ClusterQueue.Record r = cq.get(id);
-                if (r != null && origin().equals(r.claimedBy())) {
-                    cq.started(id, run.getNumber());
+                if (r != null && !cq.started(id, run.getNumber())) {
+                    ClusterQueue.Record now = cq.get(id);
+                    if (now == null || now.state() != ClusterQueue.State.STARTED || now.buildNumber() != run.getNumber()) {
+                        claimLost(run, now);
+                    } // else this very build, recorded by the controller that started it (adopted here since, say)
                 }
             } catch (IOException | RuntimeException e) {
                 LOGGER.log(Level.WARNING, "Failed to record that " + run + " started", e);
             }
+        }
+
+        /**
+         * Stops a build which started here for a queue item this controller no longer had claimed (its claim lapsed while
+         * it was paused, say): another controller builds that item, or will.
+         */
+        private static void claimLost(Run<?, ?> run, @CheckForNull ClusterQueue.Record now) {
+            LOGGER.warning(() -> run + " started for queue item " + run.getQueueId() + ", which this controller no longer had claimed ("
+                    + (now == null ? "gone" : now.state() + (now.claimedBy() == null ? "" : " by " + now.claimedBy())) + "); stopping it");
+            hudson.model.Executor executor = run.getExecutor();
+            if (executor != null) {
+                executor.interrupt(hudson.model.Result.ABORTED, new ClaimLost());
+            }
+        }
+    }
+
+    /** Cause of interruption of a build whose queue item another controller took meanwhile. */
+    @Restricted(NoExternalUse.class)
+    public static final class ClaimLost extends jenkins.model.CauseOfInterruption {
+        @Override
+        public String getShortDescription() {
+            return "Another controller took the queue item of this build";
         }
     }
 
