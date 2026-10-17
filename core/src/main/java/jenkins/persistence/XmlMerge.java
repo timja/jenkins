@@ -300,8 +300,29 @@ public final class XmlMerge {
         return w.toString();
     }
 
+    /**
+     * Escapes an attribute's value, as read (decoded), so that it reads back the same: tabs and line breaks too, which
+     * reading would turn into spaces, and control characters, which XML 1.1 only takes as character references.
+     */
     private static String escapeAttribute(String v) {
-        return v.replace("&", "&amp;").replace("<", "&lt;").replace("\"", "&quot;");
+        StringBuilder b = new StringBuilder(v.length());
+        for (int i = 0; i < v.length(); i++) {
+            char c = v.charAt(i);
+            switch (c) {
+                case '&' -> b.append("&amp;");
+                case '<' -> b.append("&lt;");
+                case '>' -> b.append("&gt;");
+                case '"' -> b.append("&quot;");
+                default -> {
+                    if (c < 0x20 || c >= 0x7F && c <= 0x9F) {
+                        b.append("&#x").append(Integer.toHexString(c)).append(';');
+                    } else {
+                        b.append(c);
+                    }
+                }
+            }
+        }
+        return b.toString();
     }
 
     private static String declaration(byte[] xml) {
