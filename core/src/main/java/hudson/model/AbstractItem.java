@@ -955,7 +955,6 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
     @SuppressWarnings("unchecked")
     public void updateByXml(Source source) throws IOException {
         checkPermission(CONFIGURE);
-        XmlFile configXmlFile = getConfigFile();
         final StringWriter out = new StringWriter();
         try {
             XMLUtils.safeTransform(source, new StreamResult(out));
@@ -976,7 +975,10 @@ public abstract class AbstractItem extends Actionable implements Loadable, Item,
         Jenkins.get().rebuildDependencyGraphAsync();
 
         // if everything went well, re-serialize from memory to encrypt secrets submitted in plaintext
-        configXmlFile.write(this);
+        // (where the item is now, under the lock renames and moves hold, as save() does: not where it was before one)
+        synchronized (this) {
+            getConfigFile().write(this);
+        }
         SaveableListener.fireOnChange(this, getConfigFile());
         ItemListener.fireOnUpdated(this);
     }

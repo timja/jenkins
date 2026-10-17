@@ -37,16 +37,23 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Util;
 import hudson.model.FreeStyleProject;
 import hudson.model.Items;
+import hudson.model.Job;
+import hudson.model.JobProperty;
+import hudson.model.JobPropertyDescriptor;
 import java.io.File;
 import java.io.IOException;
+import java.io.StringReader;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import javax.xml.transform.stream.StreamSource;
 import org.htmlunit.HttpMethod;
 import org.htmlunit.WebRequest;
 import org.htmlunit.WebResponse;
@@ -56,6 +63,7 @@ import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.MockFolder;
 import org.jvnet.hudson.test.TestExtension;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
+import org.kohsuke.stapler.DataBoundConstructor;
 
 /**
  * Renames and moves carry the stored configuration along.
@@ -294,6 +302,63 @@ class PersistenceStoreItemLifecycleTest {
         } finally {
             PersistenceStores.CONFLICTS = "warn";
         }
+    }
+
+    @Test
+    void anItemRenamedWhileItIsUpdatedByXmlIsSavedInItsNewPlace() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("posted-before");
+        RelocatingProperty.relocation.set(() -> p.renameTo("posted-after"));
+        p.updateByXml(new StreamSource(new StringReader(RelocatingProperty.XML)));
+        assertEquals("posted-after", p.getName());
+        assertThat(STORE.versions(), not(hasKey("jobs/posted-before/config.xml")));
+        assertThat(new String(STORE.read("jobs/posted-after/config.xml").content(), StandardCharsets.UTF_8), containsString("posted"));
+    }
+
+    @Test
+    void anItemMovedWhileItIsUpdatedByXmlIsSavedInItsNewPlace() throws Exception {
+        MockFolder f = r.createFolder("posted-f");
+        FreeStyleProject p = r.createFreeStyleProject("posted-p");
+        RelocatingProperty.relocation.set(() -> Items.move(p, f));
+        p.updateByXml(new StreamSource(new StringReader(RelocatingProperty.XML)));
+        assertEquals("posted-f/posted-p", p.getFullName());
+        assertThat(STORE.versions(), not(hasKey("jobs/posted-p/config.xml")));
+        assertThat(new String(STORE.read("jobs/posted-f/jobs/posted-p/config.xml").content(), StandardCharsets.UTF_8), containsString("posted"));
+    }
+
+    /** Has its job renamed or moved, from another thread, while the posted configuration is applied. */
+    public static class RelocatingProperty extends JobProperty<Job<?, ?>> {
+        static final String XML = "<?xml version='1.1' encoding='UTF-8'?><project><description>posted</description><properties>"
+                + "<jenkins.persistence.PersistenceStoreItemLifecycleTest_-RelocatingProperty/></properties></project>";
+        static final AtomicReference<Relocation> relocation = new AtomicReference<>();
+
+        interface Relocation {
+            void run() throws Exception;
+        }
+
+        @DataBoundConstructor
+        public RelocatingProperty() {}
+
+        @Override
+        protected void setOwner(Job<?, ?> owner) {
+            super.setOwner(owner);
+            Relocation relocate = relocation.getAndSet(null);
+            if (relocate != null) {
+                ExecutorService elsewhere = Executors.newSingleThreadExecutor();
+                try {
+                    elsewhere.submit(() -> {
+                        relocate.run();
+                        return null;
+                    }).get(30, TimeUnit.SECONDS);
+                } catch (Exception e) {
+                    throw new AssertionError(e);
+                } finally {
+                    elsewhere.shutdown();
+                }
+            }
+        }
+
+        @TestExtension({"anItemRenamedWhileItIsUpdatedByXmlIsSavedInItsNewPlace", "anItemMovedWhileItIsUpdatedByXmlIsSavedInItsNewPlace"})
+        public static class DescriptorImpl extends JobPropertyDescriptor {}
     }
 
     @TestExtension
