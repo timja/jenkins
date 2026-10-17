@@ -392,6 +392,46 @@ class SharedQueueTest {
     }
 
     @Test
+    void anItemReservedByAnotherControllerIsNotDemandHere() throws Exception {
+        long grace = SharedQueue.ORIGIN_GRACE_MILLIS;
+        SharedQueue.ORIGIN_GRACE_MILLIS = 0; // past its controller's head start at once
+        Label cloudy = Label.get("cloudy-reserved"); // no node has it: the items stay buildable, unclaimed
+        try {
+            // membership unknown: any controller would provision for it, but its controller is starting an agent for it
+            FreeStyleProject p = r.createFreeStyleProject("cloudy-reserved");
+            p.setAssignedLabel(cloudy);
+            ClusterQueue.Record rec = publishElsewhere("cloudy-reserved", 0, "hal");
+            STORE.write(SharedQueue.Reservations.key(rec.id()), ("other-controller " + System.currentTimeMillis()).getBytes(StandardCharsets.UTF_8),
+                    PersistenceStore.ANY);
+            for (int i = 0; i < 100 && Queue.getInstance().getBuildableItems().isEmpty(); i++) {
+                Thread.sleep(100);
+            }
+            assertEquals(1, Queue.getInstance().getBuildableItems().size());
+            assertEquals(0, cloudy.loadStatistics.computeSnapshot().getQueueLength(), "reserved by its controller");
+
+            // its controller is gone, and the one elected to provision reserved it before this one joined (and won)
+            Queue.getInstance().clear();
+            awaitMirrored();
+            String me = STORE.getOrigin();
+            ClusterQueue.Record orphan = publishElsewhere("cloudy-reserved", 0, "ida");
+            String survivor = java.util.stream.IntStream.range(0, 1000).mapToObj(i -> "controller-" + i)
+                    .filter(o -> me.equals(SharedQueue.provisioner(orphan.id(), Set.of(me, o)))).findFirst().orElseThrow();
+            live = Set.of(me, survivor);
+            STORE.write(SharedQueue.Reservations.key(orphan.id()), (survivor + " " + System.currentTimeMillis()).getBytes(StandardCharsets.UTF_8),
+                    PersistenceStore.ANY);
+            for (int i = 0; i < 100 && Queue.getInstance().getBuildableItems().isEmpty(); i++) {
+                Thread.sleep(100);
+            }
+            assertEquals(1, Queue.getInstance().getBuildableItems().size());
+            assertEquals(0, cloudy.loadStatistics.computeSnapshot().getQueueLength(), "reserved by a live controller");
+        } finally {
+            live = null;
+            SharedQueue.ORIGIN_GRACE_MILLIS = grace;
+            Queue.getInstance().clear();
+        }
+    }
+
+    @Test
     void cancellingAReservedItemDoesNotWaitForTheStoreToReleaseIt() throws Exception {
         r.createFreeStyleProject("reserved-cancelled");
         ClusterQueue.Record rec = publishElsewhere("reserved-cancelled", 60_000, "hal");
