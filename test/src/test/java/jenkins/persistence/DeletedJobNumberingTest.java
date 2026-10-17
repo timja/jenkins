@@ -153,6 +153,26 @@ class DeletedJobNumberingTest {
     }
 
     @Test
+    void moveUndoneLeavesTheRaisedNumberAtTheDestination() throws Exception {
+        FreeStyleProject old = r.createFreeStyleProject("vacated");
+        for (int i = 0; i < 3; i++) {
+            r.buildAndAssertSuccess(old);
+        }
+        old.delete();
+        FreeStyleProject p = r.createFreeStyleProject("returning");
+        r.buildAndAssertSuccess(p);
+        File to = new File(r.jenkins.getRootDir(), "jobs/vacated");
+        PersistenceStores.move(p.getRootDir(), to);
+        // the local directory could not be moved: the stored entries go back
+        PersistenceStores.moveBack(to, p.getRootDir());
+
+        assertEquals("4", stored("jobs/vacated/nextBuildNumber"), "a job made there later does not reuse the deleted job's numbers");
+        assertEquals("4", stored("jobs/returning/nextBuildNumber"), "raised by the move, and back");
+        assertTrue(STORE.read("jobs/returning/config.xml") != null);
+        assertEquals(List.of("1"), builds("returning"));
+    }
+
+    @Test
     void renameOntoExistingItemStillFails() throws Exception {
         // something other than a leftover number at the destination
         STORE.write("jobs/occupied/config.xml", "<project/>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);

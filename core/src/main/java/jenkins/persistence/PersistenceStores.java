@@ -329,6 +329,46 @@ public final class PersistenceStores {
         }
     }
 
+    /**
+     * Undoes a {@link #move} the caller could not complete (its local directory could not be moved): moves the entries
+     * back, and leaves a copy of each {@code nextBuildNumber} moved back at {@code from}, as a deleted item leaves its
+     * own. The move may have raised them to numbers a deleted item at {@code from} used, which an item made there later
+     * must not use again; elsewhere, a counter left at a vacated name only makes numbers there start higher.
+     */
+    public static void moveBack(@NonNull File from, @NonNull File to) throws IOException {
+        move(from, to);
+        PersistenceStore store = get();
+        String fromKey = keyFor(from);
+        String toKey = keyFor(to);
+        if (store == null || fromKey == null || toKey == null || fromKey.equals(toKey) || isApplyingRemoteChange()) {
+            return;
+        }
+        List<String> counters = new ArrayList<>();
+        collectBuildNumbers(store, toKey, counters);
+        for (String key : counters) {
+            PersistenceStore.Entry entry = store.read(key);
+            String left = fromKey + key.substring(toKey.length());
+            if (entry != null && store.owns(left)) {
+                try {
+                    store.write(left, entry.content(), PersistenceStore.ABSENT);
+                } catch (ConflictException e) {
+                    // something is there again, with its own numbers
+                }
+            }
+        }
+    }
+
+    /** Collects the {@code nextBuildNumber} keys of the items below a key; build records are not looked into. */
+    private static void collectBuildNumbers(PersistenceStore store, String prefix, List<String> keys) throws IOException {
+        for (String child : store.children(prefix)) {
+            if (child.equals("nextBuildNumber")) {
+                keys.add(prefix + "/" + child);
+            } else if (!child.equals("builds")) {
+                collectBuildNumbers(store, prefix + "/" + child, keys);
+            }
+        }
+    }
+
     private static void release(PersistenceStore store, String key, long claim) {
         try {
             store.delete(key + MOVING, claim);
