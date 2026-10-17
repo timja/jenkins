@@ -76,12 +76,27 @@ class ItemChangeApplierTest {
                 beforeLoading = null;
                 r.run();
             }
+            String from = unreachableFrom;
+            if (key.equals(unreachableKey) && from != null && StackWalker.getInstance().walk(s -> s.anyMatch(f -> f.getMethodName().equals(from)))) {
+                unreachableKey = null;
+                throw ItemChangeApplierTest.<RuntimeException>sneaky(new IOException("the store is unreachable, this time"));
+            }
             return super.read(key);
         }
     };
 
     /** While set, run once as an item is next loaded here, just before its file is read. */
     static volatile Runnable beforeLoading;
+
+    /** A key whose next read made from a method of that name fails, as from a store unreachable for a moment. */
+    static volatile String unreachableKey;
+
+    static volatile String unreachableFrom;
+
+    @SuppressWarnings("unchecked")
+    private static <T extends Throwable> T sneaky(Throwable t) throws T {
+        throw (T) t; // an IOException, as a store throws, from a read that does not declare it
+    }
 
     private JenkinsRule r;
     private PersistenceStore other;
@@ -269,6 +284,28 @@ class ItemChangeApplierTest {
         assertTrue(new File(r.jenkins.getRootDir(), "jobs/victim").isDirectory());
         assertTrue(new File(r.jenkins.getRootDir(), "jobs/dots").isDirectory());
         other.move("jobs/dots/jobs/..", "jobs/victim"); // as it was, for the other tests
+    }
+
+    @Test
+    void aChangeElsewhereWhoseCheckFailsWhileTheStoreIsUnreachableIsAppliedByTheRetry() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("outage");
+        unreachableFrom = "written";
+        unreachableKey = "jobs/outage/config.xml";
+        other.write("jobs/outage/config.xml", project("changed during an outage"), PersistenceStore.ANY);
+        awaitApplied();
+        assertNull(unreachableKey, "the check failed");
+        assertEquals("changed during an outage", p.getDescription(), "not taken for deleted meanwhile");
+    }
+
+    @Test
+    void aChildMadeElsewhereWhileTheStoreIsUnreachableIsLoadedByTheRetry() throws Exception {
+        MockFolder f = r.createFolder("outage-folder");
+        unreachableFrom = "loadChildren";
+        unreachableKey = "jobs/outage-folder/jobs/c/config.xml";
+        other.write("jobs/outage-folder/jobs/c/config.xml", project("child"), PersistenceStore.ABSENT);
+        awaitApplied();
+        assertNull(unreachableKey, "the check failed");
+        assertNotNull(f.getItem("c"), "not dropped from the folder");
     }
 
     @Test
