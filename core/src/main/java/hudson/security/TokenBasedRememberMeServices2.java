@@ -118,13 +118,18 @@ public class TokenBasedRememberMeServices2 extends AbstractRememberMeServices {
 
     @Override
     protected boolean rememberMeRequested(HttpServletRequest request, String parameter) {
-        return ALWAYS_REMEMBER || super.rememberMeRequested(request, parameter); // read on each login, not once
+        // read on each login, not once; not for credentials sent with each request (an API token, say): the cookie,
+        // signed with the user's seed, would outlive the token being revoked
+        return ALWAYS_REMEMBER && request.getHeader("Authorization") == null || super.rememberMeRequested(request, parameter);
     }
 
     /**
      * Whether to issue the remember-me cookie on every login, as if "Keep me signed in" were always checked.
      * With several controllers behind one load balancer sharing users and keys, this signed cookie authenticates
      * a browser on whichever controller its next request reaches, without a shared session.
+     * Requests authenticating with an {@code Authorization} header (an API token, a password) get no cookie this way.
+     * A form rendered by one controller and submitted to another also needs a crumb issuer whose crumbs are not bound
+     * to the HTTP session (one shared by the controllers, or {@code DefaultCrumbIssuer.EXCLUDE_SESSION_ID}).
      */
     @Restricted(Beta.class)
     @SuppressFBWarnings(value = "MS_SHOULD_BE_FINAL", justification = "for script console")
