@@ -205,7 +205,7 @@ public final class ItemChangeApplier {
         String fullName = String.join("/", names);
         Item item = jenkins.getItemByFullName(fullName);
         if (item instanceof AbstractItem existing) {
-            if (!existing.getConfigFile().exists()) {
+            if (!existing.getConfigFile().checkExists()) { // a store unreachable throws: retried, not taken for a deletion
                 return; // moved or deleted since; that change follows, and reloads it at its new name if moved
             }
             LOGGER.fine(() -> "Reloading " + fullName + " changed elsewhere");
@@ -226,7 +226,7 @@ public final class ItemChangeApplier {
             return;
         }
         File dir = PersistenceStores.fileFor(e.key()).getParentFile();
-        if (!Items.getConfigFile(dir).exists()) {
+        if (!Items.getConfigFile(dir).checkExists()) {
             return; // moved or deleted since; that change follows
         }
         Util.createDirectories(dir.toPath());
@@ -301,7 +301,7 @@ public final class ItemChangeApplier {
                 Items.renameToMatchStore(existing, to.get(to.size() - 1));
             } else if (destination instanceof DirectlyModifiableTopLevelItemGroup d) {
                 move(existing, d);
-            } else if (destination == null && !existing.getConfigFile().exists()) {
+            } else if (destination == null && !existing.getConfigFile().checkExists()) {
                 // where it went is not here (moved or renamed on since): stored nowhere under this name, this copy is
                 // taken out, and the item is loaded where it is now as the changes that put it there are applied
                 takeOut(existing.getParent(), existing, "moved elsewhere to " + String.join("/", to) + ", which is not here");

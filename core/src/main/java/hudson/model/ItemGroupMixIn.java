@@ -143,7 +143,19 @@ public abstract class ItemGroupMixIn {
                 V item = (V) parent.getItem(subdir.getName());
                 if (item == null) {
                     XmlFile xmlFile = Items.getConfigFile(subdir);
-                    if (xmlFile.exists()) {
+                    boolean exists;
+                    try {
+                        exists = xmlFile.checkExists();
+                    } catch (IOException e) {
+                        if (PersistenceStores.isApplyingRemoteChange()) {
+                            // a folder reloaded for a change made elsewhere: that change fails, and is applied again later,
+                            // rather than the child being dropped from the folder here for the store being unreachable
+                            throw new UncheckedIOException(e);
+                        }
+                        Logger.getLogger(ItemGroupMixIn.class.getName()).log(Level.WARNING, "could not check for " + xmlFile, e);
+                        continue;
+                    }
+                    if (exists) {
                         item = (V) Items.load(parent, subdir);
                     } else {
                         Logger.getLogger(ItemGroupMixIn.class.getName()).log(Level.WARNING, "could not find file " + xmlFile.getFile());
@@ -154,6 +166,9 @@ public abstract class ItemGroupMixIn {
                 }
                 configurations.put(key.call(item), item);
             } catch (Exception e) {
+                if (e instanceof UncheckedIOException && PersistenceStores.isApplyingRemoteChange()) {
+                    throw (UncheckedIOException) e; // the store unreachable: retried, as above
+                }
                 Logger.getLogger(ItemGroupMixIn.class.getName()).log(Level.WARNING, "could not load " + subdir, e);
             }
         }
