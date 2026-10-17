@@ -53,8 +53,8 @@ public interface BuildLeases {
 
     /**
      * Whether this origin still holds the lease with this epoch.
-     * Implementations should answer false, rather than throw, once they cannot have been considered alive
-     * by the other controllers for long enough for the lease to lapse.
+     * False only on evidence from the store that it does not (another epoch, another holder, no lease); a store which
+     * cannot tell (being unreachable, say) throws: the build is then not taken for lost, which would stop it.
      */
     boolean holds(@NonNull String key, long epoch) throws IOException;
 

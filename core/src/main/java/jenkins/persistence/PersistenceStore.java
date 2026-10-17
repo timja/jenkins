@@ -161,18 +161,19 @@ public interface PersistenceStore {
     /**
      * Writes an entry only while this origin holds a {@linkplain #leases lease} with this epoch: the lease is the fence,
      * so that a controller which lost a build (another one took it over) cannot write its record over the new owner's.
-     * Stores should check and write atomically (in one transaction); this default checks, then writes.
+     * A store which offers {@linkplain #leases leases} must implement it, checking and writing atomically (in one
+     * transaction): checking, then writing, would let a controller paused in between write over the new owner's.
      *
      * @return the new version, as {@link #write}
      * @throws LeaseLostException if the lease is not (or no longer) held with this epoch
+     * @throws UnsupportedOperationException if this store offers leases but not this
      */
     default long writeIfHeld(@NonNull String leaseKey, long epoch, @NonNull String key, @NonNull byte[] content, long expectedVersion)
             throws IOException {
-        BuildLeases leases = leases();
-        if (leases != null && !leases.holds(leaseKey, epoch)) {
-            throw new LeaseLostException(leaseKey, epoch);
+        if (leases() != null) {
+            throw new UnsupportedOperationException(getClass().getName() + " offers leases, so must fence writes by them atomically");
         }
-        return write(key, content, expectedVersion);
+        return write(key, content, expectedVersion); // no leases: nothing to fence by (builds are never adopted)
     }
 
     /**
