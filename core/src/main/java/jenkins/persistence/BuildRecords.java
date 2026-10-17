@@ -263,7 +263,7 @@ public final class BuildRecords {
             publishing.merge(base, 1, Integer::sum);
         }
         try {
-            publish(run, base, filesChanged);
+            publish(run, base, filesChanged, recordChanged);
         } finally {
             synchronized (deleted) {
                 publishing.computeIfPresent(base, (k, n) -> n == 1 ? null : n - 1);
@@ -271,7 +271,7 @@ public final class BuildRecords {
         }
     }
 
-    private static void publish(Run<?, ?> run, String base, boolean filesChanged) throws IOException {
+    private static void publish(Run<?, ?> run, String base, boolean filesChanged, boolean recordChanged) throws IOException {
         File dir = run.getRootDir();
         Path record = new File(dir, RECORD).toPath();
         if (!Files.isRegularFile(record)) {
