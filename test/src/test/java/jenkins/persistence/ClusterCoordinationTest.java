@@ -130,6 +130,17 @@ class ClusterCoordinationTest {
         }
 
         @Override
+        public Entry read(String key) {
+            if (key.endsWith(".stop")) {
+                stopReads.incrementAndGet();
+                if (failingStopReads.getAndUpdate(n -> Math.max(0, n - 1)) > 0) {
+                    throw new UncheckedIOException(new IOException("the store cannot be read, this time"));
+                }
+            }
+            return super.read(key);
+        }
+
+        @Override
         public Set<String> children(String parentKey) {
             CountDownLatch l = slowListing;
             if (l != null && parentKey.startsWith("jobs/slow")) {
@@ -153,6 +164,9 @@ class ClusterCoordinationTest {
     static final AtomicInteger failingExclusive = new AtomicInteger();
     /** How many of the next releases of a job's exclusive lease here fail. */
     static final AtomicInteger failingRelease = new AtomicInteger();
+    /** Reads of stop requests, and how many of the next ones fail. */
+    static final AtomicInteger stopReads = new AtomicInteger();
+    static final AtomicInteger failingStopReads = new AtomicInteger();
     /** Origins the store reports as alive; null means everyone. */
     static volatile Set<String> live;
 
@@ -168,6 +182,7 @@ class ClusterCoordinationTest {
         failingReads.set(0);
         failingExclusive.set(0);
         failingRelease.set(0);
+        failingStopReads.set(0);
         Adopter.resuming = null;
         Adopter.resume = null;
         Adopter.abandoned.set(0);
@@ -558,6 +573,54 @@ class ClusterCoordinationTest {
             SharedQueue.abandonExclusive(p, 5);
             STORE.delete(key, PersistenceStore.ANY);
         }
+    }
+
+    /** A build of a new job, made here but not started, adopted as #1: loaded here, but with no executor (yet). */
+    private FreeStyleProject adoptedWithoutAnExecutor(String name) throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject(name);
+        p.setConcurrentBuild(true); // no exclusive lease to keep from other tests
+        assertEquals(1, p.createExecutable().getNumber());
+        PersistenceStore dead = STORE.as("dead-controller");
+        String key = "jobs/" + name + "/running/1.xml";
+        long deadEpoch = dead.leases().acquire(key);
+        dead.write(key, bytes("origin=dead-controller\ncontroller=jenkins-x\ndisplayName=#1\nstartTime=1\nepoch=" + deadEpoch + "\n"), PersistenceStore.ABSENT);
+        Adopter.job = p.getFullName();
+        live = Set.of(STORE.getOrigin());
+        try {
+            RunningBuilds.removeStale(); // (the store outlives tests: others' placeholders may be swept too)
+            assertEquals(List.of(1), Adopter.resumed);
+        } finally {
+            live = null;
+        }
+        assertThat(new String(STORE.read(key).content(), StandardCharsets.UTF_8), containsString("origin=" + STORE.getOrigin()));
+        return p;
+    }
+
+    @Test
+    void stopOfABuildOwnedHereWithNoExecutorYetIsKept() throws Exception {
+        FreeStyleProject p = adoptedWithoutAnExecutor("stop-before-executor");
+        RunningBuilds.requestStop(p, 1, "carl");
+        assertNotNull(STORE.read("jobs/stop-before-executor/running/1.stop"), "kept until the build can be stopped");
+        int reads = stopReads.get();
+        for (int i = 0; i < 50 && stopReads.get() == reads; i++) {
+            Thread.sleep(100);
+        }
+        assertThat("looked at again, for when it has an executor", stopReads.get(), greaterThan(reads));
+        STORE.delete("jobs/stop-before-executor/running/1.stop", PersistenceStore.ANY);
+    }
+
+    @Test
+    void stopOfABuildWithNoExecutorYetIsRetriedWhenTheStoreFails() throws Exception {
+        FreeStyleProject p = adoptedWithoutAnExecutor("stop-retried");
+        other.write("jobs/stop-retried/running/1.stop", bytes("controller=jenkins-b\nby=dora\n"), PersistenceStore.ANY);
+        awaitApplied(); // taken here: no executor, so looked at again later
+        int reads = stopReads.get();
+        failingStopReads.set(1); // when it is
+        for (int i = 0; i < 100 && stopReads.get() < reads + 2; i++) {
+            Thread.sleep(100);
+        }
+        assertThat("looked at again after the store failed", stopReads.get(), greaterThan(reads + 1));
+        STORE.delete("jobs/stop-retried/running/1.stop", PersistenceStore.ANY);
     }
 
         // as here, where its own builds do not block it either

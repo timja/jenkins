@@ -723,8 +723,7 @@ public final class RunningBuilds {
         String key = runningKey + "/" + number + SUFFIX;
         if (owned.containsKey(key)) {
             Run<?, ?> run = job.getBuildByNumber(number);
-            if (run != null && run.isLogUpdated()) {
-                interrupt(run, new StoppedElsewhere(CONTROLLER_NAME, by));
+            if (run != null && run.isLogUpdated() && interrupt(run, new StoppedElsewhere(CONTROLLER_NAME, by))) {
                 return;
             }
         }
@@ -738,6 +737,11 @@ public final class RunningBuilds {
         StringWriter w = new StringWriter();
         request.store(w, null); // escaped, as it is read (a user name may hold a backslash)
         store.write(runningKey + "/" + number + STOP_SUFFIX, w.toString().getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
+        if (owned.containsKey(key)) {
+            // owned here, but not loaded or given an executor yet (being resumed): stopped once it has one (the event of
+            // this controller's own write is not applied here)
+            stopRequested(jobKeyOfRunning(runningKey), number);
+        }
     }
 
     /** How many times a stop request is retried while the build it is for has no executor yet (being resumed). */
@@ -769,19 +773,29 @@ public final class RunningBuilds {
         if (run == null || run.isLogUpdated() && !interrupt(run, new StoppedElsewhere(p.getProperty("controller", "?"), p.getProperty("by", "?")))) {
             // adopted, but not loaded or given an executor yet: the request is kept (its build's completion removes it)
             if (attempt < STOP_ATTEMPTS) {
-                Timer.get().schedule(() -> {
-                    try {
-                        stopRequested(jobKey, number, attempt + 1);
-                    } catch (IOException | RuntimeException e) {
-                        LOGGER.log(Level.WARNING, "Failed to stop " + jobKey + " #" + number + " as requested", e);
-                    }
-                }, Math.min(30, 1L << attempt), TimeUnit.SECONDS);
+                stopLater(jobKey, number, attempt);
             } else {
                 LOGGER.warning(() -> "Could not stop " + jobKey + " #" + number + " as requested: it has no executor");
             }
             return;
         }
         store.delete(stopKey, PersistenceStore.ANY);
+    }
+
+    /** Tries {@link #stopRequested} again later; again after that if the store fails then (nothing else would). */
+    private static void stopLater(String jobKey, int number, int attempt) {
+        Timer.get().schedule(() -> {
+            try {
+                stopRequested(jobKey, number, attempt + 1);
+            } catch (IOException | RuntimeException e) {
+                if (attempt + 1 < STOP_ATTEMPTS) {
+                    LOGGER.log(Level.INFO, "Failed to stop " + jobKey + " #" + number + " as requested; retrying", e);
+                    stopLater(jobKey, number, attempt + 1);
+                } else {
+                    LOGGER.log(Level.WARNING, "Failed to stop " + jobKey + " #" + number + " as requested", e);
+                }
+            }
+        }, Math.min(30, 1L << attempt), TimeUnit.SECONDS);
     }
 
     /** @return false if the build has no executor (yet) to interrupt */
