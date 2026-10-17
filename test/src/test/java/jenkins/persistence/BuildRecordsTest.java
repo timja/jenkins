@@ -110,11 +110,23 @@ class BuildRecordsTest {
             }
             return super.write(key, content, expectedVersion);
         }
+        public Set<String> children(String parentKey) {
+            if (unlistable) {
+                throw sneaky(new IOException("the store is unreachable")); // checked, as a real store throws it
+            }
+            return super.children(parentKey);
+        }
     };
+    @SuppressWarnings("unchecked")
+    private static <T extends Throwable> RuntimeException sneaky(Throwable t) throws T {
+        throw (T) t;
+    }
+
     static volatile Consumer<String> afterRead;
     /** Origins the store reports as alive; null means membership is not tracked. */
     static volatile Set<String> live;
     static volatile Consumer<String> beforeWrite;
+    static volatile boolean unlistable;
     static final InMemoryBlobStore BLOBS = new InMemoryBlobStore() {
         @Override
         public void move(String fromPrefix, String toPrefix) {
@@ -252,6 +264,20 @@ class BuildRecordsTest {
         wipeAndReload(r);
         File dir = r.jenkins.getItemByFullName("planted", FreeStyleProject.class).getBuildByNumber(1).getRootDir();
         assertFalse(Files.isSymbolicLink(dir.toPath().resolve("log")));
+    }
+
+    @Test
+    void anImportCanTellNoBuildsFromUnknown() throws Exception {
+        FreeStyleProject p = project(r, "listed");
+        r.buildAndAssertSuccess(p);
+        assertEquals(Set.of(1), BuildRecords.listStoredNumbers(p));
+        unlistable = true;
+        try {
+            assertThrows(IOException.class, () -> BuildRecords.listStoredNumbers(p));
+            assertEquals(Set.of(), BuildRecords.storedNumbers(p), "where unknown is taken as none");
+        } finally {
+            unlistable = false;
+        }
     }
 
     @Test
