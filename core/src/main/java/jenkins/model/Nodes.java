@@ -357,6 +357,12 @@ public class Nodes implements PersistenceRoot {
                 jenkins.trimLabels();
                 NodeListener.fireOnDeleted(old);
             }
+            try {
+                // a copy left here (read from the store, say) must not bring the node back at the next startup
+                Util.deleteRecursive(new File(getRootDir(), name));
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "could not delete the directory of " + name + ", deleted elsewhere", e);
+            }
             return;
         }
         Node loaded = load(name, true);
