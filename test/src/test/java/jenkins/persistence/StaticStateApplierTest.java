@@ -520,6 +520,26 @@ class StaticStateApplierTest {
     }
 
     @Test
+    void aPermanentNodeReplacingACloudAgentOfItsNameIsShared() throws Exception {
+        r.jenkins.addNode(new TestCloudAgent("pod5"));
+        assertNull(STORE.read("nodes/pod5/config.xml"));
+        r.jenkins.addNode(new hudson.slaves.DumbSlave("pod5", "/tmp/pod5", new hudson.slaves.JNLPLauncher())); // through the API
+        assertNotNull(STORE.read("nodes/pod5/config.xml"), "shared, as any permanent node");
+        assertFalse(PersistenceStores.isKeptLocal("nodes/pod5/config.xml"));
+    }
+
+    @Test
+    void aNodeDeletedElsewhereLeavesThisControllersCloudAgentOfItsName() throws Exception {
+        r.jenkins.addNode(new TestCloudAgent("pod6"));
+        r.createSlave("n6", null, null);
+        writeElsewhere("nodes/pod6/config.xml", text("nodes/n6/config.xml").replace("<name>n6</name>", "<name>pod6</name>"));
+        other.delete("nodes/pod6/config.xml", PersistenceStore.ANY); // another controller's permanent node of that name
+        awaitApplied();
+        assertNotNull(r.jenkins.getNode("pod6"));
+        assertTrue(new File(r.jenkins.getRootDir(), "nodes/pod6/config.xml").isFile(), "its configuration stays here");
+    }
+
+    @Test
     void aCloudAgentOfThisControllerSurvivesItsRestart() throws Exception {
         r.jenkins.addNode(new TestCloudAgent("pod3"));
         PersistenceStores.keepLocal("nodes/pod3/config.xml", false); // what a restart forgets

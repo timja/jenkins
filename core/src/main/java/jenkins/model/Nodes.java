@@ -223,20 +223,21 @@ public class Nodes implements PersistenceRoot {
     }
 
     public XmlFile getConfigFile(Node node) {
-        if (node instanceof AbstractCloudSlave) {
-            // launched by this controller's cloud: other controllers sharing a persistence store must not launch it too
-            String key = PersistenceStores.keyFor(new File(node.getRootDir(), "config.xml"));
-            if (key != null) {
-                PersistenceStores.keepLocal(key, true);
-            }
+        // a cloud agent, launched by this controller's cloud: other controllers sharing a persistence store must not
+        // launch it too; any other node is shared, also one that replaced a cloud agent of the same name
+        String key = PersistenceStores.keyFor(new File(node.getRootDir(), "config.xml"));
+        if (key != null) {
+            PersistenceStores.keepLocal(key, node instanceof AbstractCloudSlave);
         }
         return getConfigFile(node.getRootDir());
     }
 
-    /** Whether a node is a cloud agent which another controller launched (its configuration came from the store). */
+    /**
+     * Whether a node is a cloud agent which another controller launched (its configuration came from the store): one
+     * whose configuration a store owns and which this controller does not keep local. Without such a store, none is.
+     */
     private static boolean launchedElsewhere(Node n, File dir) {
-        String key = PersistenceStores.keyFor(new File(dir, "config.xml"));
-        return n instanceof AbstractCloudSlave && key != null && !PersistenceStores.isKeptLocal(key);
+        return n instanceof AbstractCloudSlave && PersistenceStores.route(new File(dir, "config.xml")) != null;
     }
 
     public XmlFile getConfigFile(File dir) {
@@ -373,6 +374,10 @@ public class Nodes implements PersistenceRoot {
         }
         Node old = getNode(name);
         if (deleted) {
+            String key = PersistenceStores.keyFor(getConfigFile(name).getPath());
+            if (key != null && PersistenceStores.isKeptLocal(key)) {
+                return; // this controller's cloud agent of that name, which the store never had: not the node deleted
+            }
             if (old != null) {
                 unload(old);
                 jenkins.updateComputerList();
