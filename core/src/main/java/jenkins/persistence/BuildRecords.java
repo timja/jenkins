@@ -58,6 +58,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -216,6 +217,19 @@ public final class BuildRecords {
             return;
         }
         String base = builds + "/" + run.getNumber();
+        synchronized (deleted) {
+            publishing.merge(base, 1, Integer::sum);
+        }
+        try {
+            publish(run, base);
+        } finally {
+            synchronized (deleted) {
+                publishing.computeIfPresent(base, (k, n) -> n == 1 ? null : n - 1);
+            }
+        }
+    }
+
+    private static void publish(Run<?, ?> run, String base) throws IOException {
         File dir = run.getRootDir();
         Path record = new File(dir, RECORD).toPath();
         if (!Files.isRegularFile(record)) {
@@ -302,11 +316,15 @@ public final class BuildRecords {
      * {@link #DELETED_MILLIS} rather than up to a count: however many builds are deleted meanwhile (a discarder sweeping
      * a big job), a publication stalled in its upload still finds its build's marker. A marker applies only to a build
      * that started before it: a job made again under the name (its next build number moved away with a rename) can
-     * have a build of that number again, which is not the one deleted.
+     * have a build of that number again, which is not the one deleted. The marker of a build being published is kept
+     * however old, until a later deletion after the publication: one stalled for longer still finds it.
      */
     private static final LinkedHashMap<String, Long> deleted = new LinkedHashMap<>();
 
-    static final long DELETED_MILLIS = TimeUnit.HOURS.toMillis(1);
+    /** Publications in progress, by build key: how many. Guarded by {@link #deleted}. */
+    private static final Map<String, Integer> publishing = new HashMap<>();
+
+    static /* non-final for tests */ long DELETED_MILLIS = TimeUnit.HOURS.toMillis(1);
 
     private static boolean isDeleted(String base, Run<?, ?> run) {
         synchronized (deleted) {
@@ -320,11 +338,14 @@ public final class BuildRecords {
         synchronized (deleted) {
             deleted.remove(base);
             deleted.put(base, now);
-            for (var it = deleted.values().iterator(); it.hasNext(); ) {
-                if (it.next() >= now - DELETED_MILLIS) {
+            for (var it = deleted.entrySet().iterator(); it.hasNext(); ) {
+                var marker = it.next();
+                if (marker.getValue() >= now - DELETED_MILLIS) {
                     break; // in the order marked: the rest are newer
                 }
-                it.remove();
+                if (!publishing.containsKey(marker.getKey())) {
+                    it.remove();
+                }
             }
         }
     }
