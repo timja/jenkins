@@ -91,6 +91,9 @@ public final class SubItems {
             return;
         }
         for (String name : store.children(prefix)) {
+            if (!PersistenceStores.isSafeName(name)) {
+                continue; // no controller writes it: ".." would make directories outside the job's
+            }
             if (name.equals("config.xml")) {
                 Util.createDirectories(PersistenceStores.fileFor(prefix + "/config.xml").getParentFile().toPath());
             } else {
