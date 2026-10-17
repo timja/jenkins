@@ -292,12 +292,18 @@ public final class ItemChangeApplier {
             LOGGER.fine(() -> "Moving " + existing.getFullName() + " to " + String.join("/", to) + " as done elsewhere");
             ItemGroup<?> destination = parentOf(to);
             if (destination != null && destination.getItem(to.get(to.size() - 1)) instanceof AbstractItem placeholder && placeholder != existing) {
-                dropPlaceholder(destination, placeholder);
+                takeOut(destination, placeholder, "loaded before the move that brings it here was applied");
             }
             if (from.subList(0, from.size() - 1).equals(to.subList(0, to.size() - 1))) {
                 Items.renameToMatchStore(existing, to.get(to.size() - 1));
             } else if (destination instanceof DirectlyModifiableTopLevelItemGroup d) {
                 move(existing, d);
+            } else if (destination == null && !existing.getConfigFile().exists()) {
+                // where it went is not here (moved or renamed on since): stored nowhere under this name, this copy is
+                // taken out, and the item is loaded where it is now as the changes that put it there are applied
+                takeOut(existing.getParent(), existing, "moved elsewhere to " + String.join("/", to) + ", which is not here");
+                applied.incrementAndGet();
+                return;
             } else {
                 LOGGER.warning(() -> "Cannot move " + existing.getFullName() + " to " + String.join("/", to));
                 return;
@@ -311,15 +317,17 @@ public final class ItemChangeApplier {
     }
 
     /**
-     * Takes out of its parent an item loaded at the destination of a move from the store before the move was applied
-     * (with a folder created elsewhere just before), so that the item being moved, with its builds, takes its place.
-     * Nothing is deleted from the store: that is the moved item's configuration.
+     * Takes an item out of its parent, its local directory deleted, or moved aside if it holds more than loading makes.
+     * For an item loaded at the destination of a move from the store before the move was applied (with a folder created
+     * elsewhere just before), so that the item being moved, with its builds, takes its place; or for the source of a
+     * move whose destination is not here, a copy stored nowhere any more.
+     * Nothing is deleted from the store.
      */
-    private void dropPlaceholder(ItemGroup<?> parent, AbstractItem placeholder) throws Exception {
+    private void takeOut(ItemGroup<?> parent, AbstractItem placeholder, String why) throws Exception {
         if (!(parent instanceof DirectlyModifiableTopLevelItemGroup group) || !(placeholder instanceof TopLevelItem item)) {
             return;
         }
-        LOGGER.fine(() -> "Dropping " + placeholder.getFullName() + ", loaded before the move that brings it here was applied");
+        LOGGER.fine(() -> "Dropping " + placeholder.getFullName() + ", " + why);
         group.remove(item);
         File dir = placeholder.getRootDir();
         String key = PersistenceStores.keyFor(dir);
