@@ -46,7 +46,9 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Collection;
+import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import jenkins.model.Jenkins;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -65,6 +67,9 @@ class PersistenceStoreItemEnumerationTest {
             key -> key.startsWith("jobs/") && key.endsWith("/config.xml") && !key.contains("/builds/")) {
         @Override
         public Entry read(@NonNull String key) {
+            if (reads != null) {
+                reads.add(key);
+            }
             if (key.equals(unreadable)) {
                 throw new UncheckedIOException(new IOException("cannot read " + key));
             }
@@ -74,6 +79,9 @@ class PersistenceStoreItemEnumerationTest {
 
     /** A key whose reads fail. */
     static volatile String unreadable;
+
+    /** While set, the keys read. */
+    static volatile List<String> reads;
 
     private JenkinsRule r;
 
@@ -142,6 +150,39 @@ class PersistenceStoreItemEnumerationTest {
         assertNotNull(r.jenkins.getItem("a"));
         assertNull(r.jenkins.getItem("b"));
         assertNotNull(r.jenkins.getItem("c"));
+    }
+
+    @Test
+    void itemsListedLocallyAreNotReadToEnumerate() throws Exception {
+        r.createFreeStyleProject("here");
+        STORE.write("jobs/only-stored/config.xml", "<?xml version='1.1' encoding='UTF-8'?><project/>".getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+        File jobs = new File(r.jenkins.getRootDir(), "jobs");
+        reads = new CopyOnWriteArrayList<>();
+        Set<String> names;
+        try {
+            names = PersistenceStores.storedItemNames(jobs, Set.of("here"));
+        } finally {
+            List<String> read = reads;
+            reads = null;
+            assertFalse(read.contains("jobs/here/config.xml"), read.toString());
+        }
+        assertFalse(names.contains("here"));
+        assertTrue(names.contains("only-stored"));
+    }
+
+    @Test
+    void manyItemsOnlyInTheStoreAllLoad() throws Exception {
+        for (int i = 0; i < 12; i++) {
+            STORE.write("jobs/many-" + i + "/config.xml", ("<?xml version='1.1' encoding='UTF-8'?><project><description>" + i + "</description></project>")
+                    .getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+        }
+        Util.deleteRecursive(new File(r.jenkins.getRootDir(), "jobs"));
+
+        r.jenkins.reload();
+
+        for (int i = 0; i < 12; i++) {
+            assertEquals(String.valueOf(i), r.jenkins.getItemByFullName("many-" + i, FreeStyleProject.class).getDescription());
+        }
     }
 
     @Test

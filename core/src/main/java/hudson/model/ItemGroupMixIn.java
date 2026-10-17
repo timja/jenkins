@@ -119,7 +119,7 @@ public abstract class ItemGroupMixIn {
         // items which so far exist only in a persistence store
         Set<String> stored;
         try {
-            stored = PersistenceStores.storedItemNames(modulesDir);
+            stored = PersistenceStores.storedItemNames(modulesDir, listed); // those listed here are loaded anyway
         } catch (IOException e) {
             Logger.getLogger(ItemGroupMixIn.class.getName()).log(Level.WARNING, "could not list stored items of " + modulesDir, e);
             stored = Set.of();
