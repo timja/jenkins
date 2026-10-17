@@ -24,6 +24,7 @@ import javax.crypto.BadPaddingException;
 import javax.crypto.Cipher;
 import javax.crypto.CipherInputStream;
 import javax.crypto.CipherOutputStream;
+import javax.crypto.IllegalBlockSizeException;
 import javax.crypto.SecretKey;
 import jenkins.model.Jenkins;
 import jenkins.persistence.ConflictException;
@@ -140,8 +141,8 @@ public class DefaultConfidentialStore extends ConfidentialStore {
         } catch (GeneralSecurityException e) {
             throw new IOException("Failed to load the key: " + key.getId(), e);
         } catch (IOException x) {
-            if (x.getCause() instanceof BadPaddingException) {
-                return null; // broken somehow, e.g. encrypted with another master key
+            if (x.getCause() instanceof BadPaddingException || x.getCause() instanceof IllegalBlockSizeException) {
+                return null; // broken somehow, e.g. encrypted with another master key, or truncated
             }
             throw x;
         }
