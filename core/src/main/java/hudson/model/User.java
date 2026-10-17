@@ -1258,16 +1258,16 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
         }
     }
 
+    /** How many times applying a change made elsewhere was put off, by user id, because a save was pending here. */
+    private static final Map<String, Integer> PUT_OFF = new ConcurrentHashMap<>();
+    private static final int MAX_PUT_OFF = 3;
+
     /**
      * Applies a change another controller made to a user's configuration in a shared persistence store:
      * reloads the user if known here, loads it if new, or forgets it if deleted. Nothing is saved.
      *
      * @param dirName the user's directory name under {@code users/}
      */
-    /** How many times applying a change made elsewhere was put off, by user id, because a save was pending here. */
-    private static final Map<String, Integer> PUT_OFF = new ConcurrentHashMap<>();
-    private static final int MAX_PUT_OFF = 3;
-
     @Restricted(NoExternalUse.class)
     public static void changedElsewhere(@NonNull String dirName, boolean deleted) {
         synchronized (AllUsers.SCANNING) { // not while users are scanned (startup, reload)
