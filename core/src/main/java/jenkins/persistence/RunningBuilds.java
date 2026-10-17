@@ -317,9 +317,10 @@ public final class RunningBuilds {
         if (live == null) {
             return 0;
         }
-        Set<String> gone = new HashSet<>();
         int removed = 0;
         for (Job<?, ?> job : Jenkins.get().allItems(Job.class)) {
+            // per job: a sweep of many jobs takes a while, during which an origin found gone may come back
+            Set<String> gone = new HashSet<>();
             int removedHere = 0;
             for (Placeholder p : all(job)) {
                 if (!live.contains(p.origin) && stillGone(store, p.origin, gone)) {
@@ -340,7 +341,8 @@ public final class RunningBuilds {
     /**
      * Whether the origin of a placeholder missing from the sweep's first answer is still gone when asked after the
      * placeholder was listed: its controller may have joined since (a restart, during a rolling one) and written it.
-     * An origin found gone then is taken as gone for the rest of the sweep, so that the store is asked once per origin.
+     * An origin found gone then is taken as gone for the rest of the job's placeholders, so that the store is asked once
+     * per origin and job.
      */
     private static boolean stillGone(PersistenceStore store, String origin, Set<String> gone) throws IOException {
         if (gone.contains(origin)) {
