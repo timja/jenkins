@@ -169,6 +169,24 @@ class StoredBuildNumberAssignerTest {
     }
 
     @Test
+    void counterLeftAtOldNameIsNotNumberedFrom() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("left");
+        STORE.move("jobs/left", "jobs/moved");
+        // a counter that another controller, also behind on the rename, left at the old name
+        STORE.as("other").write("jobs/left/nextBuildNumber", "5\n".getBytes(StandardCharsets.UTF_8), PersistenceStore.ABSENT);
+        assertThrows(IOException.class, p::assignBuildNumber);
+        assertEquals("5", stored("jobs/left/nextBuildNumber"));
+    }
+
+    @Test
+    void nextBuildNumberIsNotSetUnderAnOldName() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("set");
+        STORE.move("jobs/set", "jobs/elsewhere");
+        assertThrows(IOException.class, () -> p.updateNextBuildNumber(10));
+        assertThat(STORE.versions(), not(hasKey("jobs/set/nextBuildNumber")));
+    }
+
+    @Test
     void storedNumberIsReadThroughEveryTextFileMethod() throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("text");
         STORE.as("other").write("jobs/text/nextBuildNumber", "1234\n".getBytes(StandardCharsets.UTF_8), PersistenceStore.ANY);
