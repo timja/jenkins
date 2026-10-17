@@ -31,14 +31,15 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.ExtensionList;
 import hudson.XmlFile;
 import hudson.init.InitMilestone;
+import hudson.util.PersistedList;
 import hudson.util.XStream2;
 import java.io.ByteArrayInputStream;
 import java.io.File;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -50,6 +51,7 @@ import java.util.logging.Logger;
 import jenkins.model.Jenkins;
 import jenkins.util.SystemProperties;
 import jenkins.util.ThrowingCallable;
+import jenkins.util.ThrowingRunnable;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
@@ -80,6 +82,11 @@ public final class PersistenceStores {
     private static volatile PersistenceStore resolvedStore;
 
     private static final Map<String, Long> versions = new ConcurrentHashMap<>();
+    /**
+     * The top-level elements of item, user and root configuration files as this JVM last read or wrote them, by key:
+     * the fields their objects may hold a value for (see {@link #clearRemovedFields}).
+     */
+    private static final Map<String, Set<String>> elements = new ConcurrentHashMap<>();
     private static final AtomicLong conflicts = new AtomicLong();
 
     private PersistenceStores() {}
@@ -121,6 +128,7 @@ public final class PersistenceStores {
                     }
                     resolvedStore = store;
                     versions.clear();
+                    elements.clear();
                     resolvedFor = j;
                 }
                 return resolvedStore;
@@ -271,6 +279,10 @@ public final class PersistenceStores {
         // elsewhere since), keep that older one, so that the next save conflicts and merges as it would have unmoved
         for (PersistenceStore.Moved m : moved) {
             Long last = versions.get(m.from());
+            Set<String> held = elements.remove(m.from());
+            if (held != null) {
+                elements.put(m.to(), held); // the same content
+            }
             // nothing is at the old key now: a write made there from an object loaded before (a save resolving the old
             // name) conflicts with something created there elsewhere since, rather than replacing it
             seen(m.from(), PersistenceStore.ABSENT);
@@ -321,6 +333,9 @@ public final class PersistenceStores {
         } else {
             versions.remove(key);
         }
+        if (version <= PersistenceStore.ABSENT) {
+            elements.remove(key);
+        }
     }
 
     /**
@@ -338,6 +353,7 @@ public final class PersistenceStores {
     @Restricted(NoExternalUse.class)
     public static void forgetUnder(@NonNull String prefix) {
         versions.keySet().removeIf(k -> k.startsWith(prefix + "/"));
+        elements.keySet().removeIf(k -> k.startsWith(prefix + "/"));
     }
 
     /**
@@ -348,23 +364,60 @@ public final class PersistenceStores {
     }
 
     /**
-     * Prepares an object for reloading from its file, changed by another controller: nulls the fields the new version
-     * no longer has. Loading into a live object leaves alone the fields the file has no element for, and XStream writes
-     * no element for a null field, so a value cleared elsewhere (a system message, an administrator address) would
-     * survive here and be brought back everywhere by the next save here. Only top-level fields this object serialises
-     * now (as last saved or reloaded, unless changed here since) and the new version lacks are nulled: a field the file
-     * never had keeps its default. Call it just before loading, so that what loading derives sees them cleared.
+     * Reloads an object from its file, changed by another controller: {@linkplain #clearRemovedFields clears} the fields
+     * the new version removed, then loads it. Clearing and loading each read the file: if yet another version was stored
+     * between the two reads, loading took that one, as seen, so that its own change is not applied again; what it removed
+     * is then cleared, and it is loaded once more.
+     *
+     * @param load loads the object from the file
      */
     @Restricted(NoExternalUse.class)
-    public static void clearRemovedFields(@NonNull XmlFile file, @NonNull Object o) throws IOException {
-        if (!file.exists()) {
-            return;
+    public static void reload(@NonNull XmlFile file, @NonNull Object o, @NonNull ThrowingRunnable<IOException> load) throws IOException {
+        String key = keyFor(file.getPath());
+        for (int attempt = 1; ; attempt++) {
+            long read = clearRemovedFields(file, o);
+            load.run();
+            if (key == null || read <= PersistenceStore.ABSENT || lastSeen(key) == read) {
+                return;
+            }
+            if (attempt == 3) {
+                LOGGER.fine(() -> key + " kept changing while being reloaded; fields it no longer has may be left");
+                return;
+            }
         }
+    }
+
+    /**
+     * Prepares an object for reloading from its file, changed by another controller: clears the fields the new version
+     * no longer has. Loading into a live object leaves alone the fields the file has no element for, and XStream writes
+     * no element for a null field, so a value cleared elsewhere (a system message, an administrator address) would
+     * survive here and be brought back everywhere by the next save here. Only top-level fields that the content this JVM
+     * last read or wrote had, and the new version lacks, are cleared: a field the file never had keeps its default (a
+     * file written by an older version, say), and nothing is cleared if that content is unknown. A collection or map is
+     * emptied rather than nulled, as code expects one initialised by the constructor to be there. Call it just before
+     * loading, so that what loading derives sees them cleared; or use {@link #reload}, which also covers a version
+     * stored between the two reads.
+     *
+     * @return the version read, {@link PersistenceStore#ABSENT} if none is stored, or {@link PersistenceStore#ANY} if
+     *     the file is not served by a store
+     */
+    @Restricted(NoExternalUse.class)
+    public static long clearRemovedFields(@NonNull XmlFile file, @NonNull Object o) throws IOException {
+        Route route = route(file.getPath());
+        if (route == null) {
+            return PersistenceStore.ANY;
+        }
+        PersistenceStore.Entry entry = route.store().read(route.key()); // not taken as seen: loading reads it again
+        if (entry == null) {
+            return PersistenceStore.ABSENT;
+        }
+        Set<String> kept = topLevelElements(entry.content());
+        Set<String> had = elements.get(route.key());
         XStream xs = file.getXStream();
-        Set<String> kept = topLevelElements(file.readRawBytes());
-        Set<String> removed = topLevelElements(xs.toXML(o).getBytes(StandardCharsets.UTF_8));
-        removed.removeAll(kept);
-        for (String element : removed) {
+        for (String element : had == null ? Set.<String>of() : had) {
+            if (kept.contains(element)) {
+                continue;
+            }
             Field f = fieldFor(xs, o.getClass(), element);
             int m = f == null ? 0 : f.getModifiers();
             if (f == null || f.getType().isPrimitive() || Modifier.isStatic(m) || Modifier.isFinal(m) || Modifier.isTransient(m)) {
@@ -372,11 +425,45 @@ public final class PersistenceStores {
             }
             try {
                 f.setAccessible(true);
-                f.set(o, null);
+                Object value = f.get(o);
+                // a PersistedList would save its owner, half reloaded, when emptied: nulled, as loading a file without it does
+                if (value instanceof Collection<?> c && !(value instanceof PersistedList<?>)) {
+                    c.clear();
+                } else if (value instanceof Map<?, ?> map) {
+                    map.clear();
+                } else {
+                    f.set(o, null);
+                }
                 LOGGER.fine(() -> "Cleared " + f + ", removed elsewhere from " + file);
             } catch (ReflectiveOperationException | RuntimeException e) {
                 LOGGER.log(Level.FINE, "Could not clear " + f, e);
             }
+        }
+        elements.put(route.key(), kept); // what it may hold once cleared; loading adds what it reads then
+        return entry.version();
+    }
+
+    /**
+     * Records the top-level elements of content an object of an item, user or root configuration file was just loaded
+     * from (added to those it held, which loading leaves alone) or saved as (replacing them).
+     */
+    private static void held(String key, byte[] content, boolean loaded) {
+        if (!key.endsWith("/config.xml") && (key.indexOf('/') >= 0 || !key.endsWith(".xml"))) {
+            return; // not one cleared on reloading (build records, say)
+        }
+        try {
+            Set<String> names = topLevelElements(content);
+            if (loaded) {
+                elements.merge(key, names, (a, b) -> {
+                    Set<String> both = new TreeSet<>(a);
+                    both.addAll(b);
+                    return both;
+                });
+            } else {
+                elements.put(key, names);
+            }
+        } catch (RuntimeException e) {
+            elements.remove(key); // not XML: nothing cleared on reloading it
         }
     }
 
@@ -477,6 +564,7 @@ public final class PersistenceStores {
     public static void setForTesting(@CheckForNull PersistenceStore store) {
         testingStore = store;
         versions.clear();
+        elements.clear();
         conflicts.set(0);
     }
 
@@ -489,6 +577,9 @@ public final class PersistenceStores {
         public PersistenceStore.Entry read() throws IOException {
             PersistenceStore.Entry entry = store.read(key);
             seen(key, entry == null ? PersistenceStore.ABSENT : entry.version());
+            if (entry != null) {
+                held(key, entry.content(), true);
+            }
             return entry;
         }
 
@@ -518,6 +609,7 @@ public final class PersistenceStores {
                 creation.written = version;
             }
             seen(key, version);
+            held(key, content, false);
             return version;
         }
 
