@@ -67,6 +67,24 @@ public abstract class ConfidentialStore {
      */
     public abstract byte[] randomBytes(int size);
 
+    /** Creates the value of a key that has none yet. */
+    interface Generator {
+        byte[] generate() throws IOException;
+    }
+
+    /**
+     * Loads the value of a key, or creates and stores it if there is none.
+     * Stores shared by several controllers override this so that concurrent first uses agree on one value.
+     */
+    byte[] loadOrCreate(ConfidentialKey key, Generator generator) throws IOException {
+        byte[] value = load(key);
+        if (value == null) {
+            value = generator.generate();
+            store(key, value);
+        }
+        return value;
+    }
+
     /**
      * Retrieves the currently active singleton instance of {@link ConfidentialStore}.
      */

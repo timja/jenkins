@@ -129,14 +129,15 @@ public class HMACConfidentialKey extends ConfidentialKey {
         if (key == null || cs != lastCS) {
             lastCS = cs;
             try {
-                byte[] encoded = load();
-                if (encoded == null) {
-                    KeyGenerator kg = KeyGenerator.getInstance(ALGORITHM);
-                    SecretKey key = kg.generateKey();
-                    store(encoded = key.getEncoded());
-                }
+                byte[] encoded = loadOrCreate(() -> {
+                    try {
+                        return KeyGenerator.getInstance(ALGORITHM).generateKey().getEncoded();
+                    } catch (NoSuchAlgorithmException e) {
+                        throw new IOException(e);
+                    }
+                });
                 key = new SecretKeySpec(encoded, ALGORITHM);
-            } catch (IOException | NoSuchAlgorithmException e) {
+            } catch (IOException e) {
                 throw new Error("Failed to load the key: " + getId(), e);
             }
         }
