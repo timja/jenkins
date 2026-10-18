@@ -42,6 +42,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import jenkins.persistence.PersistenceStores;
 import jenkins.util.SystemProperties;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
@@ -155,12 +156,27 @@ public final class ItemUuids {
     }
 
     /**
+     * Whether an item's identity is pinned ({@link #pin}): saved with it, and so the same on every controller sharing
+     * its configuration. An unpinned item's is derived from its name; data shared under it would be another item's once
+     * the item is pinned, so it should not be keyed by it where items are shared.
+     *
+     * @return false for an item with no identity, or an unpinned one
+     * @since TODO
+     */
+    public static boolean isPinned(@NonNull Item item) {
+        if (item instanceof AbstractItem ai) {
+            return ai.isItemUuidPinned();
+        }
+        return item.getItemUuid() != null; // its own kind of identity: kept as that kind keeps it
+    }
+
+    /**
      * Whether a new item is pinned from the start: created, copied or imported, its configuration is first written
      * with an identity of its own.
      */
     @Restricted(NoExternalUse.class)
     public static boolean pinsNewItems() {
-        return PIN_NEW_ITEMS;
+        return PIN_NEW_ITEMS || PersistenceStores.get() != null;
     }
 
     /**
@@ -274,10 +290,6 @@ public final class ItemUuids {
         } catch (IOException e) {
             LOGGER.log(Level.WARNING, "Could not save the new identity of " + item.getFullName(), e);
         }
-    }
-
-    private static boolean isPinned(Item item) {
-        return !(item instanceof AbstractItem ai) || ai.isItemUuidPinned();
     }
 
     /** Keeps the index, and gives an item that has another's identity (as from posted configuration) one of its own. */

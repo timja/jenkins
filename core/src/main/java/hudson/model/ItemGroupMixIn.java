@@ -24,6 +24,7 @@
 
 package hudson.model;
 
+import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.Util;
 import hudson.XmlFile;
@@ -34,13 +35,19 @@ import hudson.util.Function1;
 import io.jenkins.servlet.ServletExceptionWrapper;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletResponse;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.xml.transform.TransformerException;
@@ -48,6 +55,9 @@ import javax.xml.transform.stream.StreamResult;
 import javax.xml.transform.stream.StreamSource;
 import jenkins.model.ItemUuids;
 import jenkins.model.Jenkins;
+import jenkins.persistence.ConflictException;
+import jenkins.persistence.PersistenceStores;
+import jenkins.persistence.StoredItems;
 import jenkins.security.ExtendedReadRedaction;
 import jenkins.util.xml.XMLUtils;
 import org.kohsuke.stapler.StaplerRequest;
@@ -108,7 +118,29 @@ public abstract class ItemGroupMixIn {
             throw new UncheckedIOException(e);
         }
 
-        File[] subdirs = modulesDir.listFiles(File::isDirectory);
+        List<File> subdirs = new ArrayList<>(Arrays.asList(modulesDir.listFiles(File::isDirectory)));
+        if (PersistenceStores.get() != null) {
+            // items which so far exist only in the persistence store (on a fresh controller, say)
+            Set<String> listed = new HashSet<>();
+            subdirs.forEach(d -> listed.add(d.getName()));
+            Set<String> stored;
+            try {
+                stored = PersistenceStores.storedItemNames(modulesDir, listed); // those listed here are loaded anyway
+            } catch (IOException e) {
+                Logger.getLogger(ItemGroupMixIn.class.getName()).log(Level.WARNING, "could not list stored items of " + modulesDir, e);
+                stored = Set.of();
+            }
+            for (String name : stored) {
+                File subdir = new File(modulesDir, name);
+                try {
+                    Util.createDirectories(subdir.toPath());
+                    subdirs.add(subdir);
+                } catch (IOException e) {
+                    // one item which cannot be made here does not keep the others from loading
+                    Logger.getLogger(ItemGroupMixIn.class.getName()).log(Level.WARNING, "could not make a directory for stored item " + subdir, e);
+                }
+            }
+        }
         CopyOnWriteMap.Tree<K, V> configurations = new CopyOnWriteMap.Tree<>();
         for (File subdir : subdirs) {
             try {
@@ -116,7 +148,14 @@ public abstract class ItemGroupMixIn {
                 V item = (V) parent.getItem(subdir.getName());
                 if (item == null) {
                     XmlFile xmlFile = Items.getConfigFile(subdir);
-                    if (xmlFile.exists()) {
+                    boolean exists;
+                    try {
+                        exists = xmlFile.checkExists();
+                    } catch (IOException e) {
+                        Logger.getLogger(ItemGroupMixIn.class.getName()).log(Level.WARNING, "could not check for " + xmlFile.getPath(), e);
+                        continue;
+                    }
+                    if (exists) {
                         item = (V) Items.load(parent, subdir);
                     } else {
                         Logger.getLogger(ItemGroupMixIn.class.getName()).log(Level.WARNING, "could not find file " + xmlFile.getFile());
@@ -256,6 +295,13 @@ public abstract class ItemGroupMixIn {
         Jenkins.checkGoodName(name);
         ItemListener.checkBeforeCopy(src, parent);
 
+        if (PersistenceStores.get() != null) {
+            T copied = copyThroughStore(src, srcConfigFile, name);
+            if (copied != null) {
+                return copied;
+            }
+        }
+
         T result = (T) createProject(src.getDescriptor(), name, false);
 
         // copy config
@@ -284,6 +330,74 @@ public abstract class ItemGroupMixIn {
         return result;
     }
 
+    /**
+     * Copies an item into a persistence store serving its configuration: stored once, as a creation, only once loaded
+     * with an identity of its own, so that no other controller ever sees the copy without it, nor with the source's.
+     *
+     * @return the copy, or null if the store does not serve the copy's configuration
+     */
+    @CheckForNull
+    @SuppressWarnings("unchecked")
+    private <T extends TopLevelItem> T copyThroughStore(T src, XmlFile srcConfigFile, String name) throws IOException {
+        Jenkins.get().getProjectNamingStrategy().checkName(parent.getFullName(), name);
+        Items.verifyItemDoesNotAlreadyExist(parent, name, null);
+        final File dir = getRootDirFor(name);
+        final StoredItems.Creation creation = StoredItems.creating(Items.getConfigFile(dir).getPath());
+        if (creation == null) {
+            return null;
+        }
+        final boolean existed = dir.exists(); // the local directory of an item stored elsewhere (its builds) is not ours
+        boolean success = false;
+        try {
+            creation.hold();
+            Util.createDirectories(dir.toPath());
+            Items.getConfigFile(dir).writeRaw(srcConfigFile.readRawBytes());
+            T result = (T) loadNew(dir);
+            result.onCopiedFrom(src);
+            result.save();
+            commit(creation, name);
+            success = true;
+
+            add(result);
+            ItemListener.fireOnCopied(src, result);
+            Jenkins.get().rebuildDependencyGraphAsync();
+            return result;
+        } finally {
+            creation.close();
+            if (!success) {
+                creation.undo();
+                if (!existed || !creation.wroteNothing()) {
+                    Util.deleteRecursive(dir);
+                }
+            }
+        }
+    }
+
+    /**
+     * Loads an item made here from its configuration, with an identity of its own (new items are pinned with a store),
+     * given before anything (its {@code onLoad}, the listeners it calls) can see it without: not one derived from its
+     * name, nor the one in the configuration (posted, or copied from another item).
+     */
+    private TopLevelItem loadNew(File dir) throws IOException {
+        return Items.callWhileUpdatingByXml(() -> {
+            TopLevelItem item = (TopLevelItem) Items.getConfigFile(dir).read();
+            if (item instanceof AbstractItem ai) {
+                ai.newItemUuid();
+            }
+            item.onLoad(parent, parent.getItemName(dir, item));
+            return item;
+        });
+    }
+
+    /** Stores a held creation's configuration, refused if an item of that name was stored meanwhile. */
+    private static void commit(StoredItems.Creation creation, String name) throws IOException {
+        try {
+            creation.commit();
+        } catch (ConflictException e) {
+            throw new Failure(Messages.Hudson_JobAlreadyExists(name));
+        }
+    }
+
     public synchronized TopLevelItem createProjectFromXML(String name, InputStream xml) throws IOException {
         acl.checkPermission(Item.CREATE);
 
@@ -292,15 +406,28 @@ public abstract class ItemGroupMixIn {
         Jenkins.checkGoodName(name);
 
         // place it as config.xml
-        File configXml = Items.getConfigFile(getRootDirFor(name)).getFile();
-        final File dir = configXml.getParentFile();
+        final File dir = getRootDirFor(name);
+        File configXml = Items.getConfigFile(dir).getPath();
+        // in a persistence store, an item of that name this controller has not loaded is not replaced
+        final StoredItems.Creation creation = StoredItems.creating(configXml);
+        // nor is the local directory of such an item (its builds) this creation's to delete
+        final boolean existed = dir.exists();
         boolean success = false;
         try {
             Util.createDirectories(dir.toPath());
-            XMLUtils.safeTransform(new StreamSource(xml), new StreamResult(configXml));
+            if (creation != null) {
+                // kept from the store until loaded with an identity of its own (below): no other controller ever sees
+                // the item without it, nor under the posted configuration's
+                creation.hold();
+                ByteArrayOutputStream buf = new ByteArrayOutputStream();
+                XMLUtils.safeTransform(new StreamSource(xml), new StreamResult(buf));
+                Items.getConfigFile(dir).writeRaw(buf.toByteArray());
+            } else {
+                XMLUtils.safeTransform(new StreamSource(xml), new StreamResult(configXml));
+            }
 
             // load it
-            TopLevelItem result = Items.callWhileUpdatingByXml(() -> (TopLevelItem) Items.load(parent, dir));
+            TopLevelItem result = creation != null ? loadNew(dir) : Items.callWhileUpdatingByXml(() -> (TopLevelItem) Items.load(parent, dir));
 
             boolean hasCreatePermission = acl.getACL().hasCreatePermission2(Jenkins.getAuthentication2(), parent, result.getDescriptor());
             boolean applicableIn = result.getDescriptor().isApplicableIn(parent);
@@ -315,8 +442,13 @@ public abstract class ItemGroupMixIn {
             }
             if (ItemUuids.pinsNewItems() && result instanceof AbstractItem created) {
                 // a new item, with an identity of its own whatever the posted configuration had, as for a copy
-                created.newItemUuid();
+                if (creation == null) {
+                    created.newItemUuid(); // with a store, given it before it loaded
+                }
                 created.save();
+            }
+            if (creation != null) {
+                commit(creation, name);
             }
 
             add(result);
@@ -333,9 +465,18 @@ public abstract class ItemGroupMixIn {
             success = false;
             throw e;
         } finally {
+            if (creation != null) {
+                creation.close();
+            }
             if (!success) {
                 // if anything fails, delete the config file to avoid further confusion
-                Util.deleteRecursive(dir);
+                // (in a persistence store, only what was written here)
+                if (creation != null) {
+                    creation.undo();
+                }
+                if (!existed || creation == null || !creation.wroteNothing()) {
+                    Util.deleteRecursive(dir);
+                }
             }
         }
     }
@@ -353,7 +494,12 @@ public abstract class ItemGroupMixIn {
 
         TopLevelItem item = type.newInstance(parent, name);
         item.onCreatedFromScratch();
-        item.save();
+        // in a persistence store, an item of that name this controller has not loaded is not replaced
+        try (StoredItems.Creation creation = StoredItems.creating(new File(item.getRootDir(), "config.xml"))) {
+            item.save();
+        } catch (ConflictException e) {
+            throw new Failure(Messages.Hudson_JobAlreadyExists(name));
+        }
         add(item);
         Jenkins.get().rebuildDependencyGraphAsync();
 

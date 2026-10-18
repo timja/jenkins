@@ -278,6 +278,7 @@ import jenkins.diagnostics.URICheckEncodingMonitor;
 import jenkins.install.InstallState;
 import jenkins.install.SetupWizard;
 import jenkins.model.ProjectNamingStrategy.DefaultProjectNamingStrategy;
+import jenkins.persistence.PersistenceStores;
 import jenkins.security.ClassFilterImpl;
 import jenkins.security.ConfidentialKey;
 import jenkins.security.ConfidentialStore;
@@ -3429,6 +3430,20 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
         }
     }
 
+    /** Loads an item found only in the persistence store; one which fails to load does not stop the others. */
+    private void loadStoredItem(File projectsDir, String name, Set<String> loadedNames) {
+        File subdir = new File(projectsDir, name);
+        try {
+            Util.createDirectories(subdir.toPath());
+            TopLevelItem item = (TopLevelItem) Items.load(Jenkins.this, subdir);
+            items.put(item.getName(), item);
+            loadedNames.add(item.getName());
+        } catch (IOException | RuntimeException | LinkageError e) {
+            // as with one task per item (a missing plugin class, say)
+            LOGGER.log(Level.WARNING, "Failed to load item " + name + " from the persistence store", e);
+        }
+    }
+
     private synchronized TaskBuilder loadTasks() throws IOException {
         File projectsDir = new File(root, "jobs");
         if (!projectsDir.getCanonicalFile().isDirectory() && !projectsDir.mkdirs()) {
@@ -3464,6 +3479,35 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
                 loadedNames.add(item.getName());
             }));
         }
+
+        // a persistence store may hold items with no local directory yet (on a fresh controller, say); it is only
+        // available once extensions are, so cannot be listed above. Nothing to do without one
+        loadJobs.add(g.requires(loadJenkins).requires(SYSTEM_CONFIG_ADAPTED).attains(JOB_LOADED).notFatal().add("Loading items only stored", session -> {
+            if (PersistenceStores.get() == null) {
+                return;
+            }
+            Set<String> local = new HashSet<>();
+            for (File subdir : subdirs) {
+                local.add(subdir.getName());
+            }
+            // the locally listed ones are loaded by their own tasks: not even read here
+            Set<String> storeOnly = PersistenceStores.storedItemNames(projectsDir, local);
+            List<Future<?>> loads = new ArrayList<>();
+            for (String name : storeOnly) {
+                if (PARALLEL_LOAD) {
+                    loads.add(threadPoolForLoad.submit(() -> {
+                        try (ACLContext ctx = ACL.as2(ACL.SYSTEM2)) {
+                            loadStoredItem(projectsDir, name, loadedNames);
+                        }
+                    }));
+                } else {
+                    loadStoredItem(projectsDir, name, loadedNames);
+                }
+            }
+            for (Future<?> load : loads) {
+                load.get();
+            }
+        }));
 
         g.requires(loadJobs.toArray(new Handle[0])).attains(JOB_LOADED).add("Cleaning up obsolete items deleted from the disk", reactor -> {
             // anything we didn't load from disk, throw them away.
