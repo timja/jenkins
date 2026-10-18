@@ -25,14 +25,22 @@
 package hudson.security;
 
 import com.google.common.annotations.VisibleForTesting;
+import edu.umd.cs.findbugs.annotations.CheckForNull;
+import edu.umd.cs.findbugs.annotations.NonNull;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import hudson.ExtensionList;
 import hudson.model.User;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import jakarta.servlet.http.HttpSession;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
 import java.time.temporal.ChronoUnit;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.Date;
 import java.util.Objects;
 import java.util.concurrent.TimeUnit;
@@ -42,9 +50,11 @@ import jenkins.model.Jenkins;
 import jenkins.security.HMACConfidentialKey;
 import jenkins.security.ImpersonatingUserDetailsService2;
 import jenkins.security.LastGrantedAuthoritiesProperty;
+import jenkins.security.LoginRevocation;
 import jenkins.security.seed.UserSeedProperty;
 import jenkins.util.SystemProperties;
 import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.Beta;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.springframework.security.authentication.RememberMeAuthenticationProvider;
 import org.springframework.security.core.Authentication;
@@ -115,6 +125,87 @@ public class TokenBasedRememberMeServices2 extends AbstractRememberMeServices {
         super(Jenkins.get().getSecretKey(), new ImpersonatingUserDetailsService2(userDetailsService));
     }
 
+    @Override
+    protected boolean rememberMeRequested(HttpServletRequest request, String parameter) {
+        // read on each login, not once; not for credentials sent with each request (an API token, say): the cookie,
+        // signed with the user's seed, would outlive the token being revoked
+        return (ALWAYS_REMEMBER && request.getHeader("Authorization") == null) || super.rememberMeRequested(request, parameter);
+    }
+
+    /**
+     * Whether to issue the remember-me cookie on every login, as if "Keep me signed in" were always checked.
+     * With several controllers behind one load balancer sharing users and keys, this signed cookie authenticates
+     * a browser on whichever controller its next request reaches, without a shared session.
+     * Requests authenticating with an {@code Authorization} header (an API token, a password) get no cookie this way.
+     * A form rendered by one controller and submitted to another also needs a crumb issuer whose crumbs are not bound
+     * to the HTTP session (one shared by the controllers, or {@code DefaultCrumbIssuer.EXCLUDE_SESSION_ID}).
+     * Every browser sign-in is then remembered for {@link #TOKEN_VALIDITY}, also for users who did not ask for it; signing
+     * out ends it everywhere only where a {@link LoginRevocation} is registered.
+     */
+    @Restricted(Beta.class)
+    @SuppressFBWarnings(value = "MS_SHOULD_BE_FINAL", justification = "for script console")
+    public static /* Script Console modifiable */ boolean ALWAYS_REMEMBER =
+            SystemProperties.getBoolean(TokenBasedRememberMeServices2.class.getName() + ".alwaysRemember");
+
+    /** Session (and request) attribute: the id of the login a session belongs to, see {@link LoginRevocation}. */
+    static final String LOGIN_ID = LoginRevocation.class.getName() + ".loginId";
+    /** Session (and request) attribute: when that login's cookie expires, in milliseconds since the epoch. */
+    static final String LOGIN_EXPIRES = LoginRevocation.class.getName() + ".expiresAt";
+
+    /** The id of a login: the Base64url SHA-256 of its remember-me cookie's value. */
+    private String loginId(String[] tokens) {
+        try {
+            return Base64.getUrlEncoder().withoutPadding().encodeToString(
+                    MessageDigest.getInstance("SHA-256").digest(encodeCookie(tokens).getBytes(StandardCharsets.US_ASCII)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** Records in the session a sign-in made which login it is, where something can revoke logins. */
+    private void recordLogin(HttpServletRequest request, String[] tokens, long expiryTime) {
+        if (ExtensionList.lookup(LoginRevocation.class).isEmpty()) {
+            return;
+        }
+        HttpSession session = request.getSession();
+        session.setAttribute(LOGIN_ID, loginId(tokens));
+        session.setAttribute(LOGIN_EXPIRES, expiryTime);
+    }
+
+    /** Removes from the session which login it belonged to: a sign-in made in it may be of no login, or another. */
+    static void forgetLogin(HttpServletRequest request) {
+        HttpSession session = request.getSession(false);
+        if (session != null) {
+            session.removeAttribute(LOGIN_ID);
+            session.removeAttribute(LOGIN_EXPIRES);
+        }
+    }
+
+    /**
+     * Ends the login a session belongs to everywhere, as when its user signs out: on every controller, through the
+     * {@link LoginRevocation}s. Does nothing for a session of no login (none was remembered) or with none registered.
+     */
+    @Restricted(NoExternalUse.class)
+    public static void revokeLogin(@CheckForNull HttpSession session, @NonNull String username) {
+        Object id = session == null ? null : session.getAttribute(LOGIN_ID);
+        if (!(id instanceof String loginId)) {
+            return;
+        }
+        long expiresAt = session.getAttribute(LOGIN_EXPIRES) instanceof Long l ? l : System.currentTimeMillis() + MAX_TOKEN_VALIDITY.toMillis();
+        for (LoginRevocation r : ExtensionList.lookup(LoginRevocation.class)) {
+            try {
+                r.revoke(loginId, username, expiresAt);
+            } catch (IOException | RuntimeException e) {
+                LOGGER.log(Level.WARNING, "Could not end the login of " + username + " everywhere", e);
+            }
+        }
+    }
+
+    /** Whether the login a session belongs to was revoked, here or elsewhere. */
+    static boolean isRevoked(@NonNull HttpSession session) {
+        return session.getAttribute(LOGIN_ID) instanceof String loginId && LoginRevocation.anyRevoked(loginId);
+    }
+
     protected String makeTokenSignature(long tokenExpiryTime, String username) {
         String userSeed;
         if (UserSeedProperty.DISABLE_USER_SEED) {
@@ -162,8 +253,9 @@ public class TokenBasedRememberMeServices2 extends AbstractRememberMeServices {
 
         String signatureValue = makeTokenSignature(expiryTime, username);
         int tokenLifetime = calculateLoginLifetime(request, successfulAuthentication);
-        setCookie(new String[] { username, Long.toString(expiryTime), signatureValue },
-                tokenLifetime, request, response);
+        String[] tokens = { username, Long.toString(expiryTime), signatureValue };
+        setCookie(tokens, tokenLifetime, request, response);
+        recordLogin(request, tokens, expiryTime);
 
         if (logger.isDebugEnabled()) {
             logger.debug("Added remember-me cookie for user '" + username + "', expiry: '" + new Date(expiryTime)
@@ -226,6 +318,15 @@ public class TokenBasedRememberMeServices2 extends AbstractRememberMeServices {
             throw new InvalidCookieException("Cookie token[2] contained signature '" + cookieTokens[2]
                     + "' but expected '" + expectedTokenSignature + "'");
         }
+        if (!ExtensionList.lookup(LoginRevocation.class).isEmpty()) {
+            String loginId = loginId(cookieTokens);
+            if (LoginRevocation.anyRevoked(loginId)) {
+                cancelCookie(request, response);
+                throw new InvalidCookieException("This login was signed out of");
+            }
+            request.setAttribute(LOGIN_ID, loginId); // recorded in the session it makes
+            request.setAttribute(LOGIN_EXPIRES, tokenExpiryTime);
+        }
         return userDetails;
     }
 
@@ -249,6 +350,10 @@ public class TokenBasedRememberMeServices2 extends AbstractRememberMeServices {
             UserSeedProperty userSeed = user.getProperty(UserSeedProperty.class);
             String sessionSeed = userSeed.getSeed();
             request.getSession().setAttribute(UserSeedProperty.USER_SESSION_SEED, sessionSeed);
+        }
+        if (request.getAttribute(LOGIN_ID) instanceof String loginId) {
+            request.getSession().setAttribute(LOGIN_ID, loginId);
+            request.getSession().setAttribute(LOGIN_EXPIRES, request.getAttribute(LOGIN_EXPIRES));
         }
 
         return auth;
