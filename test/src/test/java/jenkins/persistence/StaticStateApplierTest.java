@@ -33,6 +33,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import hudson.Util;
+import hudson.init.InitializerFinder;
 import hudson.model.Descriptor;
 import hudson.model.Label;
 import hudson.model.Node;
@@ -63,6 +64,8 @@ import jenkins.model.NodeListener;
 import jenkins.security.HMACConfidentialKey;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.jvnet.hudson.reactor.Reactor;
+import org.jvnet.hudson.reactor.Task;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.LogRecorder;
 import org.jvnet.hudson.test.TestExtension;
@@ -181,6 +184,16 @@ class StaticStateApplierTest {
         assertTrue(stored.contains("<scmCheckoutRetryCount>4</scmCheckoutRetryCount>"), stored);
         assertEquals(4, r.jenkins.getScmCheckoutRetryCount(), "reloaded with the other change");
         assertEquals(quietPeriod, r.jenkins.getQuietPeriod(), "and without the refused one");
+    }
+
+    @Test
+    void earlyDescriptorReloadRunsAtStartup() throws Exception {
+        // the reactor can call it: it runs on every start, before the system configuration is loaded
+        Task task = new InitializerFinder(StaticStateApplier.class.getClassLoader()).discoverTasks(new Reactor()).stream()
+                .filter(t -> t.toString().contains(StaticStateApplier.class.getName() + ".reloadEarlyDescriptors("))
+                .findFirst()
+                .orElseThrow();
+        task.run(null);
     }
 
     @Test

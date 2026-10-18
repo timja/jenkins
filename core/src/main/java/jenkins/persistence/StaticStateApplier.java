@@ -48,7 +48,7 @@ import org.kohsuke.accmod.restrictions.NoExternalUse;
  * say) applies it instead. Called by {@link ItemChangeApplier}.
  */
 @Restricted(NoExternalUse.class)
-final class StaticStateApplier {
+public final class StaticStateApplier {
 
     private static final Logger LOGGER = Logger.getLogger(StaticStateApplier.class.getName());
 
