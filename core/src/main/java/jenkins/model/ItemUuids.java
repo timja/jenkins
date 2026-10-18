@@ -243,7 +243,8 @@ public final class ItemUuids {
             index(item);
             return false;
         }
-        if (item instanceof AbstractItem ai) {
+        if (item instanceof AbstractItem ai && !PersistenceStores.isApplyingRemoteChange()) {
+            // only where the change was made: the controller applying it elsewhere gets the new identity from it
             LOGGER.log(ai.isItemUuidPinned() ? Level.WARNING : Level.FINE, "{0} has the identity of {1}; giving it one of its own",
                     new Object[] {item.getFullName(), items.get(id).getFullName()});
             ai.newItemUuid();
