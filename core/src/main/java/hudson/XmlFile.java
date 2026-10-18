@@ -30,23 +30,29 @@ import com.thoughtworks.xstream.converters.DataHolder;
 import com.thoughtworks.xstream.converters.UnmarshallingContext;
 import com.thoughtworks.xstream.io.HierarchicalStreamDriver;
 import com.thoughtworks.xstream.io.HierarchicalStreamReader;
+import edu.umd.cs.findbugs.annotations.CheckForNull;
 import hudson.diagnosis.OldDataMonitor;
 import hudson.model.Descriptor;
 import hudson.util.AtomicFileWriter;
 import hudson.util.XStream2;
 import java.io.BufferedInputStream;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
 import java.io.Reader;
 import java.io.Serializable;
 import java.io.StringWriter;
+import java.io.UncheckedIOException;
 import java.io.Writer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
+import java.nio.file.NoSuchFileException;
 import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.Map;
@@ -56,7 +62,12 @@ import java.util.logging.Logger;
 import javax.xml.XMLConstants;
 import javax.xml.parsers.ParserConfigurationException;
 import javax.xml.parsers.SAXParserFactory;
+import jenkins.persistence.PersistenceStore;
+import jenkins.persistence.Route;
+import jenkins.persistence.StoreRouting;
 import org.apache.commons.io.IOUtils;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.xml.sax.Attributes;
 import org.xml.sax.InputSource;
 import org.xml.sax.Locator;
@@ -161,7 +172,7 @@ public final class XmlFile {
         if (LOGGER.isLoggable(Level.FINE)) {
             LOGGER.fine("Reading " + file);
         }
-        try (InputStream in = new BufferedInputStream(Files.newInputStream(file.toPath()))) {
+        try (InputStream in = new BufferedInputStream(open(true))) {
             return xs.fromXML(in);
         } catch (RuntimeException | Error e) {
             throw new IOException("Unable to read " + file, e);
@@ -188,7 +199,7 @@ public final class XmlFile {
     }
 
     private Object unmarshal(Object o, boolean nullOut) throws IOException {
-        try (InputStream in = new BufferedInputStream(Files.newInputStream(file.toPath()))) {
+        try (InputStream in = new BufferedInputStream(open(true))) {
             // TODO: expose XStream the driver from XStream
             if (nullOut) {
                 return ((XStream2) xs).unmarshal(DEFAULT_DRIVER.createReader(in), o, null, true);
@@ -203,6 +214,11 @@ public final class XmlFile {
     public void write(Object o) throws IOException {
         if (LOGGER.isLoggable(Level.FINEST)) {
             LOGGER.log(Level.FINEST, new Throwable(), () -> "Writing " + file);
+        }
+        Route route = route();
+        if (route != null) {
+            writeToStore(route, o);
+            return;
         }
         mkdirs();
         AtomicFileWriter w = force
@@ -226,6 +242,25 @@ public final class XmlFile {
         }
     }
 
+    private void writeToStore(Route route, Object o) throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        try (Writer w = new OutputStreamWriter(buf, StandardCharsets.UTF_8)) {
+            w.write("<?xml version='1.1' encoding='UTF-8'?>\n");
+            beingWritten.put(o, null);
+            writing.set(file);
+            try {
+                xs.toXML(o, w);
+            } finally {
+                beingWritten.remove(o);
+                writing.set(null);
+            }
+        } catch (RuntimeException e) {
+            throw new IOException(e);
+        }
+        mkdirs(); // the directory itself stays local: other files, such as builds, live alongside
+        route.write(buf.toByteArray());
+    }
+
     /**
      * Provides an XStream replacement for an object unless a call to {@link #write} is currently in progress.
      * As per JENKINS-45892 this may be used by any class which expects to be written at top level to an XML file
@@ -247,11 +282,34 @@ public final class XmlFile {
         }
     }
 
+    /**
+     * Whether the file exists.
+     *
+     * @throws UncheckedIOException if the content is served by a {@link PersistenceStore} which cannot tell (being
+     *     unreachable, say): it is never taken for absent, which callers would take for a deletion, or a first start
+     */
     public boolean exists() {
-        return file.exists();
+        try {
+            return checkExists();
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to check whether " + file + " exists", e);
+        }
+    }
+
+    /**
+     * As {@link #exists()}, but throwing a checked exception if the {@link PersistenceStore} serving the file cannot tell.
+     */
+    @Restricted(NoExternalUse.class)
+    public boolean checkExists() throws IOException {
+        Route route = route();
+        return route != null ? route.exists() : file.exists();
     }
 
     public void delete() throws IOException {
+        Route route = route();
+        if (route != null) {
+            route.delete();
+        }
         Files.deleteIfExists(Util.fileToPath(file));
     }
 
@@ -273,7 +331,7 @@ public final class XmlFile {
      */
     public Reader readRaw() throws IOException {
         try {
-            InputStream fileInputStream = Files.newInputStream(file.toPath());
+            InputStream fileInputStream = open(false);
             try {
                 return new InputStreamReader(fileInputStream, sniffEncoding());
             } catch (IOException ex) {
@@ -323,7 +381,7 @@ public final class XmlFile {
             }
         }
 
-        try (InputStream in = Files.newInputStream(file.toPath())) {
+        try (InputStream in = open(false)) {
             InputSource input = new InputSource(file.toURI().toASCIIString());
             input.setByteStream(in);
             SAXParserFactory spf = SAXParserFactory.newInstance();
@@ -378,6 +436,29 @@ public final class XmlFile {
     /**
      * {@link XStream} instance is supposed to be thread-safe.
      */
+
+    @CheckForNull
+    private Route route() {
+        return StoreRouting.route(file);
+    }
+
+    /**
+     * Opens the content, from the {@link PersistenceStore} if it serves this file, else from the local file.
+     *
+     * @param loading whether the content is read into an object: this JVM then holds that version, against which a
+     *     later write of the object is checked (and merged); other reads (raw text, the encoding) only look
+     */
+    private InputStream open(boolean loading) throws IOException {
+        Route route = route();
+        if (route == null) {
+            return Files.newInputStream(file.toPath());
+        }
+        PersistenceStore.Entry entry = loading ? route.read() : route.peek();
+        if (entry == null) {
+            throw new NoSuchFileException(file.toString(), null, "not found in the persistence store as " + route.key());
+        }
+        return new ByteArrayInputStream(entry.content());
+    }
 
     private static final Logger LOGGER = Logger.getLogger(XmlFile.class.getName());
 
