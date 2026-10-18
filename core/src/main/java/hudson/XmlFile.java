@@ -62,6 +62,7 @@ import java.util.logging.Logger;
 import javax.xml.XMLConstants;
 import javax.xml.parsers.ParserConfigurationException;
 import javax.xml.parsers.SAXParserFactory;
+import jenkins.persistence.MaterializedCopies;
 import jenkins.persistence.PersistenceStore;
 import jenkins.persistence.Route;
 import jenkins.persistence.StoreRouting;
@@ -157,7 +158,26 @@ public final class XmlFile {
         this.force = force;
     }
 
+    /**
+     * The file on the local filesystem.
+     * If the content is served by a {@link PersistenceStore}, the stored content is first copied to this file (when it
+     * changed since the last copy), for callers reading it directly. Such a copy is read-only: the store is not
+     * updated from changes made to it. Use {@link #read}, {@link #unmarshal} and {@link #write} instead.
+     */
     public File getFile() {
+        Route route = route();
+        if (route != null) {
+            MaterializedCopies.materialize(route, file);
+        }
+        return file;
+    }
+
+    /**
+     * The local path of this file, without copying the stored content to it (as {@link #getFile} does).
+     * For code that only needs to know which file, or which store key, this is.
+     */
+    @Restricted(NoExternalUse.class)
+    public File getPath() {
         return file;
     }
 

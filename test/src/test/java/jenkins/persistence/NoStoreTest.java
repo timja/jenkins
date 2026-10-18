@@ -59,6 +59,7 @@ class NoStoreTest {
         XmlFile xml = Items.getConfigFile(p);
         assertEquals(config, xml.getFile());
         assertTrue(xml.exists());
+        assertTrue(PersistenceStores.materializedCopies().isEmpty());
         r.jenkins.setSystemMessage("local");
         assertThat(Files.readString(new File(r.jenkins.getRootDir(), "config.xml").toPath()), containsString("local"));
         xml.delete();

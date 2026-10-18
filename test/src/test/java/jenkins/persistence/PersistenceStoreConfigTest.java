@@ -36,6 +36,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.XmlFile;
 import hudson.model.FreeStyleProject;
 import hudson.model.Items;
@@ -43,8 +44,15 @@ import java.io.File;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.jvnet.hudson.test.JenkinsRule;
@@ -52,13 +60,14 @@ import org.jvnet.hudson.test.TestExtension;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 
 /**
- * Files routed to the store: read and written there, saves checked against the version read.
+ * Files routed to the store: read and written there, saves checked against the version read, local copies for
+ * callers reading the file directly.
  */
 @WithJenkins
 class PersistenceStoreConfigTest {
 
-    /** The store of the running Jenkins. */
-    static volatile InMemoryPersistenceStore STORE;
+    /** The store of the running Jenkins, counting reads by key. */
+    static volatile CountingStore STORE;
 
     private JenkinsRule r;
 
@@ -147,10 +156,111 @@ class PersistenceStoreConfigTest {
             IOException e = assertThrows(IOException.class, config::read);
             assertFalse(e instanceof java.nio.file.NoSuchFileException, "not taken for a missing file: " + e);
             assertThrows(IOException.class, () -> p.setDescription("not saved"));
+            // a copy for direct readers is left as it is, with no exception
+            assertSame(config.getPath(), config.getFile());
         } finally {
             STORE.setUnreachable(false);
         }
         assertTrue(config.exists());
+    }
+
+    @Test
+    void getFileCopiesTheStoredContentAndReadsTheStoreOnlyAfterAChange() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("m");
+        p.setDescription("copied");
+        String key = "jobs/m/config.xml";
+        XmlFile config = Items.getConfigFile(p);
+        int before = STORE.reads(key);
+        File f = config.getFile();
+        assertThat(Files.readString(f.toPath()), containsString("copied"));
+        for (int i = 0; i < 10; i++) {
+            config.getFile();
+        }
+        assertEquals(before + 1, STORE.reads(key), "the copy is current: no read for each use");
+        PersistenceStores.MaterializedCopy copy = PersistenceStores.materializedCopies().stream()
+                .filter(c -> c.key().equals(key)).findFirst().orElseThrow();
+        assertEquals(f, copy.file());
+        assertEquals(STORE.versions().get(key), copy.version());
+        assertEquals(f.lastModified(), copy.modified());
+        // changed elsewhere: copied again at the next use
+        String theirs = STORE.text(key).replace("copied", "elsewhere");
+        STORE.as("other").write(key, b(theirs), PersistenceStore.ANY);
+        assertThat(Files.readString(config.getFile().toPath()), containsString("elsewhere"));
+        assertEquals(before + 2, STORE.reads(key));
+        config.getFile();
+        assertEquals(before + 2, STORE.reads(key));
+        // and written here
+        route(key).read();
+        route(key).write(b(theirs.replace("elsewhere", "written here")));
+        assertThat(Files.readString(config.getFile().toPath()), containsString("written here"));
+    }
+
+    @Test
+    void aCopyChangedOnDiskIsLeftAsItIs() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("direct");
+        p.setDescription("saved");
+        File f = Items.getConfigFile(p).getFile();
+        String direct = Files.readString(f.toPath()).replace("saved", "written directly");
+        Files.writeString(f.toPath(), direct);
+        // the store is not updated from it, and it is not replaced by the stored content either
+        assertEquals(f, Items.getConfigFile(p).getFile());
+        assertEquals(direct, Files.readString(f.toPath()));
+        assertThat(STORE.text("jobs/direct/config.xml"), containsString("saved"));
+        // once it holds the stored content again (written back, say), it is current again
+        Files.write(f.toPath(), STORE.read("jobs/direct/config.xml").content());
+        Items.getConfigFile(p).getFile();
+        p.setDescription("saved again");
+        assertThat(Files.readString(Items.getConfigFile(p).getFile().toPath()), containsString("saved again"));
+    }
+
+    @Test
+    void aCopyOfWhatIsNoLongerStoredIsDeleted() throws Exception {
+        String key = "jobs/vanished/config.xml";
+        route(key).write(b("<project/>"));
+        XmlFile config = new XmlFile(PersistenceStores.fileFor(key));
+        File f = config.getFile();
+        assertTrue(f.isFile());
+        STORE.as("other").delete(key, PersistenceStore.ANY);
+        config.getFile();
+        assertFalse(f.exists());
+        assertFalse(PersistenceStores.materializedCopies().stream().anyMatch(c -> c.key().equals(key)));
+    }
+
+    @Test
+    void aCopyIsReplacedWhole() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("w");
+        String key = "jobs/w/config.xml";
+        byte[] a = b("<project><description>" + "a".repeat(1 << 20) + "</description></project>");
+        byte[] c = b("<project><description>" + "b".repeat(1 << 19) + "</description></project>");
+        File f = Items.getConfigFile(p).getFile();
+        PersistenceStore other = STORE.as("other");
+        other.write(key, a, PersistenceStore.ANY);
+        Items.getConfigFile(p).getFile();
+        AtomicBoolean done = new AtomicBoolean();
+        AtomicReference<String> torn = new AtomicReference<>();
+        Thread reader = new Thread(() -> {
+            while (!done.get()) {
+                try {
+                    byte[] seen = Files.readAllBytes(f.toPath());
+                    if (!Arrays.equals(seen, a) && !Arrays.equals(seen, c)) {
+                        torn.set("read " + seen.length + " bytes");
+                    }
+                } catch (IOException e) {
+                    torn.set(e.toString());
+                }
+            }
+        });
+        reader.start();
+        try {
+            for (int i = 0; i < 50 && torn.get() == null; i++) {
+                other.write(key, i % 2 == 0 ? c : a, PersistenceStore.ANY);
+                Items.getConfigFile(p).getFile();
+            }
+        } finally {
+            done.set(true);
+            reader.join();
+        }
+        assertNull(torn.get());
     }
 
     @Test
@@ -181,6 +291,22 @@ class PersistenceStoreConfigTest {
         assertEquals(v, STORE.versions().get("jobs/applied/config.xml"));
     }
 
+    /** Counts reads by key. */
+    static final class CountingStore extends InMemoryPersistenceStore {
+        private final Map<String, AtomicInteger> reads = new ConcurrentHashMap<>();
+
+        int reads(String key) {
+            AtomicInteger n = reads.get(key);
+            return n == null ? 0 : n.get();
+        }
+
+        @Override
+        public Entry read(@NonNull String key) throws IOException {
+            reads.computeIfAbsent(key, k -> new AtomicInteger()).incrementAndGet();
+            return super.read(key);
+        }
+    }
+
     @TestExtension
     public static final class Shared implements SharedFiles {
         @Override
@@ -193,7 +319,7 @@ class PersistenceStoreConfigTest {
     public static final class Provider implements PersistenceStoreProvider {
         @Override
         public PersistenceStore create() {
-            return STORE = new InMemoryPersistenceStore();
+            return STORE = new CountingStore();
         }
     }
 }

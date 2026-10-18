@@ -85,6 +85,7 @@ public record Route(@NonNull PersistenceStore store, @NonNull String key) {
             return StoredVersions.lastSeen(key);
         }
         long version = store.write(key, content, StoredVersions.versions.getOrDefault(key, PersistenceStore.ABSENT));
+        MaterializedCopies.changed(key);
         StoredVersions.seen(key, version);
         return version;
     }
@@ -104,6 +105,7 @@ public record Route(@NonNull PersistenceStore store, @NonNull String key) {
             LOGGER.log(Level.WARNING, e.getMessage() + "; deleting it anyway");
             store.delete(key, PersistenceStore.ANY);
         }
+        MaterializedCopies.changed(key);
         // absent is a version: a write made from an object loaded before (a late save, a new item of that name)
         // then conflicts with the key having been created again elsewhere meanwhile, rather than replacing it
         StoredVersions.seen(key, PersistenceStore.ABSENT);
