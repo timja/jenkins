@@ -31,6 +31,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -446,4 +447,56 @@ class AbstractLazyLoadRunMapTest {
         assertSame(second, first);
     }
 
+
+    @Test
+    void knowsBuildNumbersWithoutLoadingThem() {
+        assertTrue(a.knows(1));
+        assertFalse(a.knows(2));
+        assertTrue(a.knows(5));
+        assertTrue(a.getLoadedBuilds().isEmpty(), "nothing loaded");
+    }
+
+    @Test
+    void unloadMakesTheBuildBeReadAgain() {
+        Build first = a.get(3);
+        assertSame(first, a.get(3));
+        a.unload(3);
+        assertTrue(a.knows(3));
+        Build again = a.get(3);
+        again.asserts(3);
+        assertNotSame(first, again);
+        a.unload(4); // unknown: nothing to do
+        assertFalse(a.knows(4));
+    }
+
+    @Test
+    void forgetDropsTheBuildFromTheIndexOnly() {
+        a.forget(3);
+        assertFalse(a.knows(3));
+        assertNull(a.get(3));
+        assertTrue(new File(aBuilder.getDir(), "3").isDirectory(), "its directory is left alone");
+        a.get(5).asserts(5);
+    }
+
+    @Test
+    void storedNumbersAreIndexedBeforeTheyHaveADirectory() throws Exception {
+        FakeMap m = new FakeMap(localBuilder.add(1).getDir()) {
+            @Override
+            protected Set<Integer> storedNumbers() {
+                return Set.of(1, 4);
+            }
+        };
+        assertTrue(m.knows(4));
+        localBuilder.add(4); // as retrieve would make it
+        m.get(4).asserts(4);
+        m.get(1).asserts(1);
+    }
+
+    @Test
+    void sharedNumbersNeedOnlyBeUnused() {
+        a.proposeSharedNumber(2);
+        a.proposeSharedNumber(6);
+        assertThrows(IllegalStateException.class, () -> a.proposeSharedNumber(3));
+        assertThrows(IllegalStateException.class, () -> a.proposeNewNumber(2), "unlike a number of its own");
+    }
 }

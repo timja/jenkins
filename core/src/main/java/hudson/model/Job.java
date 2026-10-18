@@ -737,7 +737,8 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
     }
 
     @Restricted(NoExternalUse.class)
-    @Extension
+    // first: LazyBuildMixIn.ItemListenerImpl then points the job's builds at the new location, and other listeners load them
+    @Extension(ordinal = Double.MAX_VALUE)
     public static class SubItemBuildsLocationImpl extends ItemListener {
         @Override
         public void onLocationChanged(Item item, String oldFullName, String newFullName) {
