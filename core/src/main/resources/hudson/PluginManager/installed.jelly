@@ -47,6 +47,7 @@ THE SOFTWARE.
           <st:include page="overflow.jelly" />
         </div>
       </div>
+      <st:include it="${app.pluginManager}" page="notices.jelly"/>
 
       <st:adjunct includes="hudson.PluginManager._table"/>
 

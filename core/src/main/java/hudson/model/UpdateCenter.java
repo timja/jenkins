@@ -114,6 +114,7 @@ import jenkins.install.InstallUtil;
 import jenkins.management.Badge;
 import jenkins.model.Jenkins;
 import jenkins.model.Loadable;
+import jenkins.plugins.PluginArchiveListener;
 import jenkins.security.stapler.StaplerDispatchable;
 import jenkins.security.stapler.StaplerNotDispatchable;
 import jenkins.util.SystemProperties;
@@ -2536,6 +2537,15 @@ public class UpdateCenter extends AbstractModelObject implements Loadable, Savea
                 }
 
                 moveAtomically(src, dst);
+            }
+            if (site != null && site.getId().equals(ID_UPLOAD)) {
+                for (PluginArchiveListener l : PluginArchiveListener.all()) {
+                    try {
+                        l.installed(plugin.name, dst);
+                    } catch (RuntimeException e) {
+                        LOGGER.log(Level.WARNING, "Listener failed on the install of " + dst, e);
+                    }
+                }
             }
         }
 
