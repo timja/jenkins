@@ -104,6 +104,7 @@ public final class AuthenticationProcessingFilter2 extends UsernamePasswordAuthe
             request.getSession().invalidate();
             request.getSession(true);
         }
+        TokenBasedRememberMeServices2.forgetLogin(request); // the session may be kept; its new login is recorded next
         super.successfulAuthentication(request, response, chain, authResult);
         HttpSession newSession = request.getSession();
 

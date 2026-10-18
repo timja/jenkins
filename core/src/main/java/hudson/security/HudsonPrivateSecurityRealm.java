@@ -26,6 +26,7 @@ package hudson.security;
 
 import static jakarta.servlet.http.HttpServletResponse.SC_UNAUTHORIZED;
 
+import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import hudson.Extension;
@@ -74,6 +75,8 @@ import java.util.regex.Pattern;
 import javax.crypto.SecretKeyFactory;
 import javax.crypto.spec.PBEKeySpec;
 import jenkins.model.Jenkins;
+import jenkins.persistence.PersistenceStore;
+import jenkins.security.DefaultConfidentialStore;
 import jenkins.security.FIPS140;
 import jenkins.security.NonePasswordComplexityRule;
 import jenkins.security.PasswordComplexityException;
@@ -744,8 +747,47 @@ public class HudsonPrivateSecurityRealm extends AbstractPasswordBasedSecurityRea
         }
 
         public String getProtectedPassword() {
-            // put session Id in it to prevent a replay attack.
-            return Protector.protect(Stapler.getCurrentRequest2().getSession().getId() + ':' + getPassword());
+            // put a value bound to this session in it to prevent a replay attack.
+            if (DefaultConfidentialStore.isSharingKeys()) {
+                // with a key every controller has (no session to bind it to), not the hash itself but a digest of it:
+                // the form is only taken as unchanged while the hash is still the user's, so a page kept around reveals
+                // nothing of it; marked, so that one which cannot be read where it is submitted is never taken for a new
+                // password
+                return SHARED_PROTECTED + Protector.protect(replayGuard() + ':' + digest(getPassword()));
+            }
+            return Protector.protect(replayGuard() + ':' + getPassword());
+        }
+
+        /** Starts a protected password rendered with a key every controller has (see {@link #getProtectedPassword}). */
+        static final String SHARED_PROTECTED = "{shared-protected}";
+
+        /** A digest of a password hash, standing for it in a protected form field. */
+        static String digest(String hash) {
+            try {
+                return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(
+                        MessageDigest.getInstance("SHA-256").digest(hash.getBytes(StandardCharsets.UTF_8)));
+            } catch (java.security.NoSuchAlgorithmException e) {
+                throw new IllegalStateException(e);
+            }
+        }
+
+        /**
+         * Binds the protected password to who is editing it. Normally the session id;
+         * with controllers sharing confidential keys through a {@link PersistenceStore}
+         * ({@link DefaultConfidentialStore#isSharingKeys}), whose sessions are their own,
+         * the signed-in user and their seed (which changes when their sessions are invalidated) instead,
+         * so that the form can be submitted to another controller than the one which rendered it. Such a form is then
+         * taken as unchanged only while the password it was rendered with is still the user's (see newInstance), and its
+         * crumb must not be bound to the session either (see {@link TokenBasedRememberMeServices2#ALWAYS_REMEMBER}).
+         */
+        static String replayGuard() {
+            if (!DefaultConfidentialStore.isSharingKeys()) {
+                return Stapler.getCurrentRequest2().getSession().getId();
+            }
+            String name = Jenkins.getAuthentication2().getName();
+            User u = User.getById(name, false);
+            UserSeedProperty seed = u == null ? null : u.getProperty(UserSeedProperty.class);
+            return "user:" + name + ":" + (seed == null ? "" : seed.getSeed());
         }
 
         public String getUsername() {
@@ -864,6 +906,10 @@ public class HudsonPrivateSecurityRealm extends AbstractPasswordBasedSecurityRea
                     throw new FormException("Please confirm the password by typing it twice", "user.password2");
                 }
 
+                if (DefaultConfidentialStore.isSharingKeys() && (pwd.startsWith(Details.SHARED_PROTECTED) || pwd2.startsWith(Details.SHARED_PROTECTED))) {
+                    return unchangedSharedPassword(req, pwd, pwd2);
+                }
+
                 // will be null if it wasn't encrypted
                 String data = Protector.unprotect(pwd);
                 String data2 = Protector.unprotect(pwd2);
@@ -884,7 +930,7 @@ public class HudsonPrivateSecurityRealm extends AbstractPasswordBasedSecurityRea
                 }
 
                 if (data != null) {
-                    String prefix = Stapler.getCurrentRequest2().getSession().getId() + ':';
+                    String prefix = replayGuard() + ':';
                     if (data.startsWith(prefix)) {
                         // The password is not being changed
                         return Details.fromHashedPassword(data.substring(prefix.length()));
@@ -917,6 +963,36 @@ public class HudsonPrivateSecurityRealm extends AbstractPasswordBasedSecurityRea
                 return Details.fromPlainPassword(Util.fixNull(pwd));
             }
 
+            /**
+             * The password of a form rendered with a key every controller has, submitted unchanged: kept as it is, if it
+             * still is the one the form was rendered with. Never taken for a new password: one that cannot be read here
+             * (the controllers' keys differ), was rendered for another user, or changed in one field only, is refused.
+             */
+            private static Details unchangedSharedPassword(StaplerRequest2 req, String pwd, String pwd2) throws FormException {
+                String data = pwd.startsWith(Details.SHARED_PROTECTED) ? Protector.unprotect(pwd.substring(Details.SHARED_PROTECTED.length())) : null;
+                String data2 = pwd2.startsWith(Details.SHARED_PROTECTED) ? Protector.unprotect(pwd2.substring(Details.SHARED_PROTECTED.length())) : null;
+                String prefix = replayGuard() + ':';
+                if (data == null || data2 == null || !MessageDigest.isEqual(data.getBytes(StandardCharsets.UTF_8), data2.getBytes(StandardCharsets.UTF_8))
+                        || !data.startsWith(prefix)) {
+                    throw new FormException("This page cannot be submitted here; reload it and try again", "user.password");
+                }
+                // not bound to a session, which logging out ends: a page rendered before the password was changed would
+                // bring the old one back
+                String current = currentPassword(req);
+                String hash = data.substring(prefix.length());
+                if (current == null || !MessageDigest.isEqual(digest(current).getBytes(StandardCharsets.UTF_8), hash.getBytes(StandardCharsets.UTF_8))) {
+                    throw new FormException("The password was changed since this page was loaded; reload it", "user.password");
+                }
+                return Details.fromHashedPassword(current);
+            }
+
+            @CheckForNull
+            private static String currentPassword(StaplerRequest2 req) {
+                User user = Util.getNearestAncestorOfTypeOrThrow(req, User.class);
+                Details current = user.getProperty(Details.class);
+                return current == null ? null : current.getPassword();
+            }
+
             @POST
             public FormValidation doCheckPassword(@QueryParameter String value) {
                 String password = Util.fixEmpty(value);
@@ -924,10 +1000,14 @@ public class HudsonPrivateSecurityRealm extends AbstractPasswordBasedSecurityRea
                     return FormValidation.ok();
                 }
 
+                if (DefaultConfidentialStore.isSharingKeys() && password.startsWith(Details.SHARED_PROTECTED)) {
+                    return FormValidation.ok(); // the password is not being changed (checked when submitted)
+                }
+
                 // will be null if it wasn't encrypted
                 String data = Protector.unprotect(password);
                 if (data != null) {
-                    String prefix = Stapler.getCurrentRequest2().getSession().getId() + ':';
+                    String prefix = replayGuard() + ':';
                     if (data.startsWith(prefix)) {
                         // The password is not being changed
                         return FormValidation.ok();
