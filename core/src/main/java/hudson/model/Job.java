@@ -570,7 +570,7 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
      *
      * @since 1.188
      */
-    public void addProperty(JobProperty<? super JobT> jobProp) throws IOException {
+    public synchronized void addProperty(JobProperty<? super JobT> jobProp) throws IOException {
         ((JobProperty) jobProp).setOwner(this);
         properties.add(jobProp);
         save();
@@ -581,7 +581,7 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
      *
      * @since 1.279
      */
-    public void removeProperty(JobProperty<? super JobT> jobProp) throws IOException {
+    public synchronized void removeProperty(JobProperty<? super JobT> jobProp) throws IOException {
         properties.remove(jobProp);
         save();
     }
@@ -593,7 +593,7 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
      *      The property that was just removed.
      * @since 1.279
      */
-    public <T extends JobProperty> T removeProperty(Class<T> clazz) throws IOException {
+    public synchronized <T extends JobProperty> T removeProperty(Class<T> clazz) throws IOException {
         for (JobProperty<? super JobT> p : properties) {
             if (clazz.isInstance(p)) {
                 removeProperty(p);
