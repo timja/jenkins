@@ -908,9 +908,11 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
      */
     public void delete() throws IOException {
         String idKey = idStrategy().keyFor(id);
+        XmlFile config = getConfigFile();
         AllUsers.remove(id);
         Util.deleteRecursive(getUserFolderFor(id));
         UserDetailsCache.get().invalidate(idKey);
+        SaveableListener.fireOnDeleted(this, config);
     }
 
     /**

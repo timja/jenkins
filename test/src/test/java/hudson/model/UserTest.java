@@ -41,6 +41,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import hudson.ExtensionList;
+import hudson.XmlFile;
+import hudson.model.listeners.SaveableListener;
 import hudson.security.ACL;
 import hudson.security.ACLContext;
 import hudson.security.AbstractPasswordBasedSecurityRealm;
@@ -60,6 +62,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.logging.Level;
 import jenkins.model.IdStrategy;
@@ -818,4 +821,26 @@ class UserTest {
             throw new UserMayOrMayNotExistException2(username + " not found");
         }
     }
+    @Test
+    void deletingAUserTellsSaveableListeners() throws Exception {
+        User alice = User.getById("alice", true);
+        alice.save();
+        File config = new File(j.jenkins.getRootDir(), "users").listFiles(d -> d.getName().startsWith("alice"))[0];
+        alice.delete();
+        assertEquals(List.of(alice), DeletedUsers.deleted.keySet().stream().toList());
+        assertEquals(new File(config, "config.xml"), DeletedUsers.deleted.get(alice));
+    }
+
+    @TestExtension("deletingAUserTellsSaveableListeners")
+    public static class DeletedUsers extends SaveableListener {
+        static final Map<Saveable, File> deleted = new java.util.concurrent.ConcurrentHashMap<>();
+
+        @Override
+        public void onDeleted(Saveable o, XmlFile file) {
+            if (o instanceof User) {
+                deleted.put(o, file.getFile());
+            }
+        }
+    }
+
 }
