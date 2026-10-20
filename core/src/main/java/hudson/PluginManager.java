@@ -135,6 +135,7 @@ import jenkins.install.InstallState;
 import jenkins.install.InstallUtil;
 import jenkins.model.Jenkins;
 import jenkins.plugins.DetachedPluginsUtil;
+import jenkins.plugins.PluginArchiveListener;
 import jenkins.security.CustomClassFilter;
 import jenkins.security.stapler.StaplerNotDispatchable;
 import jenkins.util.SystemProperties;
@@ -1959,6 +1960,14 @@ public abstract class PluginManager extends AbstractModelObject implements OnMas
             copier.cleanup();
 
             final String baseName = identifyPluginShortName(t);
+            try {
+                for (PluginArchiveListener l : PluginArchiveListener.all()) {
+                    l.beforeInstall(baseName, t);
+                }
+            } catch (AbortException e) {
+                Files.deleteIfExists(t.toPath());
+                throw new Failure(e.getMessage());
+            }
 
             pluginUploaded = true;
 

@@ -65,6 +65,7 @@ THE SOFTWARE.
           <st:include page="overflow.jelly" />
         </div>
       </div>
+      <st:include it="${app.pluginManager}" page="notices.jelly"/>
 
       <script src="${resURL}/jsbundles/plugin-manager-ui.js" type="text/javascript"/>
 
