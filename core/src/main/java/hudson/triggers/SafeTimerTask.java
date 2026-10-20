@@ -35,6 +35,7 @@ import java.util.TimerTask;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
+import jenkins.util.PeriodicWorkCoordinator;
 import jenkins.util.SystemProperties;
 import jenkins.util.Timer;
 
@@ -89,6 +90,9 @@ public abstract class SafeTimerTask extends TimerTask {
         // background activity gets system credential,
         // just like executors get it.
         try (ACLContext ctx = ACL.as2(ACL.SYSTEM2)) {
+            if (this instanceof PeriodicWork work && !PeriodicWorkCoordinator.allows(work)) {
+                return; // another controller runs it this period
+            }
             doRun();
         } catch (Throwable t) {
             LOGGER.log(Level.SEVERE, "Timer task " + this + " failed", t);
