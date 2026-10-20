@@ -28,12 +28,15 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.is;
 import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 
 import hudson.model.FreeStyleBuild;
 import hudson.model.FreeStyleProject;
+import hudson.model.Item;
+import hudson.model.listeners.ItemListener;
 import hudson.model.listeners.RunListener;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -41,6 +44,7 @@ import org.jvnet.hudson.test.Issue;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.RunLoadCounter;
 import org.jvnet.hudson.test.SleepBuilder;
+import org.jvnet.hudson.test.TestExtension;
 import org.jvnet.hudson.test.junit.jupiter.WithJenkins;
 
 @WithJenkins
@@ -158,6 +162,29 @@ class LazyBuildMixInTest {
             }
             return null;
         });
+    }
+
+    @Test
+    void listenersToldOfARenameFindTheBuildsInTheNewLocation() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("p");
+        r.buildAndAssertSuccess(p);
+        p._getRuns().purgeCache(); // not in memory: loaded from wherever the job's builds are taken to be
+        p.renameTo("renamed");
+        assertEquals(1, BuildLookup.found.get(p), "loaded in the new location by a listener of default ordinal");
+        assertNotNull(p.getBuildByNumber(1));
+    }
+
+    @TestExtension("listenersToldOfARenameFindTheBuildsInTheNewLocation")
+    public static class BuildLookup extends ItemListener {
+        static final java.util.Map<Item, Integer> found = new java.util.concurrent.ConcurrentHashMap<>();
+
+        @Override
+        public void onLocationChanged(Item item, String oldFullName, String newFullName) {
+            if (item instanceof FreeStyleProject p) {
+                FreeStyleBuild b = p.getBuildByNumber(1);
+                found.put(item, b == null ? 0 : b.getNumber());
+            }
+        }
     }
 
 }
