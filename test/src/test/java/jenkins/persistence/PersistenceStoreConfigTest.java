@@ -117,10 +117,10 @@ class PersistenceStoreConfigTest {
         byte[] theirs = b("<project><description>elsewhere</description></project>");
         STORE.as("other").write(key, theirs, PersistenceStore.ANY);
         // not read here (its read failed, say, and the object holds defaults): its save must not replace what is stored
-        assertThrows(ConflictException.class, () -> route(key).write(b("<project/>")));
+        assertThrows(ConflictException.class, () -> route(key).write(b("<project/>"), null));
         assertArrayEquals(theirs, STORE.read(key).content());
         // never stored: created
-        route("jobs/unread2/config.xml").write(b("<project/>"));
+        route("jobs/unread2/config.xml").write(b("<project/>"), null);
         assertThat(STORE.versions(), hasKey("jobs/unread2/config.xml"));
     }
 
@@ -129,19 +129,19 @@ class PersistenceStoreConfigTest {
         String key = "jobs/absent/config.xml";
         assertNull(route(key).read());
         STORE.as("other").write(key, b("<project/>"), PersistenceStore.ANY);
-        assertThrows(ConflictException.class, () -> route(key).write(b("<project><description>here</description></project>")));
+        assertThrows(ConflictException.class, () -> route(key).write(b("<project><description>here</description></project>"), null));
         assertArrayEquals(b("<project/>"), STORE.read(key).content());
     }
 
     @Test
     void aKeyCreatedAgainElsewhereAfterItsDeletionHereIsNotReplaced() throws Exception {
         String key = "jobs/gone/config.xml";
-        route(key).write(b("<project/>"));
+        route(key).write(b("<project/>"), null);
         route(key).delete();
         assertThat(STORE.versions(), not(hasKey(key)));
         STORE.as("other").write(key, b("<project><description>elsewhere</description></project>"), PersistenceStore.ANY);
         // a late save from an object loaded before must not replace that
-        assertThrows(ConflictException.class, () -> route(key).write(b("<project><description>late</description></project>")));
+        assertThrows(ConflictException.class, () -> route(key).write(b("<project><description>late</description></project>"), null));
         assertThat(STORE.text(key), containsString("elsewhere"));
     }
 
@@ -191,7 +191,7 @@ class PersistenceStoreConfigTest {
         assertEquals(before + 2, STORE.reads(key));
         // and written here
         route(key).read();
-        route(key).write(b(theirs.replace("elsewhere", "written here")));
+        route(key).write(b(theirs.replace("elsewhere", "written here")), null);
         assertThat(Files.readString(config.getFile().toPath()), containsString("written here"));
     }
 
@@ -216,7 +216,7 @@ class PersistenceStoreConfigTest {
     @Test
     void aCopyOfWhatIsNoLongerStoredIsDeleted() throws Exception {
         String key = "jobs/vanished/config.xml";
-        route(key).write(b("<project/>"));
+        route(key).write(b("<project/>"), null);
         XmlFile config = new XmlFile(PersistenceStores.fileFor(key));
         File f = config.getFile();
         assertTrue(f.isFile());

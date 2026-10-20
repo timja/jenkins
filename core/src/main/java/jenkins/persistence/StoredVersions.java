@@ -39,12 +39,17 @@ public final class StoredVersions {
 
     /** The version of each key this JVM last read or wrote ({@link PersistenceStore#ABSENT} if it saw none). */
     static final Map<String, Long> versions = new ConcurrentHashMap<>();
+    /** The content of each XML key at the version this JVM last read or wrote, the base of a merge. */
+    static final Map<String, Base> bases = new ConcurrentHashMap<>();
+    /** Bases larger than this are not kept: such a save is refused rather than merged on a conflict. */
+    private static final int MAX_BASE_SIZE = 1024 * 1024;
 
     private StoredVersions() {}
 
     /** Forgets every key, as when the store is resolved again. */
     static void clear() {
         versions.clear();
+        bases.clear();
     }
 
     /**
@@ -59,6 +64,10 @@ public final class StoredVersions {
         } else {
             versions.remove(key);
         }
+        Base base = bases.get(key);
+        if (base != null && base.version() != version) {
+            bases.remove(key); // not the content of this version: never merged against
+        }
     }
 
     /**
@@ -69,9 +78,21 @@ public final class StoredVersions {
         return versions.getOrDefault(key, PersistenceStore.ANY);
     }
 
+    /** Content of an XML key at a version, the base of a merge. */
+    record Base(long version, byte[] content) {}
+
+    static void remember(String key, long version, byte[] content) {
+        if (key.endsWith(".xml") && content.length <= MAX_BASE_SIZE) {
+            bases.put(key, new Base(version, content));
+        } else {
+            bases.remove(key);
+        }
+    }
+
     /** Records that this JVM's object now holds an entry read with {@link Route#peek} (as {@link Route#read} does). */
     @Restricted(NoExternalUse.class)
     public static void loaded(@NonNull String key, @NonNull PersistenceStore.Entry entry) {
         seen(key, entry.version());
+        remember(key, entry.version(), entry.content());
     }
 }

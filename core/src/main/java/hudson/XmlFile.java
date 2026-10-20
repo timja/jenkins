@@ -33,6 +33,7 @@ import com.thoughtworks.xstream.io.HierarchicalStreamReader;
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import hudson.diagnosis.OldDataMonitor;
 import hudson.model.Descriptor;
+import hudson.model.Saveable;
 import hudson.util.AtomicFileWriter;
 import hudson.util.XStream2;
 import java.io.BufferedInputStream;
@@ -66,6 +67,7 @@ import jenkins.persistence.MaterializedCopies;
 import jenkins.persistence.PersistenceStore;
 import jenkins.persistence.Route;
 import jenkins.persistence.StoreRouting;
+import jenkins.persistence.StoredReloads;
 import org.apache.commons.io.IOUtils;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
@@ -278,7 +280,8 @@ public final class XmlFile {
             throw new IOException(e);
         }
         mkdirs(); // the directory itself stays local: other files, such as builds, live alongside
-        route.write(buf.toByteArray());
+        // merged with a change made elsewhere meanwhile, or refused: either way the object is then reloaded
+        route.write(buf.toByteArray(), o instanceof Saveable s ? () -> StoredReloads.reloadLater(this, s) : null);
     }
 
     /**

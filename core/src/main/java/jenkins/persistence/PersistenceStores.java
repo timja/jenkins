@@ -32,6 +32,7 @@ import java.io.File;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.util.Collection;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
 import jenkins.util.ThrowingCallable;
@@ -54,6 +55,7 @@ public final class PersistenceStores {
 
     private static volatile Jenkins resolvedFor;
     private static volatile PersistenceStore resolvedStore;
+    static final AtomicLong refused = new AtomicLong();
 
     private PersistenceStores() {}
 
@@ -224,5 +226,11 @@ public final class PersistenceStores {
     @NonNull
     public static Collection<MaterializedCopy> materializedCopies() {
         return MaterializedCopies.all();
+    }
+
+    /** How many conflicting saves were refused (and their objects reloaded), since this controller started. */
+    @Restricted(NoExternalUse.class)
+    public static long getRefusedCount() {
+        return refused.get();
     }
 }
