@@ -197,6 +197,16 @@ public final class StoredItems {
      */
     static final long GONE = -3;
 
+    /**
+     * Records that the item whose configuration a key is is being moved away from it, as a move made elsewhere is
+     * applied: until it is in its new place ({@link #movedAway}), a save or deletion of it there is refused.
+     */
+    @Restricted(NoExternalUse.class)
+    public static void movingAway(@NonNull String key) {
+        StoredVersions.versions.put(key, GONE);
+        StoredVersions.bases.remove(key);
+    }
+
     /** Items deleted here: a late save of one (a build completing, say) is refused rather than storing it again. */
     private static final Map<Object, Boolean> deleted = Collections.synchronizedMap(new WeakHashMap<>());
 
