@@ -35,5 +35,10 @@ THE SOFTWARE.
     </j:otherwise>
   </j:choose>
 
+  <!-- builds not on this controller (jenkins.model.ExternalBuilds): their markup is the implementation's -->
+  <j:forEach var="b" items="${it.runningElsewhere}">
+    <st:include it="${b}" page="historyEntry.jelly" optional="true"/>
+  </j:forEach>
+
   <st:include page="/hudson/widgets/HistoryWidget/entries.jelly"/>
 </j:jelly>
