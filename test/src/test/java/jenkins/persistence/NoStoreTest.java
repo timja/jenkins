@@ -64,5 +64,6 @@ class NoStoreTest {
         assertThat(Files.readString(new File(r.jenkins.getRootDir(), "config.xml").toPath()), containsString("local"));
         xml.delete();
         assertFalse(config.exists());
+        assertFalse(hudson.ExtensionList.lookupSingleton(RefusedAtStartupMonitor.class).isActivated());
     }
 }

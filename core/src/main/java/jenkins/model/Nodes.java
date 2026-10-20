@@ -38,21 +38,31 @@ import hudson.model.PersistenceRoot;
 import hudson.model.Queue;
 import hudson.model.Saveable;
 import hudson.model.listeners.SaveableListener;
+import hudson.slaves.AbstractCloudSlave;
 import hudson.slaves.EphemeralNode;
 import hudson.slaves.OfflineCause;
 import java.io.File;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import jenkins.persistence.ConflictException;
+import jenkins.persistence.PersistenceStore;
+import jenkins.persistence.PersistenceStores;
+import jenkins.persistence.Route;
+import jenkins.persistence.StoreRouting;
 import jenkins.util.SystemProperties;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
@@ -120,6 +130,7 @@ public class Nodes implements PersistenceRoot {
                 final var name = node.getNodeName();
                 Nodes.this.nodes.put(name, node);
                 node.onLoad(Nodes.this, name);
+                route(node);
                 var oldNode = toRemove.get(name);
                 if (oldNode != null) {
                     node.setTemporaryOfflineCause(oldNode.getTemporaryOfflineCause());
@@ -138,7 +149,7 @@ public class Nodes implements PersistenceRoot {
             NodeListener.fireOnDeleted(deletedNode);
             var nodeName = deletedNode.getNodeName();
             LOGGER.fine(() -> "deleting " + new File(getRootDir(), nodeName));
-            Util.deleteRecursive(new File(getRootDir(), nodeName));
+            deleteNodeDir(nodeName);
         }
     }
 
@@ -190,6 +201,7 @@ public class Nodes implements PersistenceRoot {
 
     private void handleAddedNode(final @NonNull Node node, final Node old) throws IOException {
         node.onLoad(this, node.getNodeName());
+        route(node);
         jenkins.updateNewComputer(node);
         jenkins.trimLabels(node, old);
         // TODO there is a theoretical race whereby the node instance is updated/removed after lock release
@@ -218,6 +230,26 @@ public class Nodes implements PersistenceRoot {
 
     public XmlFile getConfigFile(Node node) {
         return getConfigFile(node.getRootDir());
+    }
+
+    /**
+     * Routes the configuration of a node becoming the one of its name here: a cloud agent, launched by this controller's
+     * cloud, is kept local, as other controllers sharing a persistence store must not launch it too; any other node is
+     * shared, also one that replaced a cloud agent of the same name. Called before the node is first saved.
+     */
+    private void route(Node node) {
+        String key = PersistenceStores.keyFor(new File(node.getRootDir(), "config.xml"));
+        if (key != null) {
+            StoreRouting.keepLocal(key, node instanceof AbstractCloudSlave);
+        }
+    }
+
+    /**
+     * Whether a node is a cloud agent which another controller launched (its configuration came from the store): one
+     * whose configuration a store owns and which this controller does not keep local. Without such a store, none is.
+     */
+    private static boolean launchedElsewhere(Node n, File dir) {
+        return n instanceof AbstractCloudSlave && StoreRouting.route(new File(dir, "config.xml")) != null;
     }
 
     public XmlFile getConfigFile(File dir) {
@@ -290,11 +322,12 @@ public class Nodes implements PersistenceRoot {
                 Nodes.this.nodes.remove(oldOne.getNodeName());
                 Nodes.this.nodes.put(newOne.getNodeName(), newOne);
                 newOne.onLoad(Nodes.this, newOne.getNodeName());
+                route(newOne);
             });
             updateNode(newOne, false);
             if (!newOne.getNodeName().equals(oldOne.getNodeName())) {
                 LOGGER.fine(() -> "deleting " + new File(getRootDir(), oldOne.getNodeName()));
-                Util.deleteRecursive(new File(getRootDir(), oldOne.getNodeName()));
+                deleteNodeDir(oldOne.getNodeName());
             }
             Queue.withLock(() -> {
                 jenkins.updateComputers(newOne);
@@ -328,14 +361,84 @@ public class Nodes implements PersistenceRoot {
             });
             // no need for a full save() so we just do the minimum
             LOGGER.fine(() -> "deleting " + new File(getRootDir(), node.getNodeName()));
-            Util.deleteRecursive(new File(getRootDir(), node.getNodeName()));
+            XmlFile config = getConfigFile(node);
+            deleteNodeDir(node.getNodeName());
 
             if (match.get()) {
                 jenkins.updateComputers(node);
                 jenkins.trimLabels(node);
             }
             NodeListener.fireOnDeleted(node);
-            SaveableListener.fireOnDeleted(node, getConfigFile(node));
+            SaveableListener.fireOnDeleted(node, config);
+        }
+    }
+
+    /**
+     * Applies a change another controller made to a node's configuration in a shared persistence store:
+     * loads it again (or for the first time), or forgets it if it was deleted. Nothing is saved.
+     */
+    @Restricted(NoExternalUse.class)
+    public void changedElsewhere(@NonNull String name, boolean deleted) {
+        if (!PersistenceStores.isSafeName(name)) {
+            // from a key no controller writes: ".." would be JENKINS_HOME itself, deleted below
+            LOGGER.warning(() -> "Ignoring a node named " + name + ", changed elsewhere: not a node's name");
+            return;
+        }
+        Node old = getNode(name);
+        if (deleted) {
+            String key = PersistenceStores.keyFor(getConfigFile(name).getPath());
+            if (key != null && StoreRouting.isKeptLocal(key)) {
+                return; // this controller's cloud agent of that name, which the store never had: not the node deleted
+            }
+            if (old != null) {
+                unload(old);
+                jenkins.updateComputerList();
+                jenkins.trimLabels();
+                NodeListener.fireOnDeleted(old);
+            }
+            try {
+                // a copy left here (read from the store, say) must not bring the node back at the next startup
+                Util.deleteRecursive(new File(getRootDir(), name));
+            } catch (IOException e) {
+                LOGGER.log(Level.WARNING, "could not delete the directory of " + name + ", deleted elsewhere", e);
+            }
+            return;
+        }
+        Node loaded = load(name, true);
+        if (loaded == null) {
+            return; // gone meanwhile, or vetoed here (then dropped here too, as at startup)
+        }
+        if (old != null) {
+            Queue.withLock(() -> {
+                jenkins.updateComputerList(); // rebind the computer to the new node object
+                jenkins.trimLabels(old, loaded); // as a local replacement does: a label removed elsewhere leaves it now
+            });
+            NodeListener.fireOnUpdated(old, loaded);
+        } else {
+            NodeListener.fireOnCreated(loaded);
+        }
+    }
+
+    /**
+     * Deletes a node's directory, and its configuration from a persistence store sharing it, so that it sees the deletion.
+     * The local configuration goes with the directory, which is only unlinked if it is a symbolic link.
+     */
+    private void deleteNodeDir(String nodeName) throws IOException {
+        Route route = StoreRouting.route(getConfigFile(nodeName).getPath());
+        if (route != null) {
+            try {
+                route.delete();
+            } catch (ConflictException e) {
+                if (e.getActualVersion() != PersistenceStore.ABSENT) {
+                    throw e;
+                }
+                // deleted elsewhere already (not applied here yet): gone, as wanted
+            }
+        }
+        Util.deleteRecursive(new File(getRootDir(), nodeName));
+        String key = PersistenceStores.keyFor(new File(getRootDir(), nodeName + File.separator + "config.xml"));
+        if (key != null) {
+            StoreRouting.keepLocal(key, false);
         }
     }
 
@@ -373,12 +476,39 @@ public class Nodes implements PersistenceRoot {
      */
     public void load() throws IOException {
         final File nodesDir = getRootDir();
-        final File[] subdirs = nodesDir.listFiles(File::isDirectory);
+        final File[] localDirs = nodesDir.listFiles(File::isDirectory);
+        // nodes may also exist only in a persistence store shared with other controllers
+        final Set<File> localSet = new java.util.HashSet<>(localDirs == null ? List.of() : Arrays.asList(localDirs));
+        final Set<File> subdirs = new TreeSet<>(localSet);
+        final Set<String> stored = PersistenceStores.storedItemNames(nodesDir);
+        for (String name : stored) {
+            subdirs.add(new File(nodesDir, name));
+        }
         final Map<String, Node> newNodes = new TreeMap<>();
-        if (subdirs != null) {
+        {
             for (File subdir : subdirs) {
                 try {
-                    load(subdir, newNodes);
+                    boolean local = localSet.contains(subdir);
+                    // only here (this controller's cloud agent, never written to the store): read it from here, which
+                    // routing to the store would not find, and keep it here if it is a cloud agent
+                    String key = PersistenceStores.keyFor(new File(subdir, "config.xml"));
+                    boolean onlyHere = local && key != null && !stored.contains(subdir.getName());
+                    if (onlyHere) {
+                        StoreRouting.keepLocal(key, true);
+                    }
+                    Node n = null;
+                    try {
+                        n = load(subdir, newNodes);
+                    } finally {
+                        if (onlyHere && !(n instanceof AbstractCloudSlave)) {
+                            // a permanent node, or nothing loadable (e.g. an empty directory left behind): shared from its next save
+                            StoreRouting.keepLocal(key, false);
+                        }
+                    }
+                    if (n != null && launchedElsewhere(n, subdir)) {
+                        // from the store, even with a directory here: another controller's cloud agent
+                        newNodes.remove(n.getNodeName());
+                    }
                 } catch (IOException e) {
                     LOGGER.log(Level.WARNING, "could not load " + subdir, e);
                 }
@@ -399,6 +529,17 @@ public class Nodes implements PersistenceRoot {
         });
     }
 
+    /** Whether every {@link NodeListener} allows a node to be loaded, as {@link #load()} asks. */
+    private static boolean allowLoad(Node node) {
+        return ExtensionList.lookup(NodeListener.class).stream().allMatch(nodeListener -> {
+            if (!nodeListener.allowLoad(node)) {
+                LOGGER.log(Level.FINE, () -> "Loading of node " + node.getNodeName() + " vetoed by " + nodeListener);
+                return false;
+            }
+            return true;
+        });
+    }
+
     @CheckForNull
     public Node getOrLoad(String name) {
         Node node = getNode(name);
@@ -408,12 +549,36 @@ public class Nodes implements PersistenceRoot {
 
     @CheckForNull
     public Node load(String name) {
+        return load(name, false);
+    }
+
+    /**
+     * @param vetoable whether {@link NodeListener#allowLoad} may veto the node, as at startup ({@link #load()}): a node
+     *     vetoed is not loaded, and one of that name loaded before is dropped
+     */
+    @CheckForNull
+    private Node load(String name, boolean vetoable) {
         try {
             XmlFile xmlFile = getConfigFile(name);
-            if (xmlFile.exists()) {
+            if (xmlFile.checkExists()) {
                 Node n = (Node) xmlFile.read();
+                if (launchedElsewhere(n, new File(getRootDir(), name))) {
+                    LOGGER.fine(() -> "not loading " + name + ", a cloud agent of another controller");
+                    return null;
+                }
+                if (vetoable && !allowLoad(n)) {
+                    Node old = nodes.get(n.getNodeName());
+                    if (old != null) { // as if deleted: it would not be here after a restart either
+                        unload(old);
+                        jenkins.updateComputerList();
+                        jenkins.trimLabels();
+                        NodeListener.fireOnDeleted(old);
+                    }
+                    return null;
+                }
                 nodes.put(n.getNodeName(), n);
                 n.onLoad(this, n.getNodeName());
+                route(n);
                 jenkins.updateNewComputer(n);
                 jenkins.trimLabels(n);
                 LOGGER.finer(() -> "loading " + xmlFile);
@@ -422,6 +587,9 @@ public class Nodes implements PersistenceRoot {
                 LOGGER.fine(() -> "no such file " + xmlFile);
             }
         } catch (IOException e) {
+            if (vetoable) { // a change made elsewhere: applied again later, not taken for the node being gone
+                throw new UncheckedIOException("could not load " + name + ", changed elsewhere", e);
+            }
             LOGGER.log(Level.WARNING, "could not load " + name, e);
         }
         return null;

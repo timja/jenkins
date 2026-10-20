@@ -28,8 +28,11 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.ExtensionList;
 import hudson.XmlFile;
 import hudson.model.AbstractItem;
+import hudson.model.Descriptor;
 import hudson.model.Items;
+import hudson.model.Node;
 import hudson.model.Saveable;
+import hudson.model.User;
 import hudson.security.ACL;
 import hudson.security.ACLContext;
 import hudson.util.DaemonThreadFactory;
@@ -108,9 +111,12 @@ public final class StoredReloads {
     }
 
     /**
-     * Brings a live object up to date with stored content: the first {@link StoredConfigReconciler} that does it,
-     * under the object's monitor, as {@code save()} takes it, the content's version being taken as held before the
-     * monitor is released; or else the default ({@link XmlFile#unmarshalNullingOut}, under that monitor too). And, for
+     * Brings a live object up to date with stored content: the first {@link StoredConfigReconciler} that does it, or
+     * else, for a user, {@link User#loadStored}; either under the object's monitor, as {@code save()} takes it, the
+     * content's version being taken as held before the monitor is released. Otherwise the default for its kind: for the
+     * global configuration {@link Jenkins#reloadGlobalConfig}; for a node of this controller, as one changed elsewhere
+     * ({@code Nodes.changedElsewhere}); for a descriptor its own {@link Descriptor#load}, after
+     * {@link RemovedFields#clear}; for others {@link XmlFile#unmarshalNullingOut} under the object's monitor. And, for
      * an item, its {@code onLoad}, as {@code updateByXml} does, once that monitor is released: {@code onLoad} takes
      * other locks (the builds' of a job), which code holding them and then the item's (a new build being numbered) takes
      * in the other order. Content older than what this JVM holds of the key is not applied: it was read before a
@@ -122,7 +128,7 @@ public final class StoredReloads {
     public static void reload(@NonNull XmlFile file, @NonNull Saveable o, @NonNull PersistenceStore.Entry entry,
             @NonNull StoredConfigReconciler.Reason reason) throws IOException {
         String key = PersistenceStores.keyFor(file.getPath());
-        boolean reconciled = false;
+        boolean applied = false;
         // the content applied and its version taken as held at once: a save here then merges against the content the
         // object holds, never against what it held before, which would take what was reloaded for its own change
         synchronized (o) {
@@ -132,18 +138,36 @@ public final class StoredReloads {
             }
             for (StoredConfigReconciler r : ExtensionList.lookup(StoredConfigReconciler.class)) {
                 if (r.reload(file, o, entry, reason)) {
-                    if (key != null) {
-                        StoredVersions.loaded(key, entry);
-                    }
-                    reconciled = true;
+                    applied = true;
                     break;
                 }
             }
+            if (!applied && o instanceof User u) {
+                u.loadStored(entry.content()); // as at startup: its properties bound to it again
+                applied = true;
+            }
+            if (applied && key != null) {
+                StoredVersions.loaded(key, entry);
+            }
         }
-        if (!reconciled) {
-            if (o instanceof Jenkins) {
-                // not reloaded field by field: its configuration is applied when this controller next starts
-                LOGGER.fine(() -> "Not reloading the global configuration from " + file);
+        if (!applied) {
+            if (o instanceof Jenkins j) {
+                // not nulled out: the global configuration is loaded over the root object as at startup
+                j.reloadGlobalConfig();
+                return;
+            }
+            if (o instanceof Node n && Jenkins.get().getNode(n.getNodeName()) == n) {
+                // loaded afresh and its computer rebound to it, as a node changed elsewhere is (its executors, labels)
+                Jenkins.get().getNodesObject().changedElsewhere(n.getNodeName(), false);
+                return;
+            }
+            if (o instanceof Descriptor<?> d) {
+                synchronized (d) {
+                    // through its own load(), as at startup, so that an override migrating old data runs; not nulled out,
+                    // as load() does not null out, but a field the stored content lacks is cleared
+                    RemovedFields.clear(file, d, entry.content());
+                    d.load(); // reads the stored content, so takes its version as held
+                }
                 return;
             }
             synchronized (o) {

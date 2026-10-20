@@ -70,6 +70,13 @@ public final class StoredVersions {
         }
     }
 
+    /** The keys this JVM has read or written, with the version it holds of each (see {@link #lastSeen}). */
+    @Restricted(NoExternalUse.class)
+    @NonNull
+    public static Map<String, Long> held() {
+        return Map.copyOf(versions);
+    }
+
     /**
      * The version of a key this JVM last read or wrote, or {@link PersistenceStore#ANY} if unknown.
      */

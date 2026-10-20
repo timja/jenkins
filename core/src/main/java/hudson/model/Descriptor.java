@@ -996,6 +996,14 @@ public abstract class Descriptor<T extends Describable<T>> implements Loadable, 
     }
 
     /**
+     * The file a descriptor keeps its configuration in, wherever {@link #getConfigFile} says that is.
+     */
+    @Restricted(NoExternalUse.class)
+    public static XmlFile configFileOf(@NonNull Descriptor<?> d) {
+        return d.getConfigFile();
+    }
+
+    /**
      * Returns the plugin in which this descriptor is defined.
      *
      * @return
