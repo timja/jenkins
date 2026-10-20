@@ -39,11 +39,14 @@ import java.util.Comparator;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.SortedMap;
 import java.util.function.IntPredicate;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import jenkins.model.Jenkins;
 import jenkins.model.lazy.AbstractLazyLoadRunMap;
+import jenkins.model.lazy.BuildRecordSource;
 import jenkins.model.lazy.BuildReference;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
@@ -184,7 +187,10 @@ public final class RunMap<R extends Run<?, R>> extends AbstractLazyLoadRunMap<R>
         if (Files.isDirectory(rootDir.toPath())) {
             throw new IllegalStateException("JENKINS-23152: " + rootDir + " already existed; will not overwrite with " + r);
         }
-        if (!r.getClass().getName().equals("hudson.matrix.MatrixRun")) { // JENKINS-26739: grandfathered in
+        BuildRecordSource source = source();
+        if (source != null && job != null && source.sharesNumbers(job)) {
+            proposeSharedNumber(r.getNumber());
+        } else if (!r.getClass().getName().equals("hudson.matrix.MatrixRun")) { // JENKINS-26739: grandfathered in
             proposeNewNumber(r.getNumber());
         }
         try {
@@ -253,8 +259,24 @@ public final class RunMap<R extends Run<?, R>> extends AbstractLazyLoadRunMap<R>
         };
     }
 
+    @Restricted(NoExternalUse.class)
+    @Override
+    protected Set<Integer> storedNumbers() {
+        BuildRecordSource source = source();
+        return source == null || job == null ? Set.of() : source.numbers(job);
+    }
+
     @Override
     protected R retrieve(File d) throws IOException {
+        BuildRecordSource source = source();
+        // only builds in the job's current build directory (not, say, one left behind by a rename)
+        if (source != null && job != null && job.getBuildDir().equals(d.getParentFile())) {
+            return source.retrieve(job, d, () -> load(d));
+        }
+        return load(d);
+    }
+
+    private R load(File d) {
         if (new File(d, "build.xml").exists()) {
             // if the build result file isn't in the directory, ignore it.
             try {
@@ -270,6 +292,11 @@ public final class RunMap<R extends Run<?, R>> extends AbstractLazyLoadRunMap<R>
         }
         LOGGER.fine(() -> "no config.xml in " + d);
         return null;
+    }
+
+    @CheckForNull
+    private static BuildRecordSource source() {
+        return Jenkins.getInstanceOrNull() == null ? null : BuildRecordSource.get();
     }
 
     @Override
