@@ -38,7 +38,8 @@ import org.kohsuke.accmod.restrictions.Beta;
  * {@code JENKINS_HOME} so that several controllers can share them.
  *
  * <p>Keys are paths relative to {@link jenkins.model.Jenkins#getRootDir}, using {@code /} as the separator,
- * for example {@code jobs/folder/jobs/job/config.xml}. Which files are stored is decided by core, not by the store.
+ * for example {@code jobs/folder/jobs/job/config.xml}. Which files are stored is decided by core
+ * ({@code StoreRouting}, from {@link SharedFiles} and {@link LocalFiles}), not by the store.
  * Keys whose first segment starts with {@code _} (such as {@code _items/<uuid>/…}) are never produced by routing:
  * they are reserved for code that uses the store directly, such as plugins.
  *
