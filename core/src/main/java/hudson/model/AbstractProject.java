@@ -1548,11 +1548,11 @@ public abstract class AbstractProject<P extends AbstractProject<P, R>, R extends
     /**
      * Adds a new {@link Trigger} to this {@link Project} if not active yet.
      */
-    public void addTrigger(Trigger<?> trigger) throws IOException {
+    public synchronized void addTrigger(Trigger<?> trigger) throws IOException {
         addToList(trigger, triggers());
     }
 
-    public void removeTrigger(TriggerDescriptor trigger) throws IOException {
+    public synchronized void removeTrigger(TriggerDescriptor trigger) throws IOException {
         removeFromList(trigger, triggers());
     }
 

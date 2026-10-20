@@ -26,9 +26,12 @@ package hudson.model;
 
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsInAnyOrder;
+import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import hudson.AbortException;
 import hudson.cli.CLICommand;
@@ -37,6 +40,7 @@ import hudson.cli.CopyJobCommand;
 import hudson.cli.CreateJobCommand;
 import hudson.security.ACL;
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.net.HttpURLConnection;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
@@ -317,6 +321,17 @@ class ItemsTest {
         private static JenkinsRule.WebClient wc(JenkinsRule r) {
             return r.createWebClient().withBasicApiToken("attacker");
         }
+    }
+
+    @Test
+    void moveIntoItselfIsRefused() throws Exception {
+        MockFolder f = r.createFolder("f");
+        MockFolder inner = f.createProject(MockFolder.class, "inner");
+        IOException e = assertThrows(IOException.class, () -> Items.move(f, inner));
+        assertThat(e.getMessage(), containsString("into itself"));
+        assertSame(f, r.jenkins.getItemByFullName("f"));
+        assertSame(inner, r.jenkins.getItemByFullName("f/inner"));
+        assertTrue(f.getRootDir().isDirectory());
     }
 
 }

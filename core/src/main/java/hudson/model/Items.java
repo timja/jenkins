@@ -594,7 +594,8 @@ public class Items {
      * @param item some item (job or folder)
      * @param destination the destination of the move (a folder or {@link Jenkins}); not the current parent (or you could just call {@link AbstractItem#renameTo})
      * @return the new item (usually the same object as {@code item})
-     * @throws IOException if the move fails, or some subsequent step fails (directory might have already been moved)
+     * @throws IOException if the move fails, or some subsequent step fails (directory might have already been moved),
+     *     or the destination is the item or inside it
      * @throws IllegalArgumentException if the move would really be a rename, or the destination cannot accept the item, or the destination already has an item of that name
      * @since 1.548
      */
@@ -603,7 +604,9 @@ public class Items {
         if (oldParent == destination) {
             throw new IllegalArgumentException();
         }
-        // TODO verify that destination is to not equal to, or inside, item
+        if (destination instanceof Item d && (d == item || d.getFullName().startsWith(item.getFullName() + "/"))) {
+            throw new IOException("Cannot move " + item.getFullName() + " into itself");
+        }
         if (!destination.canAdd(item)) {
             throw new IllegalArgumentException();
         }

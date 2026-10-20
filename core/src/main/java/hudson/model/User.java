@@ -952,6 +952,7 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
      */
     public void delete() throws IOException {
         String idKey = idStrategy().keyFor(id);
+        XmlFile config = getConfigFile();
         AllUsers.remove(id);
         // from a persistence store too, if it holds users: deleting only the directory would leave the user there for
         // every other controller (and for this one once restarted); the local files go with the directory, which is
@@ -969,6 +970,7 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
         }
         Util.deleteRecursive(getUserFolderFor(id));
         UserDetailsCache.get().invalidate(idKey);
+        SaveableListener.fireOnDeleted(this, config);
     }
 
     /**
