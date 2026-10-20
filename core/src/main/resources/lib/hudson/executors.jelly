@@ -37,6 +37,9 @@ THE SOFTWARE.
         <span style="margin-left: 1ch;">${title}</span>
       </a>
         <j:choose>
+          <j:when test="${elsewhere != null}">
+            <div tooltip="${%busyElsewhere(elsewhere.countBusy(), elsewhere.executors, elsewhere.where)}" data-tooltip-append-to-parent="true">${elsewhere.countBusy()}/${elsewhere.executors}</div>
+          </j:when>
           <j:when test="${c.offline}">
             <j:choose>
               <j:set var="offlineCause" value="${c.offlineCause}"/>
@@ -127,6 +130,41 @@ THE SOFTWARE.
           </div>
       </j:if>
     </d:tag>
+    <d:tag name="executorElsewhere">
+      <div class="executor-row">
+        <div class="executor-type"/>
+        <div class="executor-cell">
+          <table class="executor-cell-table">
+            <tr>
+              <j:set var="job" value="${b.job}"/>
+              <td class="pane">
+                <div style="white-space: normal">
+                  <j:choose>
+                    <j:when test="${job != null and b.build gt 0}">
+                      <a href="${rootURL}/${job.url}"><l:breakable value="${job.fullDisplayName}"/></a>
+                      <t:progressBar tooltip="${%runningElsewhere(elsewhere.where)}" pos="${b.progress}" href="${rootURL}/${job.url}${b.build}/console"/>
+                    </j:when>
+                    <j:when test="${job != null}">
+                      <a href="${rootURL}/${job.url}"><l:breakable value="${job.fullDisplayName}"/></a>
+                      <t:progressBar tooltip="${%Pending}" pos="-1" href="${rootURL}/${job.url}"/>
+                    </j:when>
+                    <j:otherwise>
+                      <span>${%Unknown Task}</span>
+                    </j:otherwise>
+                  </j:choose>
+                </div>
+              </td>
+              <td class="pane">
+                <j:if test="${job != null and b.build gt 0}">
+                  <a href="${rootURL}/${job.url}${b.build}/" class="model-link inside" style="display: block;">#${b.build}</a>
+                </j:if>
+              </td>
+            </tr>
+          </table>
+        </div>
+        <div class="executor-stop"/>
+      </div>
+    </d:tag>
   </d:taglib>
   <j:set var="paneIsCollapsed" value="${h.isCollapsed('executors')}" />
   <j:set var="computers" value="${attrs.computers?:app.computers}" />
@@ -193,6 +231,7 @@ THE SOFTWARE.
           <j:forEach var="c" items="${computers}">
             <div class="computer-row">
               <j:set var="cDisplayExecutors" value="${c.displayExecutors}"/>
+              <j:set var="elsewhere" value="${c.connectedElsewhere}"/>
               <j:choose>
                 <j:when test="${!singleComputer or origComputersSize > 1 or c.offline}">
                   <j:if test="${!cDisplayExecutors.isEmpty()}">
@@ -204,10 +243,19 @@ THE SOFTWARE.
               </j:choose>
               <j:if test="${!cDisplayExecutors.isEmpty()}">
                 <div class="executors-cell">
-                  <j:forEach var="de" items="${cDisplayExecutors}" varStatus="eloop">
-                    <j:set var="e" value="${de.executor}"/>
-                    <local:executor name="${de.displayName}" url="${de.url}" />
-                  </j:forEach>
+                  <j:choose>
+                    <j:when test="${elsewhere != null}">
+                      <j:forEach var="b" items="${elsewhere.busy}">
+                        <local:executorElsewhere/>
+                      </j:forEach>
+                    </j:when>
+                    <j:otherwise>
+                      <j:forEach var="de" items="${cDisplayExecutors}" varStatus="eloop">
+                        <j:set var="e" value="${de.executor}"/>
+                        <local:executor name="${de.displayName}" url="${de.url}" />
+                      </j:forEach>
+                    </j:otherwise>
+                  </j:choose>
                 </div>
               </j:if>
             </div>

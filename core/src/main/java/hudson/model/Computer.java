@@ -109,6 +109,7 @@ import java.util.logging.LogRecord;
 import java.util.logging.Logger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import jenkins.model.ComputersElsewhere;
 import jenkins.model.DisplayExecutor;
 import jenkins.model.IComputer;
 import jenkins.model.IDisplayExecutor;
@@ -125,6 +126,7 @@ import jenkins.util.SystemProperties;
 import jenkins.widgets.HasWidgets;
 import net.jcip.annotations.GuardedBy;
 import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.Beta;
 import org.kohsuke.accmod.restrictions.DoNotUse;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.kohsuke.args4j.Argument;
@@ -751,7 +753,42 @@ public /*transient*/ abstract class Computer extends Actionable implements Acces
     @Exported
     @Override
     public String getIcon() {
+        if (isAcceptingTasks() && getConnectedElsewhere() != null) {
+            return "symbol-computer";
+        }
         return IComputer.super.getIcon();
+    }
+
+    @Override
+    public String getIconAltText() {
+        if (isAcceptingTasks() && getConnectedElsewhere() != null) {
+            return "[online]";
+        }
+        return IComputer.super.getIconAltText();
+    }
+
+    @Override
+    public String getTooltip() {
+        ComputersElsewhere.Connection elsewhere = getConnectedElsewhere();
+        if (elsewhere != null) {
+            return Messages.Computer_ConnectedElsewhere(elsewhere.getWhere());
+        }
+        return IComputer.super.getTooltip();
+    }
+
+    /**
+     * Tells how the agent is doing on another controller, when it is not connected here but there, for display only:
+     * such an agent is shown as online, with its executors as they are there. It stays {@linkplain #isOffline offline}
+     * here.
+     *
+     * @return null if it is connected here, marked temporarily offline, or not known to be connected elsewhere
+     * @see ComputersElsewhere
+     * @since TODO
+     */
+    @Restricted(Beta.class)
+    @CheckForNull
+    public ComputersElsewhere.Connection getConnectedElsewhere() {
+        return ComputersElsewhere.of(this);
     }
 
     /**
