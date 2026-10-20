@@ -52,6 +52,8 @@ import java.util.StringTokenizer;
 import java.util.function.Predicate;
 import jenkins.model.DirectlyModifiableTopLevelItemGroup;
 import jenkins.model.Jenkins;
+import jenkins.persistence.PersistenceStores;
+import jenkins.persistence.StoredItems;
 import jenkins.util.MemoryReductionUtil;
 import jenkins.util.ThrowingCallable;
 import jenkins.util.ThrowingRunnable;
@@ -609,10 +611,44 @@ public class Items {
         // TODO AbstractItem.renameTo has a more baroque implementation; factor it out into a utility method perhaps?
         File destDir = destination.getRootDirFor(item);
         FileUtils.forceMkdir(destDir.getParentFile());
-        FileUtils.moveDirectory(item.getRootDir(), destDir);
-        oldParent.remove(item);
-        I newItem = destination.add(item, name);
-        item.movedTo(destination, newItem, destDir);
+        I newItem;
+        if (PersistenceStores.get() == null) {
+            FileUtils.moveDirectory(item.getRootDir(), destDir);
+            oldParent.remove(item);
+            newItem = destination.add(item, name);
+            item.movedTo(destination, newItem, destDir);
+        } else {
+            // the item's own saves (synchronized on it) wait until it is in its new place: a save made in between would
+            // store it at its old location again
+            synchronized (item) {
+                if (destDir.exists()) {
+                    // checked before the store moves anything: the directory move below would fail
+                    throw new IOException(destDir + " already exists");
+                }
+                StoredItems.move(item.getRootDir(), destDir);
+                try {
+                    FileUtils.moveDirectory(item.getRootDir(), destDir);
+                } catch (IOException e) {
+                    try {
+                        StoredItems.move(destDir, item.getRootDir()); // the stored entries back where the item still is
+                    } catch (IOException x) {
+                        e.addSuppressed(x);
+                    } finally {
+                        StoredItems.movedAway(destDir);
+                    }
+                    throw e;
+                }
+                File oldDir = item.getRootDir();
+                try {
+                    oldParent.remove(item);
+                    newItem = destination.add(item, name);
+                    item.movedTo(destination, newItem, destDir);
+                } finally {
+                    // in its new place now: saves of it and its children resolve there
+                    StoredItems.movedAway(oldDir);
+                }
+            }
+        }
         ItemListener.fireLocationChange(newItem, oldFullName);
         return newItem;
     }

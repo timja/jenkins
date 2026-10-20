@@ -52,6 +52,10 @@ public record Route(@NonNull PersistenceStore store, @NonNull String key) {
     /** Reads the content, taking its version as the one this JVM's object holds (and the base of a later merge). */
     @CheckForNull
     public PersistenceStore.Entry read() throws IOException {
+        PersistenceStore.Entry held = held();
+        if (held != null) {
+            return held; // not stored, so no version is held
+        }
         PersistenceStore.Entry entry = store.read(key);
         if (entry == null) {
             StoredVersions.seen(key, PersistenceStore.ABSENT);
@@ -64,7 +68,8 @@ public record Route(@NonNull PersistenceStore store, @NonNull String key) {
     /** Reads the current content without this JVM taking that version as the one its object holds. */
     @CheckForNull
     public PersistenceStore.Entry peek() throws IOException {
-        return store.read(key);
+        PersistenceStore.Entry held = held();
+        return held != null ? held : store.read(key);
     }
 
     /**
@@ -73,7 +78,14 @@ public record Route(@NonNull PersistenceStore store, @NonNull String key) {
      * @throws IOException if the store cannot tell (being unreachable, say): never taken for absent
      */
     public boolean exists() throws IOException {
-        return store.read(key) != null;
+        return held() != null || store.read(key) != null;
+    }
+
+    /** What the current thread wrote to the key while creating it {@linkplain StoredItems.Creation#hold held}. */
+    @CheckForNull
+    private PersistenceStore.Entry held() {
+        StoredItems.Creation creation = StoredItems.creations.get(key);
+        return creation == null ? null : creation.heldEntry();
     }
 
     /**
@@ -90,11 +102,24 @@ public record Route(@NonNull PersistenceStore store, @NonNull String key) {
         if (PersistenceStores.isApplyingRemoteChange()) {
             return StoredVersions.lastSeen(key);
         }
-        long expected = StoredVersions.versions.getOrDefault(key, PersistenceStore.ABSENT);
+        StoredItems.Creation creation = StoredItems.creations.get(key);
+        if (creation != null && creation.keep(content)) {
+            return PersistenceStore.ABSENT; // stored on commit
+        }
+        boolean createOnly = creation != null && creation.written == PersistenceStore.ABSENT;
+        if (!createOnly && StoredVersions.versions.get(key) instanceof Long held && held == StoredItems.GONE) {
+            LOGGER.warning(() -> "Not saving " + key + ": it is being moved away");
+            throw new StoredItems.Gone(key);
+        }
+        long expected = createOnly ? PersistenceStore.ABSENT : StoredVersions.versions.getOrDefault(key, PersistenceStore.ABSENT);
         long version;
         try {
             version = store.write(key, content, expected);
         } catch (ConflictException e) {
+            if (createOnly) {
+                LOGGER.fine(() -> e.getMessage() + "; not created over what is stored");
+                throw e;
+            }
             Long merged = mergeAndWrite(content, expected);
             if (merged == null) {
                 PersistenceStores.refused.incrementAndGet();
@@ -109,6 +134,9 @@ public record Route(@NonNull PersistenceStore store, @NonNull String key) {
                 reload.run();
             }
             return merged == Long.MIN_VALUE ? StoredVersions.lastSeen(key) : merged;
+        }
+        if (creation != null) {
+            creation.written = version;
         }
         MaterializedCopies.changed(key);
         StoredVersions.seen(key, version);
@@ -185,6 +213,9 @@ public record Route(@NonNull PersistenceStore store, @NonNull String key) {
             return;
         }
         long held = StoredVersions.lastSeen(key);
+        if (held == StoredItems.GONE) {
+            throw new StoredItems.Gone(key); // never what is there now: something made since the item moved away
+        }
         if (held > PersistenceStore.ABSENT && store.read(key) == null) {
             LOGGER.fine(() -> key + " was deleted or moved elsewhere since this controller read it; not deleting");
             throw new ConflictException(key, held, PersistenceStore.ABSENT);

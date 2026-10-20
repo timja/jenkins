@@ -29,10 +29,14 @@ import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.ExtensionList;
 import hudson.init.InitMilestone;
 import java.io.File;
+import java.io.IOException;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.util.Collection;
+import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
 import jenkins.util.ThrowingCallable;
@@ -201,6 +205,57 @@ public final class PersistenceStores {
             }
         }
         return true;
+    }
+
+    /**
+     * Names of the items stored below a directory which holds one subdirectory per item,
+     * such as {@code JENKINS_HOME/jobs} or a folder's {@code jobs} directory.
+     * Use in addition to listing the directory itself: on a fresh controller, items may exist only in the store.
+     *
+     * @param skip names the caller has already (listed locally, say), which are not read
+     * @return names whose {@code config.xml} the store holds; empty if no store is active
+     */
+    @Restricted(Beta.class)
+    @NonNull
+    public static Set<String> storedItemNames(@NonNull File itemsDir, @NonNull Set<String> skip) throws IOException {
+        PersistenceStore store = get();
+        String parent = store == null ? null : keyFor(itemsDir);
+        Set<String> names = new TreeSet<>();
+        if (parent == null) {
+            return names;
+        }
+        for (String name : store.children(parent)) {
+            if (skip.contains(name)) {
+                continue;
+            }
+            if (!isSafeName(name)) {
+                // whatever else can write to the store wrote it: never a directory here (".." is the parent's)
+                LOGGER.warning(() -> "Ignoring " + parent + "/" + name + " in the persistence store: not a name");
+                continue;
+            }
+            String config = parent + "/" + name + "/config.xml";
+            // children() also names directories with only deeper keys left: an item is there only if its configuration is
+            if (!StoreRouting.isRouted(config)) {
+                continue;
+            }
+            try {
+                if (store.read(config) != null) {
+                    names.add(name);
+                }
+            } catch (IOException | RuntimeException e) {
+                // one entry which cannot be read does not hide the others: loading it reports its own failure
+                LOGGER.log(Level.WARNING, "Failed to read " + config + "; listing it as an item anyway", e);
+                names.add(name);
+            }
+        }
+        return names;
+    }
+
+    /** {@link #storedItemNames(File, Set)} skipping nothing. */
+    @Restricted(Beta.class)
+    @NonNull
+    public static Set<String> storedItemNames(@NonNull File itemsDir) throws IOException {
+        return storedItemNames(itemsDir, Set.of());
     }
 
     /**

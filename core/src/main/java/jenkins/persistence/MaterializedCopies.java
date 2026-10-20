@@ -155,6 +155,12 @@ public final class MaterializedCopies {
         current.remove(key);
     }
 
+    /** Forgets the copy of a key whose entry was moved away from it. */
+    static void forget(String key) {
+        copies.remove(key);
+        current.remove(key);
+    }
+
     /** Stops following the changes of the store resolved before, and forgets its copies. */
     static void reset() {
         if (subscription != null) {

@@ -67,6 +67,7 @@ import jenkins.persistence.MaterializedCopies;
 import jenkins.persistence.PersistenceStore;
 import jenkins.persistence.Route;
 import jenkins.persistence.StoreRouting;
+import jenkins.persistence.StoredItems;
 import jenkins.persistence.StoredReloads;
 import org.apache.commons.io.IOUtils;
 import org.kohsuke.accmod.Restricted;
@@ -265,6 +266,7 @@ public final class XmlFile {
     }
 
     private void writeToStore(Route route, Object o) throws IOException {
+        StoredItems.checkStorable(o, route.key()); // not an item deleted here, say
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         try (Writer w = new OutputStreamWriter(buf, StandardCharsets.UTF_8)) {
             w.write("<?xml version='1.1' encoding='UTF-8'?>\n");
@@ -282,6 +284,39 @@ public final class XmlFile {
         mkdirs(); // the directory itself stays local: other files, such as builds, live alongside
         // merged with a change made elsewhere meanwhile, or refused: either way the object is then reloaded
         route.write(buf.toByteArray(), o instanceof Saveable s ? () -> StoredReloads.reloadLater(this, s) : null);
+    }
+
+    /**
+     * Writes an already serialized XML document, for example one submitted by a user, unchanged.
+     *
+     * @param content the complete document
+     */
+    @Restricted(NoExternalUse.class)
+    public void writeRaw(byte[] content) throws IOException {
+        mkdirs();
+        Route route = route();
+        if (route != null) {
+            route.write(content, null);
+            return;
+        }
+        // ISO-8859-1 maps every byte to one char and back, so the bytes are written unchanged
+        AtomicFileWriter w = new AtomicFileWriter(file.toPath(), StandardCharsets.ISO_8859_1, force, force);
+        try {
+            w.write(new String(content, StandardCharsets.ISO_8859_1));
+            w.commit();
+        } finally {
+            w.abort();
+        }
+    }
+
+    /**
+     * Reads the document as bytes, without interpreting its encoding.
+     */
+    @Restricted(NoExternalUse.class)
+    public byte[] readRawBytes() throws IOException {
+        try (InputStream in = open(false)) {
+            return in.readAllBytes();
+        }
     }
 
     /**
