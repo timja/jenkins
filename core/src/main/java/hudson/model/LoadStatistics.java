@@ -39,6 +39,7 @@ import java.io.Serializable;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import jenkins.model.Jenkins;
+import jenkins.model.queue.QueueStartGate;
 import jenkins.util.SystemProperties;
 import org.jenkinsci.Symbol;
 import org.jfree.chart.ChartFactory;
@@ -323,7 +324,9 @@ public abstract class LoadStatistics {
         int q = 0;
         if (queue != null) {
             for (Queue.BuildableItem item : queue) {
-
+                if (!QueueStartGate.provisionsFor(item)) {
+                    continue; // left to another instance to provision for, by a QueueStartGate
+                }
                 for (SubTask st : item.task.getSubTasks()) {
                     if (matches(item, st))
                         q++;
