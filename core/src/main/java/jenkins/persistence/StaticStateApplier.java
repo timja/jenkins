@@ -44,8 +44,9 @@ import org.kohsuke.accmod.restrictions.NoExternalUse;
 
 /**
  * Applies changes other controllers made to static state in the shared store: the global configuration, descriptors'
- * configuration, users and nodes. A {@link RemoteChangeHandler} which handles such a key (a plugin's own root file,
- * say) applies it instead. Called by {@link ItemChangeApplier}.
+ * configuration, users and nodes, and other {@link jenkins.model.Loadable} objects holding a stored file (a plugin's
+ * singleton, say; see {@link LoadedObjects}), through their own {@code load()}. A {@link RemoteChangeHandler} which
+ * handles such a key applies it instead. Called by {@link ItemChangeApplier}.
  */
 @Restricted(NoExternalUse.class)
 public final class StaticStateApplier {
@@ -101,6 +102,22 @@ public final class StaticStateApplier {
             if (entry != null) {
                 LOGGER.fine(() -> "Reloading " + d.getId() + " changed elsewhere");
                 StoredReloads.reload(Descriptor.configFileOf(d), d, entry);
+            }
+            return true;
+        }
+        LoadedObjects.Holder holder = LoadedObjects.of(key);
+        if (holder != null) {
+            if (deleted) {
+                // what load() does without its file is the object's own business (keeping its state, as a descriptor
+                // does, or clearing it): a deletion is left to a RemoteChangeHandler
+                LOGGER.fine(() -> key + " was deleted elsewhere; " + holder.object() + " keeps what it holds");
+                return true;
+            }
+            Route route = StoreRouting.route(holder.file().getPath());
+            PersistenceStore.Entry entry = route == null ? null : route.peek();
+            if (entry != null) {
+                LOGGER.fine(() -> "Reloading " + holder.object() + " changed elsewhere");
+                StoredReloads.reload(holder.file(), holder.object(), entry);
             }
             return true;
         }

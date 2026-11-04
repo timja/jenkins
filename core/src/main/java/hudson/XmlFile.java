@@ -63,6 +63,7 @@ import java.util.logging.Logger;
 import javax.xml.XMLConstants;
 import javax.xml.parsers.ParserConfigurationException;
 import javax.xml.parsers.SAXParserFactory;
+import jenkins.persistence.LoadedObjects;
 import jenkins.persistence.MaterializedCopies;
 import jenkins.persistence.PersistenceStore;
 import jenkins.persistence.Route;
@@ -222,16 +223,22 @@ public final class XmlFile {
     }
 
     private Object unmarshal(Object o, boolean nullOut) throws IOException {
+        Object r;
         try (InputStream in = new BufferedInputStream(open(true))) {
             // TODO: expose XStream the driver from XStream
             if (nullOut) {
-                return ((XStream2) xs).unmarshal(DEFAULT_DRIVER.createReader(in), o, null, true);
+                r = ((XStream2) xs).unmarshal(DEFAULT_DRIVER.createReader(in), o, null, true);
             } else {
-                return xs.unmarshal(DEFAULT_DRIVER.createReader(in), o);
+                r = xs.unmarshal(DEFAULT_DRIVER.createReader(in), o);
             }
         } catch (RuntimeException | Error e) {
             throw new IOException("Unable to read " + file, e);
         }
+        Route route = route();
+        if (route != null && r != null) {
+            LoadedObjects.loaded(route.key(), this, r);
+        }
+        return r;
     }
 
     public void write(Object o) throws IOException {
@@ -284,6 +291,7 @@ public final class XmlFile {
         mkdirs(); // the directory itself stays local: other files, such as builds, live alongside
         // merged with a change made elsewhere meanwhile, or refused: either way the object is then reloaded
         route.write(buf.toByteArray(), o instanceof Saveable s ? () -> StoredReloads.reloadLater(this, s) : null);
+        LoadedObjects.loaded(route.key(), this, o);
     }
 
     /**

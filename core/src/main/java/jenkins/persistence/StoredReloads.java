@@ -44,6 +44,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
+import jenkins.model.Loadable;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 
@@ -115,8 +116,8 @@ public final class StoredReloads {
      * else, for a user, {@link User#loadStored}; either under the object's monitor, as {@code save()} takes it, the
      * content's version being taken as held before the monitor is released. Otherwise the default for its kind: for the
      * global configuration {@link Jenkins#reloadGlobalConfig}; for a node of this controller, as one changed elsewhere
-     * ({@code Nodes.changedElsewhere}); for a descriptor its own {@link Descriptor#load}, after
-     * {@link RemovedFields#clear}; for others {@link XmlFile#unmarshalNullingOut} under the object's monitor. And, for
+     * ({@code Nodes.changedElsewhere}); for a descriptor, or another {@link Loadable} which is not an item, its own
+     * {@link Loadable#load} (as {@link Descriptor#load}), after {@link RemovedFields#clear}; for others {@link XmlFile#unmarshalNullingOut} under the object's monitor. And, for
      * an item, its {@code onLoad}, as {@code updateByXml} does, once that monitor is released: {@code onLoad} takes
      * other locks (the builds' of a job), which code holding them and then the item's (a new build being numbered) takes
      * in the other order. Content older than what this JVM holds of the key is not applied: it was read before a
@@ -161,12 +162,13 @@ public final class StoredReloads {
                 Jenkins.get().getNodesObject().changedElsewhere(n.getNodeName(), false);
                 return;
             }
-            if (o instanceof Descriptor<?> d) {
-                synchronized (d) {
-                    // through its own load(), as at startup, so that an override migrating old data runs; not nulled out,
-                    // as load() does not null out, but a field the stored content lacks is cleared
-                    RemovedFields.clear(file, d, entry.content());
-                    d.load(); // reads the stored content, so takes its version as held
+            if (o instanceof Loadable l && !(o instanceof AbstractItem)) {
+                synchronized (o) {
+                    // through its own load(), as at startup, so that an override migrating old data runs (a descriptor's,
+                    // a plugin singleton's); not nulled out, as load() does not null out, but a field the stored content
+                    // lacks is cleared
+                    RemovedFields.clear(file, o, entry.content());
+                    l.load(); // reads the stored content, so takes its version as held
                 }
                 return;
             }
