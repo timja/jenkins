@@ -32,11 +32,14 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import hudson.ExtensionList;
 import hudson.Util;
+import hudson.XmlFile;
 import hudson.init.InitializerFinder;
 import hudson.model.Descriptor;
 import hudson.model.Label;
 import hudson.model.Node;
+import hudson.model.Saveable;
 import hudson.model.User;
 import hudson.security.AbstractPasswordBasedSecurityRealm;
 import hudson.security.GroupDetails;
@@ -59,7 +62,9 @@ import java.util.logging.Level;
 import java.util.stream.Collectors;
 import jenkins.model.GlobalConfiguration;
 import jenkins.model.IdStrategy;
+import jenkins.model.Jenkins;
 import jenkins.model.JenkinsLocationConfiguration;
+import jenkins.model.Loadable;
 import jenkins.model.NodeListener;
 import jenkins.security.HMACConfidentialKey;
 import org.junit.jupiter.api.BeforeEach;
@@ -252,6 +257,83 @@ class StaticStateApplierTest {
                 value = legacy.toUpperCase(java.util.Locale.ROOT);
                 legacy = null;
             }
+        }
+    }
+
+    @Test
+    void aLoadableHoldingAStoredFileIsReloadedThroughItsOwnLoad() throws Exception {
+        Settings s = ExtensionList.lookupSingleton(Settings.class);
+        s.value = "here";
+        s.save();
+        // written by a controller with an older version of the plugin: in the old field, which load() migrates
+        writeElsewhere(Settings.KEY, text(Settings.KEY).replaceAll("<value>[^<]*</value>", "<legacy>elsewhere</legacy>"));
+        assertEquals("ELSEWHERE", s.value);
+        assertNull(s.legacy);
+        assertEquals(1, s.loadsSinceStart, "loaded once, through load()");
+    }
+
+    @Test
+    void aLoadableKeepsWhatItHoldsWhenItsFileIsDeletedElsewhere() throws Exception {
+        Settings s = ExtensionList.lookupSingleton(Settings.class);
+        s.value = "here";
+        s.save();
+        other.delete(Settings.KEY, PersistenceStore.ANY);
+        awaitApplied();
+        assertEquals("here", s.value);
+        assertEquals(0, s.loadsSinceStart);
+    }
+
+    @Test
+    void aLoadableSavedAfterACopyWasReadIsTheOneReloaded() throws Exception {
+        Settings s = ExtensionList.lookupSingleton(Settings.class);
+        s.value = "here";
+        s.save();
+        Settings copy = new Settings(); // reads the same file
+        assertEquals("here", copy.value);
+        s.value = "saved";
+        s.save();
+        writeElsewhere(Settings.KEY, text(Settings.KEY).replace("saved", "elsewhere"));
+        assertEquals("elsewhere", s.value);
+        assertEquals("here", copy.value);
+    }
+
+    @TestExtension({"aLoadableHoldingAStoredFileIsReloadedThroughItsOwnLoad", "aLoadableKeepsWhatItHoldsWhenItsFileIsDeletedElsewhere",
+            "aLoadableSavedAfterACopyWasReadIsTheOneReloaded"})
+    public static final class Settings implements Saveable, Loadable {
+        static final String KEY = "loadable-settings.xml";
+        String value;
+        /** Where an older version kept {@link #value}; migrated on load. */
+        String legacy;
+        transient int loadsSinceStart = -1;
+
+        public Settings() {
+            try {
+                load();
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
+        }
+
+        private XmlFile file() {
+            return new XmlFile(new File(Jenkins.get().getRootDir(), KEY));
+        }
+
+        @Override
+        public synchronized void load() throws IOException {
+            loadsSinceStart++;
+            if (file().exists()) {
+                file().unmarshal(this);
+            }
+            if (legacy != null) {
+                value = legacy.toUpperCase(java.util.Locale.ROOT);
+                legacy = null;
+            }
+        }
+
+        @Override
+        public synchronized void save() throws IOException {
+            loadsSinceStart = 0;
+            file().write(this);
         }
     }
 
