@@ -170,6 +170,31 @@ public interface PersistenceStore {
     }
 
     /**
+     * The identity of the item stored at a key prefix, for code that keeps data about items elsewhere (such as test
+     * results in a database) and wants it to follow the item when it is renamed or moved.
+     * An item is stored at a prefix when its configuration is at {@code <itemKey>/config.xml}, for example
+     * {@code jobs/folder/jobs/job}.
+     *
+     * <p>A store that keeps identities assigns a new one when {@code <itemKey>/config.xml} is created (written where
+     * there was nothing), keeps it while the configuration is rewritten and when it is {@linkplain #move moved} (with
+     * the prefix or a prefix above it), and forgets it when the configuration is deleted. An item deleted and created
+     * again under the same name gets a new identity, so data kept about the old one is not taken for the new one's.
+     * It changes in the same transaction as the configuration, so every controller sees the same identity.
+     * Identities are never reused, and mean something only in this store.
+     *
+     * <p>Identities are not part of the item's configuration, and Jenkins without a store has none: callers fall back
+     * to the item's full name.
+     *
+     * @param itemKey a key without trailing {@code /}
+     * @return the identity, or null if nothing is stored at {@code itemKey/config.xml} or this store keeps no identities
+     * @see PersistenceStores#itemIdentity
+     */
+    @CheckForNull
+    default String itemIdentity(@NonNull String itemKey) throws IOException {
+        return null;
+    }
+
+    /**
      * Identifies this store instance (and so this controller) as the origin of the changes it makes.
      */
     @NonNull
