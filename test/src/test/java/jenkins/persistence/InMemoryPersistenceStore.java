@@ -55,6 +55,8 @@ public class InMemoryPersistenceStore implements PersistenceStore {
     private final InMemoryPersistenceStore root;
     private final String origin;
     private final java.util.NavigableMap<String, Entry> entries;
+    /** The {@linkplain #itemIdentity identity} of each item key, changed with the item's configuration. */
+    private final Map<String, String> identities;
     private final List<Consumer<ChangeEvent>> listeners;
     /** Changes made but not yet delivered, in the order they were made: added to under the data lock. */
     private final Queue<ChangeEvent> outbox;
@@ -72,6 +74,7 @@ public class InMemoryPersistenceStore implements PersistenceStore {
         this.root = this;
         this.origin = UUID.randomUUID().toString();
         this.entries = new TreeMap<>();
+        this.identities = new TreeMap<>();
         this.listeners = new CopyOnWriteArrayList<>();
         this.outbox = new ArrayDeque<>();
         this.delivering = new Object();
@@ -81,6 +84,7 @@ public class InMemoryPersistenceStore implements PersistenceStore {
         this.root = root;
         this.origin = origin;
         this.entries = root.entries;
+        this.identities = root.identities;
         this.listeners = root.listeners;
         this.outbox = root.outbox;
         this.delivering = root.delivering;
@@ -187,6 +191,10 @@ public class InMemoryPersistenceStore implements PersistenceStore {
             }
             version = ++root.clock;
             entries.put(key, new Entry(content.clone(), version));
+            String item = itemKeyOf(key);
+            if (current == null && item != null) {
+                identities.put(item, UUID.randomUUID().toString());
+            }
             outbox.add(new ChangeEvent(ChangeEvent.Kind.WRITTEN, key, null, version, origin));
         }
         deliver();
@@ -205,6 +213,10 @@ public class InMemoryPersistenceStore implements PersistenceStore {
                 throw new ConflictException(key, expected, versionOf(current));
             }
             entries.remove(key);
+            String item = itemKeyOf(key);
+            if (item != null) {
+                identities.remove(item);
+            }
             outbox.add(new ChangeEvent(ChangeEvent.Kind.DELETED, key, null, ++root.clock, origin));
         }
         deliver();
@@ -265,12 +277,34 @@ public class InMemoryPersistenceStore implements PersistenceStore {
                 long version = ++root.clock;
                 Entry old = entries.remove(key);
                 entries.put(newKey, new Entry(old.content(), version));
+                String item = itemKeyOf(key);
+                if (item != null) {
+                    String id = identities.remove(item);
+                    if (id != null) {
+                        identities.put(itemKeyOf(newKey), id);
+                    }
+                }
                 moved.add(new Moved(key, old.version(), newKey, version));
                 outbox.add(new ChangeEvent(ChangeEvent.Kind.MOVED, newKey, key, version, origin));
             }
         }
         deliver();
         return moved;
+    }
+
+    @Override
+    @CheckForNull
+    public String itemIdentity(@NonNull String itemKey) throws IOException {
+        check();
+        synchronized (root) {
+            return identities.get(itemKey);
+        }
+    }
+
+    /** The item key whose configuration a key is ({@code jobs/a} for {@code jobs/a/config.xml}), or null. */
+    @CheckForNull
+    private static String itemKeyOf(String key) {
+        return key.endsWith("/config.xml") ? key.substring(0, key.length() - "/config.xml".length()) : null;
     }
 
     /**

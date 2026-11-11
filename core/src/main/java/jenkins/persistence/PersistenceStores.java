@@ -25,8 +25,12 @@
 package jenkins.persistence;
 
 import edu.umd.cs.findbugs.annotations.CheckForNull;
+import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.ExtensionList;
 import hudson.init.InitMilestone;
+import hudson.model.Item;
+import java.io.IOException;
+import java.nio.file.Path;
 import java.util.logging.Logger;
 import jenkins.model.Jenkins;
 import org.kohsuke.accmod.Restricted;
@@ -91,5 +95,46 @@ public final class PersistenceStores {
         } finally {
             RESOLVING.remove();
         }
+    }
+
+    /**
+     * The identity the active store keeps for an item, which stays the same when the item is renamed or moved, and is
+     * not given to an item created later under the same name (see {@link PersistenceStore#itemIdentity}).
+     * Code keeping data about items outside {@code JENKINS_HOME} can key it by this, and by the full name when it is
+     * null.
+     *
+     * @return the identity, or null if there is no store, the store keeps no identities, or the item is not stored
+     *     (as one whose configuration was not saved yet, or one outside {@code JENKINS_HOME})
+     */
+    @Restricted(Beta.class)
+    @CheckForNull
+    public static String itemIdentity(@NonNull Item item) throws IOException {
+        PersistenceStore store = get();
+        if (store == null) {
+            return null;
+        }
+        String key = keyOf(Jenkins.get().getRootDir().toPath(), item.getRootDir().toPath());
+        return key == null ? null : store.itemIdentity(key);
+    }
+
+    /**
+     * The store key of a directory: its path relative to {@code JENKINS_HOME}, worked out from the names alone (the
+     * file system is not looked at, so links are not followed), or null if it is not below {@code JENKINS_HOME}.
+     */
+    @CheckForNull
+    static String keyOf(@NonNull Path home, @NonNull Path dir) {
+        Path base = home.toAbsolutePath().normalize();
+        Path path = dir.toAbsolutePath().normalize();
+        if (!path.startsWith(base) || path.equals(base)) {
+            return null;
+        }
+        StringBuilder key = new StringBuilder();
+        for (Path name : base.relativize(path)) {
+            if (!key.isEmpty()) {
+                key.append('/');
+            }
+            key.append(name);
+        }
+        return key.toString();
     }
 }

@@ -28,6 +28,7 @@ import static jenkins.persistence.PersistenceStore.Expected.at;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -175,6 +176,40 @@ class InMemoryPersistenceStoreTest {
         assertNull(store.read("jobs/a/config.xml"));
         assertArrayEquals(b("ab"), store.read("jobs/ab/config.xml").content(), "a sibling sharing the prefix's text is not moved");
         assertEquals(moved.get(0).version(), store.read("jobs/f/jobs/a/config.xml").version());
+    }
+
+    @Test
+    void anItemKeepsItsIdentityWhenRewrittenAndMovedAndLosesItWhenDeleted() throws Exception {
+        InMemoryPersistenceStore store = new InMemoryPersistenceStore();
+        assertNull(store.itemIdentity("jobs/a"));
+        store.write("jobs/a/config.xml", b("a"), PersistenceStore.ABSENT);
+        store.write("jobs/a/jobs/x/config.xml", b("x"), PersistenceStore.ABSENT);
+        store.write("jobs/a/nextBuildNumber", b("1"), PersistenceStore.ABSENT);
+        store.write("jobs/f/config.xml", b("f"), PersistenceStore.ABSENT);
+        String a = store.itemIdentity("jobs/a");
+        String x = store.itemIdentity("jobs/a/jobs/x");
+        assertNotNull(a);
+        assertNotNull(x);
+        assertNotEquals(a, x);
+        assertEquals(a, store.as("other").itemIdentity("jobs/a"), "every controller sees the same identity");
+        assertNull(store.itemIdentity("jobs/a/nextBuildNumber"), "only a configuration makes an item");
+
+        store.write("jobs/a/config.xml", b("a2"), PersistenceStore.ANY);
+        assertEquals(a, store.itemIdentity("jobs/a"), "rewriting the configuration keeps the identity");
+
+        store.move("jobs/a", "jobs/f/jobs/b", List.of());
+        assertNull(store.itemIdentity("jobs/a"));
+        assertNull(store.itemIdentity("jobs/a/jobs/x"));
+        assertEquals(a, store.itemIdentity("jobs/f/jobs/b"), "the identity follows the item");
+        assertEquals(x, store.itemIdentity("jobs/f/jobs/b/jobs/x"), "and those of the items below it");
+
+        store.deleteAll("jobs/f/jobs/b");
+        assertNull(store.itemIdentity("jobs/f/jobs/b"));
+        assertNull(store.itemIdentity("jobs/f/jobs/b/jobs/x"));
+        store.write("jobs/f/jobs/b/config.xml", b("new"), PersistenceStore.ABSENT);
+        String again = store.itemIdentity("jobs/f/jobs/b");
+        assertNotNull(again);
+        assertNotEquals(a, again, "an item created again under the same name is a different item");
     }
 
     @Test
