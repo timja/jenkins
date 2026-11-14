@@ -32,8 +32,10 @@ import org.kohsuke.accmod.restrictions.Beta;
 /**
  * Applies a change another controller made to a key in the shared {@link PersistenceStore}, for state outside what
  * core applies itself (item, user, node and global configuration). Every key that is not routed by core, such as
- * the reserved {@code _items/…} or {@code _locks/…} keys of a plugin, or a plugin's own configuration file which it
- * loads only once, is offered to the handlers.
+ * the reserved {@code _items/…} or {@code _locks/…} keys of a plugin, is offered to the handlers.
+ * A plugin's own configuration file needs none if the object holding it implements {@link jenkins.model.Loadable} and
+ * {@link hudson.model.Saveable}, and reads and writes it through {@link hudson.XmlFile}: core then reloads the object
+ * through its {@code load()}. That does not include a deletion, which only a handler applies.
  * Called with {@link PersistenceStores#applyingRemoteChange} in effect, so saves are not written back to the store,
  * on the store's event thread, in event order: a handler must not block for long (hand slow work off).
  *
