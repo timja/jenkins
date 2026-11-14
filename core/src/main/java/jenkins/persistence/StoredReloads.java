@@ -117,7 +117,8 @@ public final class StoredReloads {
      * global configuration {@link Jenkins#reloadGlobalConfig}; for a node of this controller, as one changed elsewhere
      * ({@code Nodes.changedElsewhere}); for a descriptor its own {@link Descriptor#load}, after
      * {@link RemovedFields#clear}; for others {@link XmlFile#unmarshalNullingOut} under the object's monitor. And, for
-     * an item, its {@code onLoad}, as {@code updateByXml} does, once that monitor is released: {@code onLoad} takes
+     * an item, its {@code onLoad} (or, for a {@link RemoteItemGroup}, {@link RemoteItemGroup#onChangedElsewhere}), as
+     * {@code updateByXml} does, once that monitor is released: {@code onLoad} takes
      * other locks (the builds' of a job), which code holding them and then the item's (a new build being numbered) takes
      * in the other order. Content older than what this JVM holds of the key is not applied: it was read before a
      * save or reload here, which it would undo. Call with {@link PersistenceStores#applyingRemoteChange} in effect.
@@ -174,7 +175,11 @@ public final class StoredReloads {
                 file.unmarshalNullingOut(o); // reads the stored content, so takes its version as held
             }
         }
-        if (o instanceof AbstractItem item) {
+        if (o instanceof RemoteItemGroup group) {
+            // the group alone: reloading its children would reload every one of them
+            Items.runWhileUpdatingByXml(group::onChangedElsewhere);
+            Jenkins.get().rebuildDependencyGraphAsync();
+        } else if (o instanceof AbstractItem item) {
             Items.runWhileUpdatingByXml(() -> item.onLoad(item.getParent(), item.getParent().getItemName(item.getRootDir(), item)));
             Jenkins.get().rebuildDependencyGraphAsync();
         }
