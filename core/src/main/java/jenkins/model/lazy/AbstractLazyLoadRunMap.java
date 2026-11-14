@@ -432,7 +432,7 @@ public abstract class AbstractLazyLoadRunMap<R> extends AbstractMap<Integer, R> 
 
     /**
      * Like {@link #proposeNewNumber} for numbers assigned from a sequence shared with other controllers
-     * ({@link BuildRecordSource#sharesNumbers}): builds with higher numbers made elsewhere may already be known,
+     * ({@link hudson.model.Job.BuildNumberAssigner#sharesNumbers}): builds with higher numbers made elsewhere may already be known,
      * so only the number itself must be unused.
      *
      * @since TODO

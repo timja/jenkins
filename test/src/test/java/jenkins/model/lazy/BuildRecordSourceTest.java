@@ -94,7 +94,7 @@ class BuildRecordSourceTest {
         assertThat(p._getRuns().keySet(), contains(5, 1));
 
         // build #2 is made here while #5, made elsewhere, is already known
-        source.shares = true;
+        ExtensionList.lookupSingleton(Assigner.class).sharedJob = "p";
         FreeStyleBuild b2 = r.buildAndAssertSuccess(p);
         assertEquals(2, b2.getNumber());
         assertThat(p._getRuns().keySet(), contains(5, 2, 1));
@@ -134,7 +134,6 @@ class BuildRecordSourceTest {
         volatile String job;
         volatile File template;
         volatile Set<Integer> stored = Set.of();
-        volatile boolean shares;
         final List<File> retrieved = new CopyOnWriteArrayList<>();
 
         private boolean mine(Job<?, ?> j) {
@@ -161,10 +160,26 @@ class BuildRecordSourceTest {
             }
             return load.call();
         }
+    }
+
+    /** Numbers builds as core does, from a sequence it says is shared for {@link #sharedJob}. */
+    @TestExtension({"sharedNumbersNeedOnlyBeUnused", "numbersBelowKnownOnesAreRefusedUnlessShared"})
+    public static final class Assigner implements Job.BuildNumberAssigner {
+        volatile String sharedJob;
 
         @Override
-        public boolean sharesNumbers(@NonNull Job<?, ?> j) {
-            return mine(j) && shares;
+        public int assignBuildNumber(Job<?, ?> job, SaveNextBuildNumber saveNextBuildNumber) throws IOException {
+            synchronized (job) {
+                int n = job.getNextBuildNumber();
+                job.fastUpdateNextBuildNumber(n + 1);
+                saveNextBuildNumber.call();
+                return n;
+            }
+        }
+
+        @Override
+        public boolean sharesNumbers(@NonNull Job<?, ?> job) {
+            return job.getFullName().equals(sharedJob);
         }
     }
 }
