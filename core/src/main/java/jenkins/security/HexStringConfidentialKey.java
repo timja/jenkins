@@ -48,11 +48,7 @@ public class HexStringConfidentialKey extends ConfidentialKey {
         if (secret == null || cs != lastCS) {
             lastCS = cs;
             try {
-                byte[] payload = load();
-                if (payload == null) {
-                    payload = cs.randomBytes(length / 2);
-                    store(payload);
-                }
+                byte[] payload = loadOrCreate(() -> cs.randomBytes(length / 2));
                 secret = Util.toHexString(payload).substring(0, length);
             } catch (IOException e) {
                 throw new Error("Failed to load the key: " + getId(), e);
