@@ -292,6 +292,11 @@ class ExternalBuildsTest {
             return "p #" + number;
         }
 
+        @Override
+        public String getConsoleUrl() {
+            return getUrl() + "console";
+        }
+
         public void doIndex(StaplerResponse2 rsp) throws IOException {
             rsp.setContentType("text/plain;charset=UTF-8");
             rsp.getWriter().print("build #" + number + " elsewhere");

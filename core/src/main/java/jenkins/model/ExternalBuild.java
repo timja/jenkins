@@ -44,7 +44,9 @@ import org.kohsuke.accmod.restrictions.Beta;
  * A read-only view of a build of a job held by another controller (see {@link ExternalBuilds}).
  * A Stapler object: core dispatches {@code job/<name>/<N>/} to it, and the build history widget lists it among the
  * job's own builds, as any {@link HistoricalBuild}; the implementation supplies its own views ({@code index},
- * {@code console}) and actions (such as {@code stop}, which the widget links to while it is building).
+ * {@code console}) and actions (such as {@code stop}, which the widget links to while it is building), and says where
+ * its console is ({@link #getConsoleUrl}, typically {@code getUrl() + "console"}). No default is given for that, since
+ * an implementation may also be a {@link hudson.model.Queue.Executable}, which has its own.
  * An implementation that is also a {@link hudson.model.Queue.Executable} (whose {@code run()} throws) may be the
  * start value of a handed-off queue item (the {@code started} call of a queue hand-off).
  *
@@ -142,12 +144,5 @@ public interface ExternalBuild extends HistoricalBuild, WithConsoleUrl {
     @NonNull
     default List<BuildBadgeAction> getBadgeActions() {
         return List.of();
-    }
-
-    /** The implementation's {@code console} view, as for a {@link Run}. */
-    @Override
-    @CheckForNull
-    default String getConsoleUrl() {
-        return getUrl() + "console";
     }
 }
