@@ -29,7 +29,9 @@ import static hudson.cli.CLICommandInvoker.Matcher.succeeded;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.is;
+import static org.hamcrest.Matchers.lessThan;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.sameInstance;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -79,7 +81,7 @@ class ExternalBuildsTest {
         assertThat(p.getIconColor(), is(BallColor.BLUE));
         JenkinsRule.WebClient wc = r.createWebClient().withThrowExceptionOnFailingStatusCode(false);
         assertEquals(404, wc.goTo("job/p/5/", null).getWebResponse().getStatusCode());
-        assertThat(history(wc), not(containsString("fake-external-build")));
+        assertThat(history(wc), not(containsString("job/p/5/")));
         assertThat(new CLICommandInvoker(r, "console").invokeWithArgs("p", "5"), failedWith(3));
     }
 
@@ -102,7 +104,40 @@ class ExternalBuildsTest {
         assertEquals(404, wc.goTo("job/p/6/", null).getWebResponse().getStatusCode());
         assertEquals(200, wc.goTo("job/p/1/", null).getWebResponse().getStatusCode());
 
-        assertThat(history(wc), containsString("fake-external-build #5 on other"));
+        // listed in the build history as a build of the job, newest first, linking to its console and stop action
+        String history = history(wc);
+        assertThat(history, containsString("job/p/5/console"));
+        assertThat(history, containsString("job/p/5/stop"));
+        assertThat(history.indexOf("job/p/5/console"), lessThan(history.indexOf("job/p/1/console")));
+    }
+
+    @Test
+    void historyShowsBuildsElsewhereAmongThoseHere() throws Exception {
+        FreeStyleProject p = r.createFreeStyleProject("p");
+        for (int i = 0; i < 3; i++) {
+            r.buildAndAssertSuccess(p);
+        }
+        Fake fake = ExtensionList.lookupSingleton(Fake.class);
+        // #2 is also here: the build here wins
+        fake.builds.add(new FakeBuild(4, ""));
+        fake.builds.add(new FakeBuild(2, ""));
+        JenkinsRule.WebClient wc = r.createWebClient();
+        String history = history(wc);
+        int b4 = history.indexOf("job/p/4/console");
+        int b3 = history.indexOf("job/p/3/console");
+        int b2 = history.indexOf("job/p/2/console");
+        int b1 = history.indexOf("job/p/1/console");
+        assertThat(b4, greaterThan(-1));
+        assertThat(b3, greaterThan(b4));
+        assertThat(b2, greaterThan(b3));
+        assertThat(b1, greaterThan(b2));
+        assertThat(history.split("job/p/2/console", -1).length - 1, is(1));
+        assertThat(history, not(containsString("job/p/2/stop")));
+
+        // filtered out with the builds that are not building
+        String completed = wc.goTo("job/p/buildHistory/ajax?status=SUCCESS", null).getWebResponse().getContentAsString();
+        assertThat(completed, not(containsString("job/p/4/")));
+        assertThat(completed, containsString("job/p/3/console"));
     }
 
     @Test
@@ -160,7 +195,7 @@ class ExternalBuildsTest {
         return wc.goTo("job/p/buildHistory/ajax", null).getWebResponse().getContentAsString();
     }
 
-    @TestExtension({"jobShowsBuildsElsewhere", "consoleOfBuildElsewhere", "consoleFollowsBuildElsewhere"})
+    @TestExtension({"jobShowsBuildsElsewhere", "historyShowsBuildsElsewhereAmongThoseHere", "consoleOfBuildElsewhere", "consoleFollowsBuildElsewhere"})
     public static final class Fake implements ExternalBuilds {
         final List<FakeBuild> builds = new CopyOnWriteArrayList<>();
 
@@ -250,6 +285,11 @@ class ExternalBuildsTest {
         @Override
         public String getDisplayName() {
             return "#" + number;
+        }
+
+        @Override
+        public String getFullDisplayName() {
+            return "p #" + number;
         }
 
         public void doIndex(StaplerResponse2 rsp) throws IOException {
