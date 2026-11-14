@@ -354,6 +354,11 @@ class QueueHandOffTest {
             return "#" + number;
         }
 
+        @Override
+        public String getFullDisplayName() {
+            return job.getFullDisplayName() + " #" + number;
+        }
+
         @NonNull
         @Override
         public SubTask getParent() {
