@@ -127,6 +127,11 @@ public abstract class ItemGroupMixIn {
             try {
                 stored = PersistenceStores.storedItemNames(modulesDir, listed); // those listed here are loaded anyway
             } catch (IOException e) {
+                if (PersistenceStores.isApplyingRemoteChange()) {
+                    // a folder reloaded for a change made elsewhere: that change fails, and is applied again later,
+                    // rather than children being dropped from the folder for the store being unreachable
+                    throw new UncheckedIOException(e);
+                }
                 Logger.getLogger(ItemGroupMixIn.class.getName()).log(Level.WARNING, "could not list stored items of " + modulesDir, e);
                 stored = Set.of();
             }
@@ -152,6 +157,9 @@ public abstract class ItemGroupMixIn {
                     try {
                         exists = xmlFile.checkExists();
                     } catch (IOException e) {
+                        if (PersistenceStores.isApplyingRemoteChange()) {
+                            throw new UncheckedIOException(e); // retried, as above
+                        }
                         Logger.getLogger(ItemGroupMixIn.class.getName()).log(Level.WARNING, "could not check for " + xmlFile.getPath(), e);
                         continue;
                     }
@@ -166,6 +174,9 @@ public abstract class ItemGroupMixIn {
                 }
                 configurations.put(key.call(item), item);
             } catch (Exception e) {
+                if (e instanceof UncheckedIOException u && PersistenceStores.isApplyingRemoteChange()) {
+                    throw u; // the store unreachable: retried, as above
+                }
                 Logger.getLogger(ItemGroupMixIn.class.getName()).log(Level.WARNING, "could not load " + subdir, e);
             }
         }

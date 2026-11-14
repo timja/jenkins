@@ -127,10 +127,17 @@ class RefuseAndReloadTest {
         FreeStyleProject p = r.createFreeStyleProject("reload-window");
         p.setDescription("original");
         String key = "jobs/reload-window/config.xml";
-        // another controller allows concurrent builds and then disallows them again; the first is applied here
-        changeElsewhere(key, "<concurrentBuild>false</concurrentBuild>", "<concurrentBuild>true</concurrentBuild>");
-        PersistenceStore.Entry allowed = STORE.read(key);
-        changeElsewhere(key, "<concurrentBuild>true</concurrentBuild>", "<concurrentBuild>false</concurrentBuild>");
+        // another controller allows concurrent builds and then disallows them again; the first is applied here (as
+        // below, not by the events of those changes)
+        PersistenceStore.Entry allowed;
+        STORE.setLosingEvents(true);
+        try {
+            changeElsewhere(key, "<concurrentBuild>false</concurrentBuild>", "<concurrentBuild>true</concurrentBuild>");
+            allowed = STORE.read(key);
+            changeElsewhere(key, "<concurrentBuild>true</concurrentBuild>", "<concurrentBuild>false</concurrentBuild>");
+        } finally {
+            STORE.setLosingEvents(false);
+        }
         // while the reconciler applies it, as it finishes (an item's onLoad, say), this controller disables the item
         AtomicReference<Exception> failure = new AtomicReference<>();
         Thread save = new Thread(() -> {
@@ -173,12 +180,17 @@ class RefuseAndReloadTest {
         FreeStyleProject p = r.createFreeStyleProject("reason");
         p.setDescription("original");
         String key = "jobs/reason/config.xml";
-        changeElsewhere(key, "<description>original</description>", "<description>theirs</description>");
-        reloadNow(p, STORE.read(key));
-        assertEquals(List.of(StoredConfigReconciler.Reason.CHANGED_ELSEWHERE), ReasonReconciler.reasons);
-        assertEquals("theirs", p.getDescription());
-        changeElsewhere(key, "<description>theirs</description>", "<description>theirs again</description>");
-        assertThrows(ConflictException.class, () -> p.setDescription("mine"));
+        STORE.setLosingEvents(true); // the changes are applied here as below, not by their events
+        try {
+            changeElsewhere(key, "<description>original</description>", "<description>theirs</description>");
+            reloadNow(p, STORE.read(key));
+            assertEquals(List.of(StoredConfigReconciler.Reason.CHANGED_ELSEWHERE), ReasonReconciler.reasons);
+            assertEquals("theirs", p.getDescription());
+            changeElsewhere(key, "<description>theirs</description>", "<description>theirs again</description>");
+            assertThrows(ConflictException.class, () -> p.setDescription("mine"));
+        } finally {
+            STORE.setLosingEvents(false);
+        }
         await(() -> ReasonReconciler.reasons.size() == 2);
         assertEquals(List.of(StoredConfigReconciler.Reason.CHANGED_ELSEWHERE, StoredConfigReconciler.Reason.AFTER_SAVE_HERE),
                 ReasonReconciler.reasons);
@@ -235,8 +247,10 @@ class RefuseAndReloadTest {
     @Test
     void aSaveOverADeletionElsewhereIsRefused() throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("deleted");
-        STORE.as("other").delete("jobs/deleted/config.xml", PersistenceStore.ANY);
-        assertThrows(ConflictException.class, () -> p.setDescription("mine"));
+        synchronized (p) { // before the deletion is applied here
+            STORE.as("other").delete("jobs/deleted/config.xml", PersistenceStore.ANY);
+            assertThrows(ConflictException.class, () -> p.setDescription("mine"));
+        }
         assertEquals(null, STORE.read("jobs/deleted/config.xml"), "not created again");
     }
 
@@ -264,11 +278,16 @@ class RefuseAndReloadTest {
     @Test
     void deletingWhatWasMovedElsewhereMeanwhileIsRefused() throws Exception {
         FreeStyleProject p = r.createFreeStyleProject("moving");
-        STORE.as("other").move("jobs/moving", "jobs/moved", List.of()); // not applied here yet
-        assertThrows(ConflictException.class, p::delete);
-        assertTrue(p.getRootDir().isDirectory(), "nothing deleted here");
-        assertSame(p, r.jenkins.getItem("moving"));
-        assertThat(STORE.text("jobs/moved/config.xml"), containsString("<project>"));
+        STORE.setLosingEvents(true); // the move is not applied here (yet)
+        try {
+            STORE.as("other").move("jobs/moving", "jobs/moved", List.of());
+            assertThrows(ConflictException.class, p::delete);
+            assertTrue(p.getRootDir().isDirectory(), "nothing deleted here");
+            assertSame(p, r.jenkins.getItem("moving"));
+            assertThat(STORE.text("jobs/moved/config.xml"), containsString("<project>"));
+        } finally {
+            STORE.setLosingEvents(false);
+        }
     }
 
     @Test

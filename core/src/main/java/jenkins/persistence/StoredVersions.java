@@ -78,6 +78,16 @@ public final class StoredVersions {
         return versions.getOrDefault(key, PersistenceStore.ANY);
     }
 
+    /**
+     * Forgets what this JVM read or wrote of every key below a prefix (such as an item directory), as when what it
+     * loaded from there is dropped.
+     */
+    @Restricted(NoExternalUse.class)
+    public static void forgetUnder(@NonNull String prefix) {
+        versions.keySet().removeIf(k -> k.startsWith(prefix + "/"));
+        bases.keySet().removeIf(k -> k.startsWith(prefix + "/"));
+    }
+
     /** Content of an XML key at a version, the base of a merge. */
     record Base(long version, byte[] content) {}
 

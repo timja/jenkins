@@ -113,7 +113,7 @@ class PersistenceStoreConfigTest {
 
     @Test
     void aKeyNeverReadHereIsOnlyCreated() throws Exception {
-        String key = "jobs/unread/config.xml";
+        String key = "jobs/unread/scm-revision-hash.xml"; // no item, which another controller's write would load
         byte[] theirs = b("<project><description>elsewhere</description></project>");
         STORE.as("other").write(key, theirs, PersistenceStore.ANY);
         // not read here (its read failed, say, and the object holds defaults): its save must not replace what is stored
@@ -126,7 +126,7 @@ class PersistenceStoreConfigTest {
 
     @Test
     void aKeyCreatedElsewhereAfterBeingReadAbsentIsNotReplaced() throws Exception {
-        String key = "jobs/absent/config.xml";
+        String key = "jobs/absent/scm-revision-hash.xml";
         assertNull(route(key).read());
         STORE.as("other").write(key, b("<project/>"), PersistenceStore.ANY);
         assertThrows(ConflictException.class, () -> route(key).write(b("<project><description>here</description></project>"), null));
@@ -135,7 +135,7 @@ class PersistenceStoreConfigTest {
 
     @Test
     void aKeyCreatedAgainElsewhereAfterItsDeletionHereIsNotReplaced() throws Exception {
-        String key = "jobs/gone/config.xml";
+        String key = "jobs/gone/scm-revision-hash.xml";
         route(key).write(b("<project/>"), null);
         route(key).delete();
         assertThat(STORE.versions(), not(hasKey(key)));
@@ -185,10 +185,15 @@ class PersistenceStoreConfigTest {
         // changed elsewhere: copied again at the next use
         String theirs = STORE.text(key).replace("copied", "elsewhere");
         STORE.as("other").write(key, b(theirs), PersistenceStore.ANY);
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
+        while (!ItemChangeApplier.isIdle() && System.nanoTime() < deadline) {
+            Thread.sleep(20); // the item reloaded here, which reads it too
+        }
+        int afterChange = STORE.reads(key);
         assertThat(Files.readString(config.getFile().toPath()), containsString("elsewhere"));
-        assertEquals(before + 2, STORE.reads(key));
+        assertEquals(afterChange + 1, STORE.reads(key));
         config.getFile();
-        assertEquals(before + 2, STORE.reads(key));
+        assertEquals(afterChange + 1, STORE.reads(key));
         // and written here
         route(key).read();
         route(key).write(b(theirs.replace("elsewhere", "written here")), null);

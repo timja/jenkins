@@ -66,6 +66,8 @@ public class InMemoryPersistenceStore implements PersistenceStore {
     /** Whether operations fail as with a store that cannot be reached. */
     private volatile boolean unreachable;
     private volatile boolean confidentialKeys;
+    /** Whether changes are made without their events, as a store losing them would. */
+    private volatile boolean losingEvents;
 
     public InMemoryPersistenceStore() {
         this.root = this;
@@ -95,6 +97,11 @@ public class InMemoryPersistenceStore implements PersistenceStore {
     /** Makes every operation of this store and its views fail, as when it cannot be reached; or work again. */
     public void setUnreachable(boolean unreachable) {
         root.unreachable = unreachable;
+    }
+
+    /** Makes changes from now on be made without their events reaching anyone (as a faulty store loses them), or not. */
+    public void setLosingEvents(boolean losing) {
+        root.losingEvents = losing;
     }
 
     /** Makes the store say it {@linkplain #storesConfidentialKeys stores confidential keys}. */
@@ -145,6 +152,9 @@ public class InMemoryPersistenceStore implements PersistenceStore {
                     }
                     if (e == null) {
                         return;
+                    }
+                    if (root.losingEvents) {
+                        continue;
                     }
                     for (Consumer<ChangeEvent> l : listeners) {
                         try {
