@@ -93,6 +93,7 @@ import java.util.stream.Stream;
 import jenkins.model.BuildDiscarder;
 import jenkins.model.BuildDiscarderProperty;
 import jenkins.model.DirectlyModifiableTopLevelItemGroup;
+import jenkins.model.ExternalBuilds;
 import jenkins.model.HistoricalBuild;
 import jenkins.model.Jenkins;
 import jenkins.model.JenkinsLocationConfiguration;
@@ -313,7 +314,7 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
      */
     public boolean isBuilding() {
         RunT b = getLastBuild();
-        return b != null && b.isBuilding();
+        return b != null && b.isBuilding() || ExternalBuilds.get().isBuilding(this);
     }
 
     /**
@@ -905,7 +906,13 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
                              StaplerResponse2 rsp) {
         try {
             // try to interpret the token as build number
-            return getBuildByNumber(Integer.parseInt(token));
+            int number = Integer.parseInt(token);
+            RunT run = getBuildByNumber(number);
+            if (run == null) {
+                // perhaps a build not on this controller
+                return ExternalBuilds.get().get(this, number);
+            }
+            return run;
         } catch (NumberFormatException e) {
             // try to map that to widgets
             for (Widget w : getWidgets()) {
@@ -1263,10 +1270,11 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
         while (lastBuild != null && lastBuild.hasntStartedYet())
             lastBuild = lastBuild.getPreviousBuild();
 
-        if (lastBuild != null)
-            return lastBuild.getIconColor();
-        else
-            return BallColor.NOTBUILT;
+        BallColor color = lastBuild != null ? lastBuild.getIconColor() : BallColor.NOTBUILT;
+        if (!color.isAnimated() && !ExternalBuilds.get().running(this).isEmpty()) {
+            return color.anime();
+        }
+        return color;
     }
 
     /**
