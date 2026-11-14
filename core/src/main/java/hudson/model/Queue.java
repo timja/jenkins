@@ -778,6 +778,187 @@ public class Queue extends ResourceController implements Saveable {
         return HttpResponses.error(HttpServletResponse.SC_NOT_FOUND, "Provided id (" + id + ") not found");
     }
 
+    /**
+     * Adds an item of a queue shared with other controllers, as mirrored from another controller: always as a new item,
+     * never folded into one here (the shared queue decided which requests fold), and with no
+     * {@link QueueDecisionHandler} asked (the controller it was scheduled on did).
+     * Its id is whichever the {@link QueueIdStrategy} gives it.
+     *
+     * @since TODO
+     */
+    @Restricted(Beta.class)
+    public @NonNull WaitingItem scheduleShared(@NonNull Task p, int quietPeriod, @NonNull List<Action> actions) {
+        lock.lock();
+        try { try {
+            Calendar due = new GregorianCalendar();
+            due.add(Calendar.SECOND, quietPeriod);
+            WaitingItem added = new WaitingItem(due, p, actions);
+            added.enter(this);
+            scheduleMaintenance();
+            return added;
+        } finally { updateSnapshot(); } } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Updates an item to match a change made to it by another controller sharing the queue: its actions are replaced
+     * by these (exactly, not by class), and a waiting item's quiet period ends at {@code due} if that is earlier.
+     *
+     * @return false if there is no such waiting, blocked or buildable item here
+     * @since TODO
+     */
+    @Restricted(Beta.class)
+    public boolean updateShared(long id, @NonNull Calendar due, @NonNull List<Action> actions) {
+        lock.lock();
+        try { try {
+            Item item = getQueuedItem(id);
+            if (item == null) {
+                return false;
+            }
+            // exactly these actions: by class, replaceAction would keep actions dropped elsewhere and collapse
+            // several of one class (such as ParametersActions) into one
+            item.removeActions(Action.class);
+            for (Action a : actions) {
+                item.addAction(a);
+            }
+            if (item instanceof WaitingItem wi && due.before(wi.timestamp)) {
+                wi.leave(this);
+                wi.timestamp = due;
+                wi.enter(this);
+                scheduleMaintenance();
+            }
+            return true;
+        } finally { updateSnapshot(); } } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Records that the item with this id was taken by another controller sharing the queue.
+     * The item leaves this queue as a {@link LeftItem} that is {@linkplain LeftItem#isTakenElsewhere() taken elsewhere}
+     * and not {@linkplain LeftItem#isCancelled() cancelled}; {@link QueueListener#onLeft} fires as for any item leaving.
+     * Its {@link QueueTaskFuture} stays pending: it is completed only through the returned {@link HandOff}.
+     * The {@link LeftItem} is retained as long as any other (so {@code queue/item/<id>} answers on every controller).
+     *
+     * @return the hand-off, or null if there is no waiting, blocked or buildable item with this id here
+     * @since TODO
+     */
+    @Restricted(Beta.class)
+    public @CheckForNull HandOff handOff(long id) {
+        lock.lock();
+        try { try {
+            Item item = getQueuedItem(id);
+            if (item == null || !item.leave(this)) {
+                return null;
+            }
+            LOGGER.log(Level.FINE, "{0} item#{1} was taken by another controller", new Object[] {item.task, item.id});
+            item.future.handedOff();
+            LeftItem li = new LeftItem(item);
+            li.takenElsewhere = true;
+            li.enter(this);
+            return new HandOffImpl(item.future, li);
+        } finally { updateSnapshot(); } } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * A waiting, blocked or buildable item (not one already pending on an executor, nor one which left).
+     */
+    private @CheckForNull Item getQueuedItem(long id) {
+        assert lock.isHeldByCurrentThread();
+        for (Item item : waitingList) {
+            if (item.id == id) {
+                return item;
+            }
+        }
+        for (Item item : blockedProjects) {
+            if (item.id == id) {
+                return item;
+            }
+        }
+        for (Item item : buildables) {
+            if (item.id == id) {
+                return item;
+            }
+        }
+        return null;
+    }
+
+    private static final class HandOffImpl implements HandOff {
+        private final FutureImpl future;
+        private final LeftItem left;
+        private boolean started;
+        private boolean done;
+
+        HandOffImpl(FutureImpl future, LeftItem left) {
+            this.future = future;
+            this.left = left;
+        }
+
+        @Override
+        public synchronized void started(@NonNull Executable view) {
+            if (started || done) {
+                return;
+            }
+            started = true;
+            left.elsewhere = view;
+            future.setAsStartedElsewhere(view);
+        }
+
+        @Override
+        public synchronized void completed(@NonNull Executable run) {
+            if (done) {
+                return;
+            }
+            started(run);
+            done = true;
+            left.elsewhere = run;
+            future.set(run);
+        }
+
+        @Override
+        public synchronized void cancelled() {
+            if (started || done) {
+                return;
+            }
+            done = true;
+            future.setAsCancelled();
+        }
+    }
+
+    /**
+     * Completes the future of an item {@linkplain #handOff handed off} to another controller.
+     * Each method may be called at most once and in this order ({@link #started} before {@link #completed});
+     * {@link #cancelled} only instead of both. Later calls are ignored. Safe to call from any thread, without the queue lock.
+     *
+     * @since TODO
+     */
+    @Restricted(Beta.class)
+    public interface HandOff {
+
+        /**
+         * The remote build started: completes {@link QueueTaskFuture#getStartCondition()} with {@code view}, and
+         * {@link LeftItem#getExecutable()} returns it from now on.
+         *
+         * @param view a {@link Run} if the build is loadable here, else a read-only view of the remote build
+         *     (such as a {@link jenkins.model.ExternalBuild} that is also a {@link Executable}, whose {@code run()} throws).
+         *     Callers casting the start value to {@link Run} get a {@link ClassCastException} in the latter case.
+         */
+        void started(@NonNull Executable view);
+
+        /**
+         * The remote build completed: completes the future with {@code run} (a {@link Run} loaded from the shared build
+         * record when build records are shared, else the view given to {@link #started}). Completes the start condition
+         * too, if {@link #started} was never called.
+         */
+        void completed(@NonNull Executable run);
+
+        /** The remote item was cancelled before it started: cancels the future, as {@link Queue#cancel(Item)} would. */
+        void cancelled();
+    }
+
     public boolean isEmpty() {
         Snapshot snapshot = this.snapshot;
         return snapshot.waitingList.isEmpty() && snapshot.blockedProjects.isEmpty() && snapshot.buildables.isEmpty()
@@ -2946,15 +3127,33 @@ public class Queue extends ResourceController implements Saveable {
          */
         @Exported
         public @CheckForNull Executable getExecutable() {
-            return outcome != null ? outcome.getPrimaryWorkUnit().getExecutable() : null;
+            return outcome != null ? outcome.getPrimaryWorkUnit().getExecutable() : elsewhere;
         }
+
+        /** The build of an item {@linkplain #isTakenElsewhere() taken elsewhere}, once it started. */
+        private transient volatile Executable elsewhere;
 
         /**
          * Is this representing a cancelled item?
+         * An item {@linkplain #isTakenElsewhere() taken elsewhere} is not cancelled.
          */
         @Exported
         public boolean isCancelled() {
-            return outcome == null;
+            return outcome == null && !takenElsewhere;
+        }
+
+        private transient boolean takenElsewhere;
+
+        /**
+         * Whether the item left this queue because another controller sharing the queue took it
+         * (see {@link Queue#handOff}), rather than starting here or being cancelled.
+         * Such an item has no {@link #outcome}; {@link #getExecutable()} returns the remote build's view once it started.
+         *
+         * @since TODO
+         */
+        @Restricted(Beta.class)
+        public boolean isTakenElsewhere() {
+            return takenElsewhere;
         }
 
         @Override
