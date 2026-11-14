@@ -26,25 +26,34 @@ package jenkins.model;
 
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
-import hudson.model.ModelObject;
+import hudson.Util;
+import hudson.model.BallColor;
+import hudson.model.BuildBadgeAction;
+import hudson.model.ParameterValue;
 import hudson.model.Result;
+import hudson.model.Run;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.util.Calendar;
+import java.util.List;
+import jenkins.console.WithConsoleUrl;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
 
 /**
  * A read-only view of a build of a job held by another controller (see {@link ExternalBuilds}).
- * A Stapler object: core dispatches {@code job/<name>/<N>/} to it and includes its {@code historyEntry.jelly} view
- * (optional) in the build history widget; the implementation supplies its own views ({@code index}, {@code console}).
+ * A Stapler object: core dispatches {@code job/<name>/<N>/} to it, and the build history widget lists it among the
+ * job's own builds, as any {@link HistoricalBuild}; the implementation supplies its own views ({@code index},
+ * {@code console}) and actions (such as {@code stop}, which the widget links to while it is building).
  * An implementation that is also a {@link hudson.model.Queue.Executable} (whose {@code run()} throws) may be the
  * start value of a handed-off queue item (the {@code started} call of a queue hand-off).
  *
  * @since TODO
  */
 @Restricted(Beta.class)
-public interface ExternalBuild extends ModelObject {
+public interface ExternalBuild extends HistoricalBuild, WithConsoleUrl {
 
+    @Override
     int getNumber();
 
     long getStartTimeInMillis();
@@ -55,13 +64,16 @@ public interface ExternalBuild extends ModelObject {
     @NonNull
     String getLocation();
 
+    @Override
     boolean isBuilding();
 
     /** The result, or null while building (or if unknown). */
+    @Override
     @CheckForNull
     Result getResult();
 
     /** The URL of the build, relative to the context path, under the job, as {@link hudson.model.Run#getUrl}. */
+    @Override
     @NonNull
     String getUrl();
 
@@ -78,4 +90,64 @@ public interface ExternalBuild extends ModelObject {
      * @param by the name of the user asking, for the build's log
      */
     void requestStop(@NonNull String by) throws IOException;
+
+    /** When the build started, as {@link #getStartTimeInMillis}. */
+    @Override
+    @NonNull
+    default Calendar getTimestamp() {
+        Calendar c = Calendar.getInstance();
+        c.setTimeInMillis(getStartTimeInMillis());
+        return c;
+    }
+
+    /** As {@link Run#getIconColor}, from this build's result alone: animated while building. */
+    @Override
+    @NonNull
+    default BallColor getIconColor() {
+        Result result = getResult();
+        BallColor color = result == null ? BallColor.NOTBUILT : result.color;
+        return isBuilding() ? color.anime() : color;
+    }
+
+    /** As {@link Run#getDurationString}. */
+    @Override
+    @NonNull
+    default String getDurationString() {
+        long elapsed = Math.max(0, System.currentTimeMillis() - getStartTimeInMillis());
+        return isBuilding() ? hudson.model.Messages.Run_InProgressDuration(Util.getTimeSpanString(elapsed)) : Util.getTimeSpanString(elapsed);
+    }
+
+    /** None by default. */
+    @Override
+    @CheckForNull
+    default String getDescription() {
+        return null;
+    }
+
+    /** {@link Run#QUEUE_ID_UNKNOWN} by default. */
+    @Override
+    default long getQueueId() {
+        return Run.QUEUE_ID_UNKNOWN;
+    }
+
+    /** None by default. */
+    @Override
+    @NonNull
+    default List<ParameterValue> getParameterValues() {
+        return List.of();
+    }
+
+    /** None by default. */
+    @Override
+    @NonNull
+    default List<BuildBadgeAction> getBadgeActions() {
+        return List.of();
+    }
+
+    /** The implementation's {@code console} view, as for a {@link Run}. */
+    @Override
+    @CheckForNull
+    default String getConsoleUrl() {
+        return getUrl() + "console";
+    }
 }
