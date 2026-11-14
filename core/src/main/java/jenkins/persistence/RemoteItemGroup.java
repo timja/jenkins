@@ -32,9 +32,10 @@ import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.Beta;
 
 /**
- * An item group (such as a folder) that can take an item another controller created in it, without reloading itself.
- * Otherwise such a creation reloads the whole group, and so every child already in it: its builds' caches,
- * triggers and, for computed folders, the computation.
+ * An item group (such as a folder) that can take an item another controller created in it, and be brought up to date
+ * with a change another controller made to its own configuration, without reloading its children. Otherwise each of
+ * these reloads the whole group, and so every child in it: its builds' caches, triggers and, for computed folders, the
+ * computation.
  *
  * @since TODO
  */
@@ -48,4 +49,12 @@ public interface RemoteItemGroup {
      * @throws IllegalArgumentException if the group has an item of that name already
      */
     void addRemotelyCreated(@NonNull TopLevelItem item) throws IOException;
+
+    /**
+     * Finishes bringing the group up to date with its configuration as another controller changed it, once its fields
+     * have been set from the stored version (by core, or by a {@link StoredConfigReconciler}): what {@code onLoad} does
+     * for the group itself, without reloading its children, which their own changes keep up to date. Core calls this
+     * instead of {@code onLoad}, outside the group's monitor, as {@code updateByXml} would.
+     */
+    void onChangedElsewhere() throws IOException;
 }
