@@ -52,11 +52,15 @@ import hudson.model.Failure;
 import hudson.model.Node;
 import hudson.model.Saveable;
 import hudson.model.Slave;
+import hudson.model.TaskListener;
 import hudson.model.User;
 import hudson.model.listeners.SaveableListener;
+import hudson.slaves.AbstractCloudComputer;
+import hudson.slaves.AbstractCloudSlave;
 import hudson.slaves.ComputerLauncher;
 import hudson.slaves.ComputerRetentionWork;
 import hudson.slaves.DumbSlave;
+import hudson.slaves.JNLPLauncher;
 import hudson.slaves.OfflineCause;
 import hudson.slaves.RetentionStrategy;
 import hudson.slaves.SlaveComputer;
@@ -372,6 +376,32 @@ class NodesTest {
             // Don't allow loading any node.
             return false;
         }
+    }
+
+    @Test
+    void aCloudAgentOnDiskIsLoadedOnDemandWithoutAPersistenceStore() throws Exception {
+        // e.g. written by a plugin, never loaded so far
+        new XmlFile(Jenkins.XSTREAM, new File(r.jenkins.getRootDir(), "nodes/pod/config.xml")).write(new CloudAgent("pod"));
+        Node pod = r.jenkins.getOrLoadNode("pod");
+        assertNotNull(pod);
+        assertEquals(CloudAgent.class, pod.getClass());
+    }
+
+    public static final class CloudAgent extends AbstractCloudSlave {
+        CloudAgent(String name) throws Exception {
+            super(name, "/tmp/" + name, new JNLPLauncher());
+        }
+
+        @Override
+        public AbstractCloudComputer<?> createComputer() {
+            return new AbstractCloudComputer<>(this);
+        }
+
+        @Override
+        protected void _terminate(TaskListener listener) {}
+
+        @TestExtension("aCloudAgentOnDiskIsLoadedOnDemandWithoutAPersistenceStore")
+        public static final class DescriptorImpl extends Slave.SlaveDescriptor {}
     }
 
     @Test

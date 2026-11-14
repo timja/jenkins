@@ -27,10 +27,12 @@ package jenkins.persistence;
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
 import hudson.ExtensionList;
+import hudson.init.InitMilestone;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import jenkins.model.Jenkins;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 
@@ -96,7 +98,9 @@ public record Route(@NonNull PersistenceStore store, @NonNull String key) {
      * @param reload run if the save was merged or refused: the object saved should then be reloaded
      * @return the version written
      * @throws ConflictException if the save conflicts with a change made elsewhere which cannot be merged: it is
-     *     refused, never written over that change
+     *     refused, never written over that change. While this controller is starting, such a save is refused
+     *     (and the object reloaded) without throwing: startup does not fail because another controller saved
+     *     the same object first, as controllers started together from the same configuration as code do.
      */
     public long write(@NonNull byte[] content, @CheckForNull Runnable reload) throws IOException {
         if (PersistenceStores.isApplyingRemoteChange()) {
@@ -123,10 +127,18 @@ public record Route(@NonNull PersistenceStore store, @NonNull String key) {
             Long merged = mergeAndWrite(content, expected);
             if (merged == null) {
                 PersistenceStores.refused.incrementAndGet();
-                LOGGER.log(Level.WARNING, e.getMessage() + "; not saved, so as not to overwrite that change; reloading what is stored");
                 if (reload != null) {
                     reload.run();
                 }
+                if (isStarting()) {
+                    // typically another controller starting at the same time, from the same configuration (as code):
+                    // what it stored stands, as for any refused save, but failing this save would fail the startup
+                    LOGGER.log(Level.WARNING, e.getMessage() + "; not saved while starting, so as not to overwrite that change;"
+                            + " reloading what is stored");
+                    RefusedAtStartupMonitor.refused(key); // shown to administrators (RefusedAtStartupMonitor)
+                    return StoredVersions.lastSeen(key);
+                }
+                LOGGER.log(Level.WARNING, e.getMessage() + "; not saved, so as not to overwrite that change; reloading what is stored");
                 throw e;
             }
             MaterializedCopies.changed(key);
@@ -230,5 +242,11 @@ public record Route(@NonNull PersistenceStore store, @NonNull String key) {
         // absent is a version: a write made from an object loaded before (a late save, a new item of that name)
         // then conflicts with the key having been created again elsewhere meanwhile, rather than replacing it
         StoredVersions.seen(key, PersistenceStore.ABSENT);
+    }
+
+    /** Whether this controller is still starting: its configuration (as code, say) is being loaded and applied. */
+    static boolean isStarting() {
+        Jenkins j = Jenkins.getInstanceOrNull();
+        return j != null && j.getInitLevel().compareTo(InitMilestone.COMPLETED) < 0;
     }
 }

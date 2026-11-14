@@ -52,6 +52,7 @@ import jakarta.servlet.ServletException;
 import jakarta.servlet.http.HttpServletResponse;
 import java.io.File;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
@@ -75,6 +76,14 @@ import jenkins.model.IdStrategy;
 import jenkins.model.Jenkins;
 import jenkins.model.Loadable;
 import jenkins.model.ModelObjectWithContextMenu;
+import jenkins.persistence.ConflictException;
+import jenkins.persistence.PersistenceStore;
+import jenkins.persistence.PersistenceStores;
+import jenkins.persistence.RemovedFields;
+import jenkins.persistence.Route;
+import jenkins.persistence.StoreRouting;
+import jenkins.persistence.StoredItems;
+import jenkins.persistence.StoredReloads;
 import jenkins.scm.RunWithSCM;
 import jenkins.search.SearchGroup;
 import jenkins.security.HMACConfidentialKey;
@@ -250,6 +259,33 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
 
     private void clearExistingProperties() {
         properties.clear();
+    }
+
+    /**
+     * Loads stored content over this user, as {@link #load()} does: when it was changed elsewhere, or after a save of it
+     * was refused. Fields the content lacks are cleared (a description cleared, say), and the properties are bound to
+     * this user again (as {@link UserProperty#setUser} does for an API token's usage statistics).
+     * Content which cannot be loaded (a property of a plugin not installed here yet, say) fails before this user is
+     * touched: never half loaded, without its properties (a later save would store it so).
+     */
+    @Restricted(NoExternalUse.class)
+    public void loadStored(@NonNull byte[] content) throws IOException {
+        String userId = id;
+        try {
+            XSTREAM.unmarshal(XStream2.getDefaultDriver().createReader(new java.io.ByteArrayInputStream(content)), new User());
+        } catch (RuntimeException | Error e) {
+            throw new IOException("Unable to load user " + userId, e);
+        }
+        RemovedFields.clear(getConfigFile(), this, content);
+        clearExistingProperties();
+        try {
+            XSTREAM.unmarshal(XStream2.getDefaultDriver().createReader(new java.io.ByteArrayInputStream(content)), this);
+        } catch (RuntimeException | Error e) {
+            throw new IOException("Unable to load user " + userId, e);
+        } finally {
+            this.id = userId;
+        }
+        fixUpAfterLoad();
     }
 
     private XmlFile getConfigFile() {
@@ -718,30 +754,38 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
             or greater issues in the realm change, could affect currently logged
             in users and even the user making the change. */
         try {
-            var subdirectories = getUsersDirectory().listFiles();
-            if (subdirectories != null) {
-                for (var oldDirectory : subdirectories) {
-                    var dirName = oldDirectory.getName();
-                    if (!HASHED_DIRNAMES.matcher(dirName).matches()) {
+            var usersDirectory = getUsersDirectory();
+            var localDirectories = usersDirectory.listFiles();
+            // users may also exist only in a persistence store shared with other controllers, which then load them
+            // from where they are moved to (reloading users once they get the new strategy with the configuration)
+            var subdirectories = new java.util.TreeSet<File>(localDirectories == null ? List.of() : Arrays.asList(localDirectories));
+            for (String name : PersistenceStores.storedItemNames(usersDirectory)) {
+                subdirectories.add(new File(usersDirectory, name));
+            }
+            for (var oldDirectory : subdirectories) {
+                var dirName = oldDirectory.getName();
+                if (!HASHED_DIRNAMES.matcher(dirName).matches()) {
+                    continue;
+                }
+                var xml = new XmlFile(XSTREAM, new File(oldDirectory, CONFIG_XML));
+                if (!xml.exists()) {
+                    continue;
+                }
+                try {
+                    var user = (User) xml.read();
+                    if (user.id == null) {
                         continue;
                     }
-                    var xml = new XmlFile(XSTREAM, new File(oldDirectory, CONFIG_XML));
-                    if (!xml.exists()) {
-                        continue;
-                    }
-                    try {
-                        var user = (User) xml.read();
-                        if (user.id == null) {
-                            continue;
-                        }
-                        var newDirectory = getUserFolderFor(user.id);
-                        if (!oldDirectory.equals(newDirectory)) {
+                    var newDirectory = getUserFolderFor(user.id);
+                    if (!oldDirectory.equals(newDirectory)) {
+                        StoredItems.move(oldDirectory, newDirectory); // first: fails if a user is stored there
+                        if (oldDirectory.exists()) {
                             Files.move(oldDirectory.toPath(), newDirectory.toPath(), StandardCopyOption.REPLACE_EXISTING);
-                            LOGGER.info(() -> "migrated " + oldDirectory + " to " + newDirectory);
                         }
-                    } catch (Exception x) {
-                        LOGGER.log(Level.WARNING, "failed to migrate " + xml, x);
+                        LOGGER.info(() -> "migrated " + oldDirectory + " to " + newDirectory);
                     }
+                } catch (Exception x) {
+                    LOGGER.log(Level.WARNING, "failed to migrate " + xml, x);
                 }
             }
             reload();
@@ -909,6 +953,20 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
     public void delete() throws IOException {
         String idKey = idStrategy().keyFor(id);
         AllUsers.remove(id);
+        // from a persistence store too, if it holds users: deleting only the directory would leave the user there for
+        // every other controller (and for this one once restarted); the local files go with the directory, which is
+        // only unlinked if it is a symbolic link (XmlFile.delete would delete the file it links to)
+        Route route = StoreRouting.route(getConfigFile().getPath());
+        if (route != null) {
+            try {
+                route.delete();
+            } catch (ConflictException e) {
+                if (e.getActualVersion() != PersistenceStore.ABSENT) {
+                    throw e;
+                }
+                // deleted elsewhere already (not applied here yet): gone, as wanted
+            }
+        }
         Util.deleteRecursive(getUserFolderFor(id));
         UserDetailsCache.get().invalidate(idKey);
     }
@@ -1117,17 +1175,36 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
             }
         }
 
+        /**
+         * Held while users are scanned and while a change made to one elsewhere is applied, so that a scan does not
+         * replace a user just brought up to date with what it read before (which the change, seen already, would then
+         * never correct). The applier's worker waits for the startup scan.
+         */
+        private static final Object SCANNING = new Object();
+
         @Initializer(after = InitMilestone.JOB_CONFIG_ADAPTED)
         public static void scanAll() throws IOException {
+            synchronized (SCANNING) {
+                scanAllUnlocked();
+            }
+        }
+
+        private static void scanAllUnlocked() throws IOException {
             DIRNAMES.createMac(); // force the key to be saved during startup
             var instance = getInstance();
             instance.migrateUserIdMapper();
-            var subdirectories = getUsersDirectory().listFiles();
-            if (subdirectories == null) {
-                return;
+            var usersDirectory = getUsersDirectory();
+            var localDirectories = usersDirectory.listFiles();
+            // users may also exist only in a persistence store shared with other controllers
+            var subdirectories = new java.util.TreeSet<File>(localDirectories == null ? List.of() : Arrays.asList(localDirectories));
+            for (String name : PersistenceStores.storedItemNames(usersDirectory)) {
+                subdirectories.add(new File(usersDirectory, name));
             }
             var byName = instance.byName;
             var idStrategy = idStrategy();
+            // a user changed elsewhere can be loaded before this scan (changedElsewhere): only a second folder for the
+            // same user in this scan is a duplicate
+            var seen = new java.util.HashSet<String>();
             for (var dir : subdirectories) {
                 var dirName = dir.getName();
                 if (!HASHED_DIRNAMES.matcher(dirName).matches()) {
@@ -1155,9 +1232,13 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
                     LOGGER.warning(() -> "ignoring " + xml + " with <id> " + user.id + " expected to be in " + expectedFolderName);
                     continue;
                 }
+                // a user stored only in the persistence store has a folder here too, as one made here would: it is
+                // where its other files go, and what lets it be deleted
+                Util.createDirectories(dir.toPath());
                 user.fixUpAfterLoad();
-                var old = byName.put(idStrategy.keyFor(user.id), user);
-                if (old != null) {
+                var key = idStrategy.keyFor(user.id);
+                var old = byName.put(key, user);
+                if (!seen.add(key)) {
                     LOGGER.warning(() -> "entry for " + user.id + " in " + dir + " duplicates one seen earlier for " + old.id);
                 } else {
                     LOGGER.fine(() -> "successfully loaded " + user.id + " from " + xml);
@@ -1177,9 +1258,11 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
         }
 
         private static void reload() throws IOException {
-            getInstance().byName.clear();
-            UserDetailsCache.get().invalidateAll();
-            scanAll();
+            synchronized (SCANNING) {
+                getInstance().byName.clear();
+                UserDetailsCache.get().invalidateAll();
+                scanAllUnlocked();
+            }
         }
 
         private static void clear() {
@@ -1200,6 +1283,83 @@ public class User extends AbstractModelObject implements AccessControlled, Descr
 
         private static Collection<User> values() {
             return getInstance().byName.values();
+        }
+    }
+
+    /**
+     * Applies a change another controller made to a user's configuration in a shared persistence store:
+     * reloads the user if known here, loads it if new, or forgets it if deleted. Nothing is saved.
+     *
+     * @param dirName the user's directory name under {@code users/}
+     */
+    @Restricted(NoExternalUse.class)
+    public static void changedElsewhere(@NonNull String dirName, boolean deleted) {
+        synchronized (AllUsers.SCANNING) { // not while users are scanned (startup, reload)
+            applyChangedElsewhere(dirName, deleted);
+        }
+    }
+
+    private static void applyChangedElsewhere(String dirName, boolean deleted) {
+        if (!PersistenceStores.isSafeName(dirName)) {
+            LOGGER.warning(() -> "Ignoring a user folder named " + dirName + ", changed elsewhere: not a folder's name");
+            return;
+        }
+        User known = null;
+        for (User u : AllUsers.values()) {
+            if (dirName.equals(getUserFolderNameFor(u.id))) {
+                known = u;
+                break;
+            }
+        }
+        if (deleted) {
+            if (known != null) {
+                AllUsers.remove(known.id);
+                UserDetailsCache.get().invalidate(idStrategy().keyFor(known.id)); // nor sign in on what was cached
+            }
+            File dir = new File(getUsersDirectory(), dirName);
+            if (!dirName.equals(".") && !dirName.equals("..") && getUsersDirectory().equals(dir.getParentFile())) {
+                try {
+                    Util.deleteRecursive(dir); // its local copy too: nothing here brings it back
+                } catch (IOException e) {
+                    LOGGER.log(Level.WARNING, "Could not delete the local copy of user " + dirName + ", deleted elsewhere", e);
+                }
+            }
+        } else if (known != null) {
+            // load() takes a read failure for "no configuration" and resets the user (its password, tokens) to
+            // defaults: read it once, peeking, and load it from what was read, so that a store unavailable now fails this
+            // change before the user is touched (it is retried), and its version is taken as held only once loaded
+            Route route = StoreRouting.route(known.getConfigFile().getPath());
+            if (route == null) {
+                return; // kept local
+            }
+            try {
+                PersistenceStore.Entry entry = route.peek();
+                if (entry == null) {
+                    return; // deleted meanwhile: that deletion is applied in turn
+                }
+                StoredReloads.reload(known.getConfigFile(), known, entry);
+            } catch (IOException e) {
+                throw new UncheckedIOException("Cannot read user " + known.id + " changed elsewhere; applying the change later", e);
+            }
+        } else {
+            XmlFile xml = new XmlFile(XSTREAM, new File(new File(getUsersDirectory(), dirName), CONFIG_XML));
+            try {
+                if (xml.checkExists()) {
+                    User user = new User();
+                    xml.unmarshal(user);
+                    if (user.id != null && dirName.equals(getUserFolderNameFor(user.id))) {
+                        Util.createDirectories(new File(getUsersDirectory(), dirName).toPath()); // as at startup (scanAll)
+                        user.fixUpAfterLoad();
+                        AllUsers.put(user.id, user);
+                    }
+                }
+            } catch (IOException e) {
+                // retried by the applier: dropping it would leave the user missing here until it changes again
+                throw new UncheckedIOException("Failed to load " + xml + ", made elsewhere", e);
+            }
+        }
+        if (known != null) {
+            UserDetailsCache.get().invalidate(idStrategy().keyFor(known.id));
         }
     }
 
