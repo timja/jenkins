@@ -40,7 +40,8 @@ import org.kohsuke.accmod.restrictions.Beta;
 /**
  * Build records that exist outside this controller's disk, such as builds of a job made by another controller
  * sharing it. Consulted by {@link hudson.model.RunMap}: when it indexes the builds of a job
- * ({@link #numbers}), when it loads one ({@link #retrieve}), and when a new build is added ({@link #sharesNumbers}).
+ * ({@link #numbers}) and when it loads one ({@link #retrieve}). Builds numbered elsewhere usually also need a
+ * {@link Job.BuildNumberAssigner} that {@linkplain Job.BuildNumberAssigner#sharesNumbers shares numbers}.
  * Only the {@linkplain #get() first registered} source is consulted.
  * With none, builds are only those on disk, as upstream.
  *
@@ -66,12 +67,6 @@ public interface BuildRecordSource extends ExtensionPoint {
      */
     <R extends Run<?, ?>> R retrieve(@NonNull Job<?, ?> job, @NonNull File dir, @NonNull ThrowingCallable<R, IOException> load)
             throws IOException;
-
-    /**
-     * Whether build numbers of this job are assigned from a sequence shared with others: a new build then need not
-     * have a number above every known one, only an unused one.
-     */
-    boolean sharesNumbers(@NonNull Job<?, ?> job);
 
     /** The first registered source, or null (no source: upstream behaviour). */
     @CheckForNull

@@ -28,6 +28,7 @@ import static java.util.logging.Level.FINEST;
 
 import edu.umd.cs.findbugs.annotations.CheckForNull;
 import edu.umd.cs.findbugs.annotations.NonNull;
+import hudson.ExtensionList;
 import hudson.Util;
 import hudson.model.listeners.RunListener;
 import java.io.File;
@@ -187,8 +188,7 @@ public final class RunMap<R extends Run<?, R>> extends AbstractLazyLoadRunMap<R>
         if (Files.isDirectory(rootDir.toPath())) {
             throw new IllegalStateException("JENKINS-23152: " + rootDir + " already existed; will not overwrite with " + r);
         }
-        BuildRecordSource source = source();
-        if (source != null && job != null && source.sharesNumbers(job)) {
+        if (sharesNumbers()) {
             proposeSharedNumber(r.getNumber());
         } else if (!r.getClass().getName().equals("hudson.matrix.MatrixRun")) { // JENKINS-26739: grandfathered in
             proposeNewNumber(r.getNumber());
@@ -292,6 +292,12 @@ public final class RunMap<R extends Run<?, R>> extends AbstractLazyLoadRunMap<R>
         }
         LOGGER.fine(() -> "no config.xml in " + d);
         return null;
+    }
+
+    /** Whether the job's build numbers are shared with other processes: see {@link Job.BuildNumberAssigner#sharesNumbers}. */
+    private boolean sharesNumbers() {
+        return job != null && Jenkins.getInstanceOrNull() != null
+                && ExtensionList.lookupFirst(Job.BuildNumberAssigner.class).sharesNumbers(job);
     }
 
     @CheckForNull

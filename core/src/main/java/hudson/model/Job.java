@@ -366,6 +366,19 @@ public abstract class Job<JobT extends Job<JobT, RunT>, RunT extends Run<JobT, R
         int assignBuildNumber(Job<?, ?> job, SaveNextBuildNumber saveNextBuildNumber) throws IOException;
 
         /**
+         * Whether the job's build numbers come from a sequence shared with other processes, such as other controllers
+         * building the same job. A build numbered here may then be added after a build with a higher number, made
+         * elsewhere, is already known here: {@link RunMap} then only checks that the number is unused, rather than
+         * above every known build's.
+         *
+         * @return false by default: a new build's number must be above every known build's
+         * @since TODO
+         */
+        default boolean sharesNumbers(@NonNull Job<?, ?> job) {
+            return false;
+        }
+
+        /**
          * Provides an externally accessible alias for {@link Job#saveNextBuildNumber}, which is {@code protected}.
          * ({@link #getNextBuildNumber} and {@link #fastUpdateNextBuildNumber} are already accessible.)
          */
