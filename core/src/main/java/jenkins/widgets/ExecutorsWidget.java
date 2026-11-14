@@ -55,7 +55,7 @@ public class ExecutorsWidget extends Widget {
         @NonNull
         @Override
         public Collection<ExecutorsWidget> createFor(@NonNull View target) {
-            return List.of(new ExecutorsWidget(target.getUrl(), target.getComputers()));
+            return List.of(new ExecutorsWidget(target.getUrl(), target.getDisplayComputers()));
         }
     }
 

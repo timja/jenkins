@@ -81,6 +81,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
@@ -90,6 +91,7 @@ import javax.xml.transform.sax.SAXSource;
 import javax.xml.transform.stream.StreamResult;
 import javax.xml.transform.stream.StreamSource;
 import jenkins.model.Badgeable;
+import jenkins.model.IComputer;
 import jenkins.model.Jenkins;
 import jenkins.model.ModelObjectWithChildren;
 import jenkins.model.ModelObjectWithContextMenu;
@@ -108,6 +110,7 @@ import org.jenkins.ui.symbol.Symbol;
 import org.jenkins.ui.symbol.SymbolRequest;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.DoNotUse;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.HttpResponse;
 import org.kohsuke.stapler.HttpResponses;
@@ -482,6 +485,23 @@ public abstract class View extends AbstractModelObject implements AccessControll
         }
 
         return result;
+    }
+
+    /**
+     * The computers shown in this view's executors widget: those of {@link ComputerSet#getComputers()}, which a plugin
+     * may supply through {@link ComputerSet.ComputerSource}, restricted to those named in {@link #getComputers()} when
+     * this view {@linkplain #isFilterExecutors() filters executors}.
+     *
+     * @since TODO
+     */
+    @Restricted(NoExternalUse.class)
+    public List<? extends IComputer> getDisplayComputers() {
+        Collection<? extends IComputer> all = Jenkins.get().getComputer().getComputers();
+        if (!isFilterExecutors()) {
+            return List.copyOf(all);
+        }
+        Set<String> relevant = getComputers().stream().map(Computer::getName).collect(Collectors.toSet());
+        return all.stream().filter(c -> relevant.contains(c.getName())).toList();
     }
 
     private boolean isRelevant(Collection<Label> labels, Computer computer) {
