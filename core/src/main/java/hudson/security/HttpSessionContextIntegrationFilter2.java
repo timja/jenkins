@@ -53,7 +53,8 @@ public class HttpSessionContextIntegrationFilter2 extends SecurityContextPersist
             if (o != null) {
                 Authentication a = o.getAuthentication();
                 if (a != null) {
-                    if (hasInvalidSessionSeed(a, session)) {
+                    // or its login was signed out of, on this controller or another (each has its own session)
+                    if (hasInvalidSessionSeed(a, session) || TokenBasedRememberMeServices2.isRevoked(session)) {
                         session.setAttribute(HttpSessionSecurityContextRepository.SPRING_SECURITY_CONTEXT_KEY, null);
                     }
                 }

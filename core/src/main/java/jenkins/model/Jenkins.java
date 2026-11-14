@@ -164,6 +164,7 @@ import hudson.security.PermissionGroup;
 import hudson.security.PermissionScope;
 import hudson.security.SecurityMode;
 import hudson.security.SecurityRealm;
+import hudson.security.TokenBasedRememberMeServices2;
 import hudson.security.csrf.CrumbIssuer;
 import hudson.security.csrf.GlobalCrumbIssuerConfiguration;
 import hudson.slaves.Cloud;
@@ -4453,6 +4454,8 @@ public class Jenkins extends AbstractCIBase implements DirectlyModifiableTopLeve
      */
     public void doLogout(StaplerRequest2 req, StaplerResponse2 rsp) throws IOException, ServletException {
         String user = getAuthentication2().getName();
+        // everywhere the login is in use (other controllers' sessions made from its cookie), where that can be done
+        TokenBasedRememberMeServices2.revokeLogin(req.getSession(false), user);
         securityRealm.doLogout(req, rsp);
         SecurityListener.fireLoggedOut(user);
     }
